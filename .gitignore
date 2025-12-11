@@ -1,0 +1,5 @@
+redis/*
+*__pycache__*
+wemg.egg-info/*
+draft.ipynb
+draft.py
