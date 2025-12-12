@@ -44,6 +44,7 @@ class BaseClient:
         self.num_samples = generate_kwargs.get('n', 1)
         self.top_p = generate_kwargs.get('top_p', 0.8)
         self.max_tokens = generate_kwargs.get('max_tokens', 8192) # default max tokens to generate
+        self.max_inputs_tokens = generate_kwargs.get('max_input_tokens', 32768) # default max input tokens
         self.top_k = generate_kwargs.get('top_k', 20)
         self.enable_thinking = generate_kwargs.get('enable_thinking', None)
         self.random_seed = generate_kwargs.get('random_seed', None)
@@ -102,6 +103,7 @@ class BaseClient:
         while len(valid_choices) < n and attempts < self.max_retries:
             attempts += 1
             try:
+                messages = litellm.utils.trim_messages(messages, max_tokens=self.max_inputs_tokens)
                 response: litellm.ModelResponse = self.completion(messages, **model_kwargs)
             except Exception as e:
                 logger.warning(f"Error during completion: {e}. Retrying...")

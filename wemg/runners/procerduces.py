@@ -7,7 +7,6 @@ from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.retriever_agent import RetrieverAgent
 from wemg.agents import roles
 from wemg.agents.tools import wikidata, web_search
-from wemg.runners.memory import Memory
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
