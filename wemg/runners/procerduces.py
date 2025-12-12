@@ -44,7 +44,7 @@ async def retrieve_from_kb(
             'output_schema': roles.open_ie.NEROutput,
             'n': 1, # only one response
         }
-        ner_response = llm_agent.generator_role_execute(ner_messages, **ner_kwargs)
+        ner_response = llm_agent.generator_role_execute(ner_messages, **ner_kwargs)[0][0]
         ner_output: roles.open_ie.NEROutput = ner_role.parse_response(ner_response)
         entities = ner_output.entities
         logger.info(f"Extracted entities: {entities}")

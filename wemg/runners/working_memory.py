@@ -1,11 +1,13 @@
 from enum import Enum
 import logging
 import os
-from typing import List
+from typing import Any, Dict, List, Union
 import networkx as nx
 
 from wemg.agents import roles
 from wemg.agents.base_llm_agent import BaseLLMAgent
+from wemg.agents.tools import wikidata
+from wemg.utils.preprocessing import get_node_id
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
@@ -19,18 +21,22 @@ class SourceType(Enum):
 class Memory:
     def __init__(
             self,
-            textual_memory: List[str],
-            graph_memory: nx.Graph,
+            textual_memory: List[str] = [],
+            graph_memory: Union[nx.DiGraph, None] = None,
             max_textual_memory_tokens: int = 8192,
     ):  
-        self.entity_dict = {} # mapping from open_ie.Entity to wikidata.WikidataEntity
-        self.textual_memory = textual_memory
-        self.graph_memory = graph_memory
+        self.entity_dict: Dict[roles.open_ie.Entity, wikidata.WikidataEntity] = {} # mapping from open_ie.Entity to wikidata.WikidataEntity
+        self.textual_memory: List[str] = textual_memory
+        if graph_memory is None:
+            self.graph_memory: nx.DiGraph = nx.DiGraph()
+        else:
+            self.graph_memory: nx.DiGraph = graph_memory
 
         self.max_textual_memory_tokens = max_textual_memory_tokens
     
     def add_textual_memory(self, text: str, source: SourceType=SourceType.SYSTEM_CONCLUSION):
         """Add text to textual memory if not already present."""
+        text = text.strip()
         if source == SourceType.SYSTEM_CONCLUSION:
             text = f"[System Conclusion]: {text}"
         elif source == SourceType.WEB_RETRIEVAL:
@@ -45,14 +51,26 @@ class Memory:
         memory = [f"- {text.strip()}" for text in self.textual_memory]
         return "\n".join(memory)
 
-    def consolidate_textual_memory(self, llm_agent: BaseLLMAgent, question: str):
-        
+    def consolidate_textual_memory(self, llm_agent: BaseLLMAgent, question: str, in_context_examples: List[Dict[str, str]] = None):
+        """Consolidate the textual memory by extracting relevant information with respect to the question."""
         extractor_role = roles.extractor.Extractor()
         extractor_input = roles.extractor.ExtractionInput(
             question=question,
             raw_data=self.format_textual_memory()
         )
-        memory_consolidation_messages = extractor_role.format_messages(input_data=extractor_input)
+        memory_consolidation_messages = extractor_role.format_messages(input_data=extractor_input, history=in_context_examples)
+        consolidation_kwargs = {
+            'output_schema': roles.extractor.ExtractionOutput,
+            'n': 3, # generate 3 consolidation outputs
+            'max_tokens': self.max_textual_memory_tokens
+        }
+        consolidation_responses = llm_agent.generator_role_execute(memory_consolidation_messages, **consolidation_kwargs)[0]
+        for response in consolidation_responses:
+            extraction_output: roles.extractor.ExtractionOutput = extractor_role.parse_response(response)
+            if extraction_output.decision == "relevant":
+                for info in extraction_output.information:
+                    self.add_textual_memory(info, source=SourceType.SYSTEM_CONCLUSION)
+                break # Only consider the first relevant consolidation output
 
     def remove_textual_memory(self):
         pass
@@ -60,24 +78,23 @@ class Memory:
     def update_textual_memory(self):
         pass
 
-    def add_graph_node(self):
-        pass
-
-    def add_graph_edge(self):
-        pass
-
-    def remove_graph_node(self):
-        pass
-
-    def remove_graph_edge(self):
-        pass
-
-    def update_graph_node(self):
-        pass
-
-    def update_graph_edge(self):
-        pass
-
+    def add_edge_to_graph_memory(self, wiki_triple: wikidata.WikiTriple):
+        subject_id = get_node_id(wiki_triple.subject)
+        object_id = get_node_id(wiki_triple.object)
+        if not self.graph_memory.has_node(subject_id):
+            self.graph_memory.add_node(subject_id, data=wiki_triple.subject)
+        if not self.graph_memory.has_node(object_id):
+            self.graph_memory.add_node(object_id, data=wiki_triple.object)
+        if not self.graph_memory.has_edge(subject_id, object_id):
+            self.graph_memory.add_edge(
+                subject_id,
+                object_id,
+                relation={wiki_triple.relation}
+                )
+        else:
+            # append relation to the existing set
+            self.graph_memory.edges[subject_id, object_id]['relation'].add(wiki_triple.relation)
+            
     def consolidate_graph_memory(self):
         pass
 

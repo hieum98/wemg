@@ -41,7 +41,7 @@ class MajorityVoteInput(pydantic.BaseModel):
 class MajorityVoteOutput(pydantic.BaseModel):
     final_answer: str = pydantic.Field(..., description="The final answer determined by majority voting.")
     reasoning: str = pydantic.Field(..., description="The reasoning behind the final answer.")
-    confidence_level: str = pydantic.Field(..., regex=r"^(high|medium|low)$", description="The confidence level of the final answer (high, medium, low).")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="The confidence level of the final answer (high, medium, low).")
 
 SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis and logical reasoning. Your task is to act as an impartial adjudicator and synthesizer. You will not generate a new answer from scratch, but will instead construct a superior answer by critically analyzing and integrating the provided candidate answers. To synthesize a single, comprehensive, and robust final answer and its corresponding reasoning path from a set of candidate reasoning paths. The synthesized answer should be more accurate, coherent, and well-supported than any individual candidate.
 
@@ -81,7 +81,7 @@ class FinalAnswerSynthesisInput(pydantic.BaseModel):
 class FinalAnswerSynthesisOutput(pydantic.BaseModel):
     final_answer: str = pydantic.Field(..., description="The synthesized final answer.")
     reasoning: str = pydantic.Field(..., description="The reasoning leading to the final answer which integrates the best elements of the candidate answers.")
-    confidence_level: str = pydantic.Field(..., regex=r"^(high|medium|low)$", description="The confidence level of the final answer (high, medium, low).")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="The confidence level of the final answer (high, medium, low).")
 
 
 class Evaluator(BaseLLMRole):

@@ -33,7 +33,7 @@ class BaseLLMRole:
         user_message = {"role": "user", "content": user_content}
         return history + [user_message]
 
-    def parse_response(self, response) -> Union[pydantic.BaseModel, Dict, str]:
+    def parse_response(self, response: Union[str, Dict[str, str], pydantic.BaseModel]) -> Union[pydantic.BaseModel, Dict, str]:
         """Parse the model response into the output model."""
         if isinstance(response, self.output_model):
             return response

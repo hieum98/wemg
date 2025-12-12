@@ -55,7 +55,7 @@ class AnswerGenerationOutput(pydantic.BaseModel):
     answer: str = pydantic.Field(..., description="The final answer to the question.")
     concise_answer: str = pydantic.Field(..., description="A concise version of the final answer.")
     reasoning: str = pydantic.Field(..., description="The reasoning process behind the answer.")
-    confidence_level: str = pydantic.Field(..., regex=r"^(high|medium|low)$", description="The confidence level of the answer (high, medium, low).")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="The confidence level of the answer (high, medium, low).")
 
 
 GENERATE_QUERIES_FOR_RETRIEVER = """"You are a highly advanced Reasoning Engine. Your primary function is to deconstruct a user's Input (a question or statement) into a series of precise, self-contained, and essential search queries. The goal is to generate queries that, when answered, provide all the necessary facts to answer/verify the Input.
@@ -101,10 +101,10 @@ class SelfCorrectionInput(pydantic.BaseModel):
     context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
 
 class SelfCorrectionOutput(pydantic.BaseModel):
-    status: str = pydantic.Field(..., regex=r"^(correct|partial|incorrect|unsupported)$", description="The evaluation status of the proposed answer.")
+    status: str = pydantic.Field(..., pattern=r"^(correct|partial|incorrect|unsupported)$", description="The evaluation status of the proposed answer.")
     refined_answer: str = pydantic.Field(..., description="The refined answer after verification.")
     reasoning: str = pydantic.Field(..., description="The reasoning process behind the evaluation and refinement of the answer.")
-    confidence_level: str = pydantic.Field(..., regex=r"^(high|medium|low)$", description="The confidence level of the refined answer (high, medium, low).")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="The confidence level of the refined answer (high, medium, low).")
 
 
 REPHRASE_QUESTION_PROMPT = """You are a Prompt Refiner, an AI expert skilled at transforming unclear or complex questions into precise, answerable queries. Your primary goal is to enhance the clarity and effectiveness of questions while preserving their original intent.
