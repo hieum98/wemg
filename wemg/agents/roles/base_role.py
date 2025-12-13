@@ -27,9 +27,10 @@ class BaseLLMRole:
         if history is None:
             history = [system_message]
         else:
-            assert history[0]["role"] == "system" and history[0]["content"] == self.system_prompt, \
-                f"The first message in history must be the system prompt of {self.__class__.__name__}. Got: {history[0]} but expected: {system_message}"
-        user_content = "\n\n".join([f"{key}: {value}" for key, value in input_data.model_dump().items()])
+            logger.warning("The history is provided externally. Ensure that all examples are compatible with this role.")
+            assert 'system' not in [msg['role'] for msg in history], "History should not contain a system message."
+            history = [system_message] + history
+        user_content = "\n\n".join([f"{key}:\n{value}" for key, value in input_data.model_dump().items()])
         user_message = {"role": "user", "content": user_content}
         return history + [user_message]
 

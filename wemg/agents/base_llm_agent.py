@@ -46,7 +46,7 @@ class BaseClient:
         self.max_tokens = generate_kwargs.get('max_tokens', 8192) # default max tokens to generate
         self.max_inputs_tokens = generate_kwargs.get('max_input_tokens', 32768) # default max input tokens
         self.top_k = generate_kwargs.get('top_k', 20)
-        self.enable_thinking = generate_kwargs.get('enable_thinking', None)
+        self.enable_thinking = generate_kwargs.get('enable_thinking', True) # enable chain-of-thought by default
         self.random_seed = generate_kwargs.get('random_seed', None)
         self.structure_output_supported = False
         

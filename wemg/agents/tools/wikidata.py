@@ -114,7 +114,10 @@ class WikidataProperty(pydantic.BaseModel):
     
     pid: str = pydantic.Field(..., description="Wikidata Property ID (e.g., P31)")
     label: Optional[str] = pydantic.Field("", description="The property label/name")
-    description: Optional[Any] = pydantic.Field(..., description="The description associated with the property")
+    description: Optional[str] = pydantic.Field(..., description="The description associated with the property")
+
+    def __hash__(self):
+        return hash(self.pid)
 
 
 class WikiTriple(pydantic.BaseModel):
