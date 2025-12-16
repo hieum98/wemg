@@ -1,9 +1,10 @@
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
 import openai
 from openai import ChatCompletion
 import pydantic
@@ -298,6 +299,8 @@ class OpenAIClient(BaseClient):
             'seed': kwargs.get('random_seed', self.random_seed),
             'response_format': response_format,
             'timeout': kwargs.get('timeout', self.timeout),
+            'logprobs': kwargs.get('logprobs', None),
+            'top_logprobs': kwargs.get('top_logprobs', None),
             'extra_body': {
                 "top_k": kwargs.get('top_k', self.top_k),
                 "chat_template_kwargs": {"enable_thinking": True if enable_thinking else None},
@@ -434,6 +437,99 @@ class BaseLLMAgent:
         client = self.get_client()
         return client.embedding(inputs, **kwargs)
     
+    def _calculate_score(self, logprobs_content) -> Tuple[str, float]:
+        """
+        Extracts 'yes' and 'no' logprobs and calculates the softmax score.
+        """
+        # Dictionary to store logprobs for target tokens
+        token_probs = {"yes": -9999.0, "no": -9999.0}
+        
+        # logprobs_content is a list of TopLogprob objects. 
+        # We only look at the first generated token.
+        if not logprobs_content:
+            return "no", 0.0
+
+        first_token_logprobs = logprobs_content[0].top_logprobs
+        
+        for token_data in first_token_logprobs:
+            # Clean the token string (remove whitespace/lower case if needed, though Qwen is usually precise)
+            token_str = token_data.token.strip().lower()
+            if token_str in token_probs:
+                token_probs[token_str] = token_data.logprob
+
+        yes_logprob = token_probs["yes"]
+        no_logprob = token_probs["no"]
+
+        # Softmax: score = exp(yes) / (exp(yes) + exp(no))
+        # Optimized as sigmoid of difference: 1 / (1 + exp(no - yes))
+        try:
+            score = 1.0 / (1.0 + np.exp(no_logprob - yes_logprob))
+        except OverflowError:
+            score = 0.0 if no_logprob > yes_logprob else 1.0
+
+        label = "yes" if score > 0.5 else "no"
+        return label, score
+    
+    def get_reranking_scores(self, query: str, 
+                             documents: List[Union[str, List[str]]],
+                             instruction: str = None,
+                             ) -> Tuple[List[str], List[float]]:
+        """Get reranking scores for documents given a query.
+        
+        Args:
+            query: The query string or list of strings.
+            documents: List of document strings or list of list of strings.
+            **kwargs: Additional keyword arguments for embedding generation.
+        Returns:
+            List of yes/no labels and their corresponding scores.
+        """
+        if instruction is None:
+            instruction = "Given a web search query, retrieve relevant passages that answer the query"
+        if isinstance(documents, str):
+            documents = [documents]
+        def create_messages(query: str, doc: str, instruction: str) -> List[Dict[str, str]]:
+            return [
+                {
+                    "role": "system",
+                    "content": "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."
+                },
+                {
+                    "role": "user",
+                    "content": f"<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {doc}"
+                }
+            ]
+
+        client: OpenAIClient = self.get_client()
+        all_messages = [create_messages(query, doc, instruction) for doc in documents]
+        kwargs = {
+            'temperature': 0.0,
+            'max_tokens': 1, # only need to generate one token ('yes' or 'no')
+            'n': 1,
+            'timeout': 30,
+            'logprobs': True,
+            'top_logprobs': 20,
+            'enable_thinking': False,
+        }
+        with ThreadPoolExecutor(max_workers=client.concurrency) as executor:
+            future_to_index = {
+                executor.submit(client.completion, messages, **kwargs): idx
+                for idx, messages in enumerate(all_messages)
+            }
+            labels = [None] * len(documents)
+            scores = [0.0] * len(documents)
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                try:
+                    response: litellm.ModelResponse = future.result()
+                    label, score = self._calculate_score(response.choices[0].logprobs.content)
+                    labels[idx] = label
+                    scores[idx] = score
+                except Exception as e:
+                    logger.error(f"Error during reranking for document {idx}: {e}")
+                    labels[idx] = "no"
+                    scores[idx] = 0.0
+        return labels, scores
+
 
 
 

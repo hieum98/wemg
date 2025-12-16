@@ -33,6 +33,9 @@ class Entity(pydantic.BaseModel):
     description: Optional[str] = pydantic.Field(None, description="A brief description or context for the entity.")
     is_scalar: bool = pydantic.Field(..., description="Indicates whether the entity is scalar (e.g., date, quantity) or not.")
 
+    def __hash__(self):
+        return hash(self.name)
+
 class NEROutput(pydantic.BaseModel):
     entities: List[Entity] = pydantic.Field(..., description="A list of extracted named entities.")
 
@@ -63,6 +66,9 @@ class Relation(pydantic.BaseModel):
     relation: str = pydantic.Field(..., description="The type of relationship between the subject and object.")
     object: str = pydantic.Field(..., description="The object entity in the relationship.")
     evidence: Optional[str] = pydantic.Field(None, description="Brief supporting evidence from the text for the relationship.")
+    
+    def __hash__(self):
+        return hash((self.subject, self.relation, self.object))
 
 class RelationExtractionInput(pydantic.BaseModel):
     text: str = pydantic.Field(..., description="The input text from which to extract relationships.")
