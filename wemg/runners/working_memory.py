@@ -12,8 +12,8 @@ from pyparsing import Optional
 from wemg.agents import roles
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.tools import wikidata
-from wemg.agents.tools.web_search import WebSearchTool
 from wemg.runners.interaction_memory import InteractionMemory
+from wemg.runners.procerduces.base_role_excercution import execute_role
 from wemg.runners.procerduces.openie import parse_graph_from_text
 from wemg.utils.graph_utils import get_densest_node, textualize_graph
 from wemg.utils.preprocessing import get_node_id
@@ -71,32 +71,31 @@ class WorkingMemory:
         llm_agent: BaseLLMAgent, 
         question: str, 
         raw_memory: str,
-        interaction_memory: Optional[InteractionMemory] = None,
+        interaction_memory: InteractionMemory = None,
         max_consolidation_tokens: int = 8192,
         ):
-        memory_consolidation_role = roles.extractor.MemoryConsolidationRole()
-        memory_consolidation_input = roles.extractor.MemoryConsolidationInput(
-            question=question,
-            memory=raw_memory
+        consolidation_input = roles.extractor.MemoryConsolidationInput(question=question, memory=raw_memory)
+        response, consolidation_log = asyncio.run(
+            execute_role(
+                llm_agent=llm_agent,
+                role=roles.extractor.MemoryConsolidationRole(),
+                input_data=consolidation_input,
+                interaction_memory=interaction_memory,
+                n=1,
+                max_tokens=max_consolidation_tokens
+            )
         )
-        memory_consolidation_messages = memory_consolidation_role.format_messages(input_data=memory_consolidation_input, interaction_memory=interaction_memory)
-        consolidation_kwargs = {
-            'output_schema': roles.extractor.MemoryConsolidationOutput,
-            'n': 1,
-            'max_tokens': max_consolidation_tokens
-        }
-        consolidation_response = llm_agent.generator_role_execute(memory_consolidation_messages, **consolidation_kwargs)[0][0]
-        consolidation_output: roles.extractor.MemoryConsolidationOutput = memory_consolidation_role.parse_response(consolidation_response)
-        return consolidation_output
+        consolidation_output: roles.extractor.MemoryConsolidationOutput = response[0]
+        return consolidation_output, consolidation_log
 
     def consolidate_textual_memory(
             self, 
             llm_agent: BaseLLMAgent, 
             question: str, 
-            interaction_memory: Optional[InteractionMemory] = None,
+            interaction_memory: InteractionMemory = None,
             ):
         """Consolidate the textual memory with respect to the question."""
-        consolidation_output: roles.extractor.MemoryConsolidationOutput = self.memory_consolidation(
+        consolidation_output, consolidation_log = self.memory_consolidation(
             llm_agent=llm_agent,
             question=question,
             raw_memory=self.format_textual_memory(),
@@ -108,6 +107,16 @@ class WorkingMemory:
                 self.add_textual_memory(item.content, source=roles.extractor.SourceType.SYSTEM_PREDICTION)
             else:
                 self.add_textual_memory(item.content, source=item.provenance)
+        
+        # Process logs
+        if consolidation_log and interaction_memory:
+            for k, v in consolidation_log.items():
+                model_input, model_output = zip(*v)
+                interaction_memory.log_turn(
+                    role=k,
+                    user_input=list(model_input),
+                    assistant_output=list(model_output)
+                )
 
     def parse_graph_memory_from_textual_memory(self, llm_agent: BaseLLMAgent, interaction_memory: InteractionMemory = None):
         textual_memory = self.format_textual_memory()
@@ -337,10 +346,10 @@ class WorkingMemory:
         llm_agent: BaseLLMAgent,
         question: str,
         interaction_memory: Optional[InteractionMemory] = None
-    ) -> nx.DiGraph:
+    ) -> tuple[nx.DiGraph, Dict[str, List[tuple[str, str]]]]:
         """Process a single cluster asynchronously: consolidate memory and parse graph."""
         # Run memory consolidation in thread pool to avoid blocking
-        consolidation_output: roles.extractor.MemoryConsolidationOutput = await asyncio.to_thread(
+        consolidation_output, consolidation_log = await asyncio.to_thread(
             self.memory_consolidation,
             llm_agent=llm_agent,
             question=question,
@@ -363,12 +372,13 @@ class WorkingMemory:
             text=consolidated_cluster_text
         )
         
-        return cluster_graph
+        return cluster_graph, consolidation_log
     
     def consolidate_graph_memory(self, 
                                  llm_agent: BaseLLMAgent, 
                                  question: str, 
-                                 interaction_memory: Optional[InteractionMemory] = None):
+                                 interaction_memory: InteractionMemory = None
+                                 ):
         components = list(nx.weakly_connected_components(self.graph_memory))
         self.graph_memory = nx.DiGraph()  # reset graph memory
         all_cluster_text = []
@@ -382,7 +392,7 @@ class WorkingMemory:
             all_cluster_text.append(cluster_raw_text)
         
         # Process all clusters concurrently
-        consolidated_graphs = asyncio.run(
+        consolidated_graphs, consolidation_logs = asyncio.run(
             asyncio.gather(*[
                 self._process_cluster_async(cluster_text, llm_agent, question, interaction_memory=interaction_memory)
                 for cluster_text in all_cluster_text
@@ -392,6 +402,21 @@ class WorkingMemory:
         for cluster_graph in consolidated_graphs:
             # Merge cluster graph into main graph memory
             self.merge_graph_memory(cluster_graph)
+        
+        # Process logs
+        all_log_keys = set(sum([list(log.keys()) for log in consolidation_logs], []))
+        to_log_data = {}
+        for k in all_log_keys:
+            all_values = sum([log.get(k, []) for log in consolidation_logs], [])
+            to_log_data[k] = list(set(all_values))
+        if consolidation_logs and interaction_memory:
+            for k, v in to_log_data.items():
+                model_input, model_output = zip(*v)
+                interaction_memory.log_turn(
+                    role=k,
+                    user_input=list(model_input),
+                    assistant_output=list(model_output)
+                )
 
     def synchronize_memory(self, 
                            llm_agent: BaseLLMAgent,

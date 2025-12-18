@@ -17,8 +17,9 @@ async def execute_role(llm_agent: BaseLLMAgent, role: BaseLLMRole, input_data: U
         all_messages.append(messages)
 
     kwargs = {
-        'n': kwargs.get('n', 1),
-        'output_schema': role.output_model
+        'n': kwargs.pop('n', 1),
+        'output_schema': role.output_model,
+        **kwargs
     }
     response, raw_response = llm_agent.generator_role_execute(all_messages, **kwargs)
 
