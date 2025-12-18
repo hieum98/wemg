@@ -1,6 +1,7 @@
+import asyncio
 from datetime import datetime
 import gc
-from typing import List
+from typing import List, Union
 import logging
 import os
 import uuid
@@ -13,6 +14,89 @@ from sklearn.metrics.pairwise import cosine_similarity
 import torch
 
 from wemg.utils.preprocessing import approximate_token_count
+
+
+class AsyncReadWriteLock:
+    """
+    An async-compatible Read-Write Lock.
+    
+    Allows multiple concurrent readers OR a single exclusive writer.
+    Writers have priority to prevent starvation.
+    """
+    def __init__(self):
+        self._read_ready = asyncio.Condition()
+        self._readers = 0
+        self._writer = False
+        self._pending_writers = 0
+    
+    async def acquire_read(self):
+        """Acquire a read lock. Multiple readers can hold this simultaneously."""
+        async with self._read_ready:
+            # Wait while there's an active writer or pending writers (writer priority)
+            while self._writer or self._pending_writers > 0:
+                await self._read_ready.wait()
+            self._readers += 1
+    
+    async def release_read(self):
+        """Release a read lock."""
+        async with self._read_ready:
+            self._readers -= 1
+            if self._readers == 0:
+                self._read_ready.notify_all()
+    
+    async def acquire_write(self):
+        """Acquire an exclusive write lock."""
+        async with self._read_ready:
+            self._pending_writers += 1
+            try:
+                # Wait until no readers and no active writer
+                while self._readers > 0 or self._writer:
+                    await self._read_ready.wait()
+                self._writer = True
+            finally:
+                self._pending_writers -= 1
+    
+    async def release_write(self):
+        """Release the write lock."""
+        async with self._read_ready:
+            self._writer = False
+            self._read_ready.notify_all()
+    
+    def read_lock(self):
+        """Context manager for read lock."""
+        return _ReadLockContext(self)
+    
+    def write_lock(self):
+        """Context manager for write lock."""
+        return _WriteLockContext(self)
+
+
+class _ReadLockContext:
+    """Async context manager for read lock."""
+    def __init__(self, lock: AsyncReadWriteLock):
+        self._lock = lock
+    
+    async def __aenter__(self):
+        await self._lock.acquire_read()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._lock.release_read()
+        return False
+
+
+class _WriteLockContext:
+    """Async context manager for write lock."""
+    def __init__(self, lock: AsyncReadWriteLock):
+        self._lock = lock
+    
+    async def __aenter__(self):
+        await self._lock.acquire_write()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._lock.release_write()
+        return False
 
 
 logger = logging.getLogger(__name__)
@@ -76,6 +160,10 @@ class InteractionMemory:
             embedding_function=self.embedding_function,
             metadata={"hnsw:space": "cosine"},
         )
+        
+        # Read-Write lock for concurrent access
+        # Allows multiple concurrent reads (get_examples) but exclusive writes (log_turn)
+        self._rw_lock = AsyncReadWriteLock()
 
     def release(self, should_delete_db: bool = False):
         if isinstance(self.embedding_function, LocalCompatibleEmbedding):
@@ -95,21 +183,41 @@ class InteractionMemory:
         # This is critical for Vector DBs to actually free the RAM immediately
         gc.collect()
     
-    def log_turn(self, role: str, user_input: str, assistant_output: str):
-        turn_id = str(uuid.uuid4())
-        metadata = {
-                "role": role,
-                "assistant_output": assistant_output,
-                "timestamp": datetime.now().isoformat()
-            }
+    def log_turn(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]]):
+        """Synchronous version - use log_turn_async for concurrent access."""
+        if isinstance(user_input, str):
+            user_input = [user_input]
+        if isinstance(assistant_output, str):
+            assistant_output = [assistant_output]
+        assert len(user_input) == len(assistant_output), "user_input and assistant_output must have the same length"
+
+        turn_ids = []
+        metadatas = []
+        documents = []
+        for u_input, a_output in zip(user_input, assistant_output):
+            turn_id = str(uuid.uuid4())
+            metadata = {
+                    "role": role,
+                    "assistant_output": a_output,
+                    "timestamp": datetime.now().isoformat()
+                }
+            turn_ids.append(turn_id)
+            metadatas.append(metadata)
+            documents.append(u_input)
         self.collection.add(
-            documents=[user_input],
-            metadatas=[metadata],
-            ids=[turn_id]
+            documents=documents,
+            metadatas=metadatas,
+            ids=turn_ids
         )
+    
+    async def log_turn_async(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]]):
+        """Async version with write lock - exclusive access during writes."""
+        async with self._rw_lock.write_lock():
+            self.log_turn(role, user_input, assistant_output)
     
     def get_examples(self, role: str, query: str, k: int = 3, strategy: str = "mmr"):
         """
+        Synchronous version - use get_examples_async for concurrent access.
         strategy: 'similarity' (standard) or 'mmr' (diverse)
         """
         if strategy == "similarity":
@@ -125,6 +233,14 @@ class InteractionMemory:
             messages.pop(0) # remove the oldest example
             total_tokens = approximate_token_count([msg for pair in messages for msg in pair])
         return messages
+    
+    async def get_examples_async(self, role: str, query: str, k: int = 3, strategy: str = "mmr"):
+        """
+        Async version with read lock - allows multiple concurrent reads.
+        strategy: 'similarity' (standard) or 'mmr' (diverse)
+        """
+        async with self._rw_lock.read_lock():
+            return self.get_examples(role, query, k, strategy)
 
     def _fetch_similarity(self, role: str, query: str, k: int):
         """Standard KNN search provided by Chroma."""

@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Optional, Tuple, Union
 import logging
 import asyncio
 
@@ -7,7 +7,8 @@ from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.retriever_agent import RetrieverAgent
 from wemg.agents import roles
 from wemg.agents.tools import wikidata, web_search
-from wemg.runners.procerduces.extraction import extract_entities_from_text
+from wemg.runners.interaction_memory import InteractionMemory
+from wemg.runners.procerduces.base_role_excercution import execute_role
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
@@ -23,22 +24,61 @@ async def retrieve_from_web(query: str, retriever_agent: Union[web_search.WebSea
         return all_contents
     else:
         raise ValueError(f"Unsupported retriever agent type: {type(retriever_agent)}")
-    
+
 
 async def retrieve_entities_from_kb(
         llm_agent: BaseLLMAgent,
         wikidata_entity_retriever: wikidata.WikidataEntityRetrievalTool,
+        wikidata_property_retriever: wikidata.WikidataPropertyRetrievalTool,
         query: str = None,
-        entities: List[Union[roles.open_ie.Entity, wikidata.WikidataEntity]] = None,
-        top_k: int = 1,
-        ) -> Dict[roles.open_ie.Entity, wikidata.WikidataEntity]:
+        entities: List[Union[roles.open_ie.Entity, wikidata.WikidataEntity]] = [],
+        relations: List[Union[str, wikidata.WikidataProperty]] = [],
+        top_k_entities: int = 1,
+        top_k_properties: int = 1,
+        interaction_memory: Optional[InteractionMemory] = None,
+        ):
     assert query or entities, "Either query or entities must be provided for knowledge base retrieval."
 
-    if query and not entities:
-        # NER Extraction
-        entities = extract_entities_from_text(llm_agent, query)
+    if query:
+        # Query generation
+        graph_query_input = roles.generator.QueryGraphGeneratorInput(input_text=query)
+        responses, graph_query_log = await execute_role(
+            llm_agent=llm_agent,
+            role=roles.generator.StructuredQueryGenerator(),
+            input_data=graph_query_input,
+            interaction_memory=interaction_memory,
+            n=1
+        )
+        queries: List[roles.generator.Query] = responses[0].queries
+        for q in queries:
+            subject_entity = roles.open_ie.Entity(name=q.subject)
+            entities.append(subject_entity)
+            relations.append(q.relation)
     
     # Retrieve from Wikidata
+    not_wikidata_properties = []
+    wikidata_properties = []
+    if relations:
+        not_wikidata_properties = [rel for rel in relations if isinstance(rel, str)]
+        not_wikidata_properties = list(set(not_wikidata_properties)) # deduplicate
+        wikidata_properties = [rel for rel in relations if isinstance(rel, wikidata.WikidataProperty)]
+    property_dict = {}
+    if not_wikidata_properties:
+        logger.info(f"Starting Wikidata property retrieval for properties: {not_wikidata_properties}")
+        retrieval_results = await wikidata_property_retriever.ainvoke(
+            {
+                "query": not_wikidata_properties,
+                "top_k_results": top_k_properties
+            }
+        )
+        retrieval_results = [[prop for prop in result if isinstance(prop, wikidata.WikidataProperty)] for result in retrieval_results] # filter out non-wikidata results
+        for item, result in zip(not_wikidata_properties, retrieval_results):
+            if result:
+                property_dict[item] = result
+                wikidata_properties.extend(result)
+        logger.info(f"Retrieved {len(wikidata_properties)} Wikidata properties.")
+    all_properties = list(set(wikidata_properties))
+
     not_wikidata_entities = [ent for ent in entities if isinstance(ent, roles.open_ie.Entity)]
     not_wikidata_entities = set(not_wikidata_entities) # deduplicate
     wikidata_entities = [ent for ent in entities if isinstance(ent, wikidata.WikidataEntity)]
@@ -49,52 +89,33 @@ async def retrieve_entities_from_kb(
         retrieval_results = await wikidata_entity_retriever.ainvoke(
             {
                 "query": [ent.name for ent in not_wikidata_entities],
-                "num_entities": top_k
+                "num_entities": top_k_entities
             }
         )
         retrieval_results = [[ent for ent in result if isinstance(ent, wikidata.WikidataEntity)] for result in retrieval_results] # filter out non-wikidata results
         for item, result in zip(not_wikidata_entities, retrieval_results):
             if result:
-                enitity_dict[item] = result[0] # take the top-1 entity
+                enitity_dict[item] = result
                 retrieved_wikidata_entities.extend(result)
         logger.info(f"Retrieved Wikidata {len(retrieved_wikidata_entities)} entities")
     all_wikidata_entities = wikidata_entities + retrieved_wikidata_entities
     # deduplicate entities based on QID
-    unique_entities = {ent.qid: ent for ent in all_wikidata_entities if ent.qid}
-    unique_entities_list: List[wikidata.WikidataEntity] = list(unique_entities.values())
-    logger.info(f"Gathered {len(unique_entities_list)} unique Wikidata entities.")
-    return unique_entities, enitity_dict
+    unique_entities = list(set(all_wikidata_entities))
+    logger.info(f"Gathered {len(unique_entities)} unique Wikidata entities.")
+    return unique_entities, enitity_dict, all_properties, property_dict, graph_query_log
 
 
-async def retrieve_from_kb(
-        llm_agent: BaseLLMAgent,
-        wikidata_entity_retriever: wikidata.WikidataEntityRetrievalTool,
+async def retrieve_triples(
         wikidata_triple_retriever: wikidata.WikidataKHopTriplesRetrievalTool,
-        query: Union[str, List[str]] = None,
-        entities: List[Union[roles.open_ie.Entity, wikidata.WikidataEntity]] = None,
-        top_k: int = 1,
+        entities: List[wikidata.WikidataEntity],
         n_hops: int = 1,
-        ) -> Tuple[List[wikidata.WikiTriple], Dict[roles.open_ie.Entity, wikidata.WikidataEntity]]:
-    assert query or entities, "Either query or entities must be provided for knowledge base retrieval."
-    if isinstance(query, list):
-        # check all start by "Q" or "P"
-        assert all(isinstance(q, str) and q.startswith("Q") for q in query), "When query is a list, all items must be Wikidata QIDs (start with 'Q')."
-        unique_entities_list = [wikidata.WikidataEntity(qid=qid, name="", description="") for qid in query] # Fake entities with only QID to retrieve triples later
-        enitity_dict = {}
-    else:
-        unique_entities_list, enitity_dict = await retrieve_entities_from_kb(
-            llm_agent=llm_agent,
-            wikidata_entity_retriever=wikidata_entity_retriever,
-            query=query,
-            entities=entities,
-            top_k=top_k,
-        )
+        ) -> List[wikidata.WikiTriple]:
 
     # Retrieve k-hop triples
     all_triples = []
-    if unique_entities_list:
+    if entities:
         logger.info("Starting k-hop triple retrieval from Wikidata.")
-        all_qids = [ent.qid for ent in unique_entities_list]
+        all_qids = [ent.qid for ent in entities if isinstance(ent, wikidata.WikidataEntity)]
         all_triples = await wikidata_triple_retriever.ainvoke(
             {
                 "query": all_qids,
@@ -110,51 +131,102 @@ async def retrieve_from_kb(
         all_triples = list(set(all_triples))
 
     logger.info(f"Retrieved {len(all_triples)} triples from Wikidata.")
-    return all_triples, enitity_dict
-
-
-def get_wiki_id(query: Union[List[str], str], id_type: str, top_k: int=1) -> List[str]:
-    """Retrieve Wikidata IDs (item: QID or property: PID) for the given queries."""
-    wikidata_wrapper = wikidata.CustomWikidataAPIWrapper(top_k_results=top_k)
-    if isinstance(query, str):
-        query = [query]
-    query = list(set(query))  # deduplicate
-    results = wikidata_wrapper._get_id(query, id_type=id_type)
-    results = [[item for item in x if item] for x in results]  # filter out empty results
-    assert len(results) == len(query), "Mismatch in number of results and queries."
-    mapped_results = {q: res for q, res in zip(query, results)}
-    return mapped_results
+    return all_triples
         
+
+async def retrieve_from_kb(
+        llm_agent: BaseLLMAgent,
+        question: str,
+        entities: List[Union[roles.open_ie.Entity, wikidata.WikidataEntity]] = [],
+        relations: List[Union[str, wikidata.WikidataProperty]] = [],
+        top_k_entities: int = 1,
+        top_k_properties: int = 1,
+        n_hops: int = 1,
+        use_question_for_graph_retrieval: bool = False,
+        interaction_memory: Optional[InteractionMemory] = None,
+        ):
+    # Retrieve Wikidata entities and props
+    wikidata_entity_retriever = wikidata.WikidataEntityRetrievalTool()
+    wikidata_property_retriever = wikidata.WikidataPropertyRetrievalTool()
+    entities, entity_dict, relations, property_dict, graph_query_log = await retrieve_entities_from_kb(
+        llm_agent=llm_agent,
+        wikidata_entity_retriever=wikidata_entity_retriever,
+        wikidata_property_retriever=wikidata_property_retriever,
+        query=question if use_question_for_graph_retrieval else None,
+        entities=entities,
+        relations=relations,
+        top_k_entities=top_k_entities,
+        top_k_properties=top_k_properties,
+        interaction_memory=interaction_memory
+    )
+
+    wikidata_wrapper = wikidata.CustomWikidataAPIWrapper(
+        wikidata_props=[r.pid for r in relations],
+        wikidata_props_with_labels={r.pid: {'label': r.label, 'description': r.description} for r in relations}
+    )
+    wikidata_triple_retriever = wikidata.WikidataKHopTriplesRetrievalTool(wikidata_wrapper=wikidata_wrapper)
+
+    retrieved_triples = await retrieve_triples(
+        wikidata_triple_retriever=wikidata_triple_retriever,
+        entities=entities,
+        n_hops=n_hops
+    )
+
+    return retrieved_triples, entity_dict, property_dict, graph_query_log
+
+
+async def explore(
+        llm_agent: BaseLLMAgent,
+        retriever_agent: Union[web_search.WebSearchTool, RetrieverAgent],
+        question: str,
+        entities: List[Union[roles.open_ie.Entity, wikidata.WikidataEntity]] = [],
+        relations: List[Union[str, wikidata.WikidataProperty]] = [],
+        top_k_websearch: int = 5,
+        top_k_entities: int = 1,
+        top_k_properties: int = 1,
+        n_hops: int = 1,
+        use_question_for_graph_retrieval: bool = False,
+        interaction_memory: Optional[InteractionMemory] = None,
+        ):
+    # webseach
+    # queries, web_retriever_to_log_data = await generate_web_queries(llm_agent=llm_agent, question=question)
+    websearch_query_input = roles.generator.QueryGeneratorInput(input_text=question)
+    responses, websearch_query_log =  await execute_role(
+            llm_agent=llm_agent,
+            role=roles.generator.QueryGenerator(),
+            input_data=websearch_query_input,
+            interaction_memory=interaction_memory,
+            n=1
+        )
+    queries: List[str] = responses[0].queries
+    # Concurently run the websearch
+    tasks = [retrieve_from_web(query, retriever_agent=retriever_agent, top_k=top_k_websearch) for query in queries]
+    documents = await asyncio.gather(*tasks)
+    documents = sum(documents, [])
+    documents = list(set(documents))
+
+    # KB search
+    retrieved_triples, entity_dict, property_dict, graph_query_log = await retrieve_from_kb(
+        llm_agent=llm_agent,
+        question=question,
+        entities=entities,
+        relations=relations,
+        top_k_entities=top_k_entities,
+        top_k_properties=top_k_properties,
+        n_hops=n_hops,
+        use_question_for_graph_retrieval=use_question_for_graph_retrieval,
+        interaction_memory=interaction_memory
+    )
+    # Process log data
+    all_log_keys = set(list(websearch_query_log.keys()) + list(graph_query_log.keys()))
+    to_log_data = {key: websearch_query_log.get(key, []) + graph_query_log.get(key, []) for key in all_log_keys}
+    return documents, retrieved_triples, entity_dict, property_dict, to_log_data
+
 
 if __name__ == "__main__":
     import asyncio
     from wemg.agents.tools import wikidata
 
-    # Configure logging
-    log_level = os.getenv("LOGGING_LEVEL", "DEBUG")
-    logging.basicConfig(level=log_level)
-
-    entities = [
-        roles.open_ie.Entity(name="Barack Obama", description="44th President of the United States", is_scalar=False),
-        roles.open_ie.Entity(name="Heisenberg", description="Famous physicist known for the uncertainty principle", is_scalar=False),
-        wikidata.WikidataEntity(
-            qid="Q917",
-            name="Albert Einstein",
-            description="German-born theoretical physicist",
-        )
-    ]
-
-    entity_retriever = wikidata.WikidataEntityRetrievalTool()
-    triple_retriever = wikidata.WikidataKHopTriplesRetrievalTool()
-
-    results = asyncio.run(retrieve_from_kb(
-        llm_agent=None,
-        wikidata_entity_retriever=entity_retriever,
-        wikidata_triple_retriever=triple_retriever,
-        entities=entities,
-        top_k=1,
-        n_hops=2,
-    ))
     
 
     

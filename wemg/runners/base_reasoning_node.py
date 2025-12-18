@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Dict, List, Optional
 import pydantic
@@ -46,8 +47,25 @@ class NodeState(pydantic.BaseModel):
        
         return self        
 
+    def __str__(self):
+        if self.node_type == NodeType.FINAL_ANSWER:
+            text = f"Final Answer: {self.content['final_answer']}"
+            if 'reasoning' in self.content:
+                text += f"\nReasoning: {self.content['reasoning']}"
+        elif self.node_type == NodeType.SUB_QA_NODE:
+            text = f"Sub Question: {self.content['sub_question']}\nSub Answer: {self.content['sub_answer']}"
+            if 'reasoning' in self.content:
+                text += f"\nReasoning: {self.content['reasoning']}"
+        elif self.node_type == NodeType.REPHASED_QUESTION_NODE:
+            text = f"Rephrased Question: {self.content['sub_question']}"
+        elif self.node_type == NodeType.SELF_CORRECTED_NODE:
+            text = f"Sub Question: {self.content['sub_question']}\nSub Answer: {self.content['sub_answer']}"
+        elif self.node_type == NodeType.SYNTHESIS_NODE:
+            text = f"{self.content['synthesized_reasoning']}"
+        return text
 
-class BaseReasoningNode(NodeMixin):
+
+class BaseReasoningNode(ABC, NodeMixin):
     def __init__(
             self, 
             node_state: NodeState,
@@ -57,9 +75,9 @@ class BaseReasoningNode(NodeMixin):
     ):  
         self.node_state = node_state
         self.node_type = node_state.node_type
-        self.parent = parent
+        self.parent: Optional['BaseReasoningNode'] = parent
         if children:
-            self.children = children
+            self.children: List['BaseReasoningNode'] = children
         content = node_state.content
 
         self.user_question = content['user_question']
@@ -88,6 +106,20 @@ class BaseReasoningNode(NodeMixin):
             if node: 
                 trajectory.append(node.node_state)
         return trajectory
+    
+    def get_reasoning_trace(self) -> str:
+        """Get the reasoning trace from the root to this node."""
+        trajectory = self.get_trajectory()
+        reasoning_trace: List[str] = []
+        for node in trajectory:
+            if node.node_type in [NodeType.SUB_QA_NODE, NodeType.SYNTHESIS_NODE]:
+                reasoning_trace.append(str(node))
+            elif node.node_type == NodeType.SELF_CORRECTED_NODE:
+                reasoning_trace[-1] += f"\nSelf Corrected: {str(node)}"
+            elif node.node_type == NodeType.FINAL_ANSWER:
+                reasoning_trace.append(str(node))
+        reasoning_trace = [f"Step {i+1}:\n {step.strip()}" for i, step in enumerate(reasoning_trace)]
+        return "\n".join(reasoning_trace)
 
     def is_terminal(self) -> bool:
         """Check if the node is a terminal node."""
@@ -96,4 +128,13 @@ class BaseReasoningNode(NodeMixin):
     def is_valid_leaf(self) -> bool:
         """Check if the node is a valid leaf node."""
         return self.node_type == NodeType.FINAL_ANSWER
+    
+    def is_root(self) -> bool:
+        """Check if the node is a root node."""
+        return self.parent is None
+    
+    @abstractmethod
+    def generate_children(self) -> List['BaseReasoningNode']:
+        """Generate children nodes for the current node."""
 
+    

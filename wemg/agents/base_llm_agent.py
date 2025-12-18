@@ -129,6 +129,7 @@ class BaseClient:
                         parsed_output = output_schema.model_validate_json(choice.message.content)
                         output = {
                             'output': parsed_output.model_dump() if hasattr(parsed_output, 'model_dump') else parsed_output,
+                            'raw_output': choice.message.content,
                             'reasoning': reasoning,
                             'is_valid': True
                         }
@@ -137,12 +138,14 @@ class BaseClient:
                         if attempts == self.max_retries - 1:
                             output = {
                                 'output': choice.message.content,
+                                'raw_output': choice.message.content,
                                 'reasoning': reasoning,
                                 'is_valid': False
                             }
                 else:
                     output = {
                         'output': choice.message.content,
+                        'raw_output': choice.message.content,
                         'reasoning': reasoning,
                         'is_valid': True
                     }
@@ -394,7 +397,7 @@ class BaseLLMAgent:
     def generator_role_execute(self, 
                      messages: Union[List[Dict[str, str]], List[List[Dict[str, str]]]],
                      **kwargs
-                     ) -> List[List[Any]]:
+                     ) -> Tuple[List[List[Any]], List[Optional[str]]]:
         output_schema = kwargs.get('output_schema', None)
         if output_schema is not None:
             assert issubclass(output_schema, pydantic.BaseModel), "Output schema must be a subclass of pydantic.BaseModel"
@@ -405,9 +408,14 @@ class BaseLLMAgent:
             _, results = client.generate(0, messages, **kwargs)
             results = [results]
         all_outputs = [None] * len(results)
+        all_raw_outputs = [None] * len(results)
         for idx, res in enumerate(results):
             outputs = []
+            raw_output = None
             for item in res:
+                if raw_output is None and item['is_valid']:
+                    # Only capture the first valid raw output
+                    raw_output = item['raw_output']
                 # Convert output to pydantic model if schema is provided and output is valid
                 if output_schema:
                     if item['is_valid']:
@@ -430,8 +438,10 @@ class BaseLLMAgent:
                             logger.error(f"Failed to parse output even after extraction: {e2}")
                 else:
                     outputs.append(item['output'])
+                
             all_outputs[idx] = outputs
-        return all_outputs
+            all_raw_outputs[idx] = raw_output
+        return all_outputs, all_raw_outputs
     
     def get_embeddings(self, inputs: Union[List[str], str], **kwargs):
         client = self.get_client()
@@ -528,6 +538,10 @@ class BaseLLMAgent:
                     logger.error(f"Error during reranking for document {idx}: {e}")
                     labels[idx] = "no"
                     scores[idx] = 0.0
+        # sort by scores descending
+        sorted_indices = np.argsort(scores)[::-1]
+        labels = [labels[i] for i in sorted_indices]
+        scores = [scores[i] for i in sorted_indices]
         return labels, scores
 
 

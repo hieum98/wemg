@@ -23,6 +23,9 @@ class ExtractionInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The user's question.")
     raw_data: str = pydantic.Field(..., description="The raw text data to be analyzed.")
 
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+
 class ExtractionOutput(pydantic.BaseModel):
     information: List[str] = pydantic.Field(
         ...,
@@ -109,6 +112,9 @@ class MemoryConsolidationInput(pydantic.BaseModel):
         ..., 
         description="The raw memory to consolidate, formatted as a list of tagged items (each starting with [System Prediction] or [Retrieval])."
     )
+
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
 
 
 class MemoryItem(pydantic.BaseModel):

@@ -32,6 +32,9 @@ class SubquestionGenerationInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
     context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
 
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+
 class SubquestionGenerationOutput(pydantic.BaseModel):
     is_answerable: bool = pydantic.Field(..., description="Indicates if the main question can be answered with the provided context.")
     subquestion: Optional[str] = pydantic.Field(None, description="The generated subquestion if the main question is not answerable with the context.")
@@ -50,6 +53,9 @@ ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-rea
 class AnswerGenerationInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
     context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
+
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
 
 class AnswerGenerationOutput(pydantic.BaseModel):
     answer: str = pydantic.Field(..., description="The final answer to the question.")
@@ -78,6 +84,9 @@ GENERATE_QUERIES_FOR_RETRIEVER = """"You are a highly advanced Reasoning Engine.
 class QueryGeneratorInput(pydantic.BaseModel):
     input_text: str = pydantic.Field(..., description="The input text (question or statement) to be deconstructed into queries.")
 
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+
 class QueryGeneratorOutput(pydantic.BaseModel):
     queries: List[str] = pydantic.Field(..., description="The list of generated search queries.")
 
@@ -99,6 +108,9 @@ class SelfCorrectionInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
     proposed_answer: str = pydantic.Field(..., description="The proposed answer to be verified.")
     context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
+
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
 
 class SelfCorrectionOutput(pydantic.BaseModel):
     status: str = pydantic.Field(..., pattern=r"^(correct|partial|incorrect|unsupported)$", description="The evaluation status of the proposed answer.")
@@ -122,6 +134,9 @@ REPHRASE_QUESTION_PROMPT = """You are a Prompt Refiner, an AI expert skilled at 
 
 class QuestionRephraserInput(pydantic.BaseModel):
     original_question: str = pydantic.Field(..., description="The original question to be rephrased.")
+
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
 
 class QuestionRephraserOutput(pydantic.BaseModel):
     rephrased_question: str = pydantic.Field(..., description="The rephrased, clearer version of the original question.")
@@ -149,10 +164,16 @@ class QueryGraphGeneratorInput(pydantic.BaseModel):
     entities: Optional[List[str]] = pydantic.Field(None, description="An optional list of entities to focus on for query generation.")
     relations: Optional[List[str]] = pydantic.Field(None, description="An optional list of relations to use for query generation.")
 
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+
 class Query(pydantic.BaseModel):
     subject: str = pydantic.Field(..., description="The subject entity in the query.")
-    relation: str = pydantic.Field(..., description="The relation type in the query.")
+    relation: str = pydantic.Field(..., description="The relation should be queried for the subject.")
     reasoning: Optional[str] = pydantic.Field(None, description="The reasoning behind the inclusion of this query.")
+
+    def __hash__(self):
+        return hash((self.subject, self.relation))
 
 class QueryGraphGeneratorOutput(pydantic.BaseModel):
     queries: List[Query] = pydantic.Field(..., description="A list of generated queries.")

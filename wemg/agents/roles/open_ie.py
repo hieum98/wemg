@@ -28,6 +28,9 @@ NER_EXTRACTION_PROMPT = """You are an expert Named Entity Recognition (NER) spec
 class NERInput(pydantic.BaseModel):
     text: str = pydantic.Field(..., description="The input text from which to extract named entities.")
 
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+
 class Entity(pydantic.BaseModel):
     name: str = pydantic.Field(..., description="The name of the extracted entity.")
     description: Optional[str] = pydantic.Field(None, description="A brief description or context for the entity.")
@@ -69,10 +72,19 @@ class Relation(pydantic.BaseModel):
     
     def __hash__(self):
         return hash((self.subject, self.relation, self.object))
-
+    
+    def __str__(self):
+        text =  f"Subject: {self.subject}\nRelation: {self.relation}\nObject: {self.object}"
+        if self.evidence:
+            text += f"\nEvidence: {self.evidence}"
+        return text
+    
 class RelationExtractionInput(pydantic.BaseModel):
     text: str = pydantic.Field(..., description="The input text from which to extract relationships.")
     entities: Optional[List[str]] = pydantic.Field(None, description="An optional list of entities to focus on for relationship extraction.")
+
+    def __str__(self):
+        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
 
 class RelationExtractionOutput(pydantic.BaseModel):
     relations: List[Relation] = pydantic.Field(..., description="A list of extracted relationships between entities.")

@@ -417,7 +417,7 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
     """Custom Wikidata API Wrapper with enhanced item retrieval."""
 
     # add wikidata_props_with_labels property
-    wikidata_props_with_labels: Dict[str, Dict[str, Optional[str]]] = {pid: PROPERTY_LABELS[pid] for pid in PROPERTY_LABELS}
+    wikidata_props_with_labels: Dict[str, Dict[str, Optional[str]]] = {}
     wikidata_props: List[str] = DEFAULT_PROPERTIES
 
     @staticmethod

@@ -1,22 +1,27 @@
 from collections import defaultdict
+import copy
 from enum import Enum
 import logging
 import os
 from typing import Any, Dict, List, Tuple, Union, Set
 import networkx as nx
+import asyncio
+
+from pyparsing import Optional
 
 from wemg.agents import roles
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.tools import wikidata
 from wemg.agents.tools.web_search import WebSearchTool
-from wemg.runners.procerduces.extraction import extract_relations_from_text
-from wemg.utils.graph_utils import get_densest_node
+from wemg.runners.interaction_memory import InteractionMemory
+from wemg.runners.procerduces.openie import parse_graph_from_text
+from wemg.utils.graph_utils import get_densest_node, textualize_graph
 from wemg.utils.preprocessing import get_node_id
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
-class Memory:
+class WorkingMemory:
     def __init__(
             self,
             textual_memory: List[str] = [],
@@ -24,6 +29,9 @@ class Memory:
             parsed_graph_memory: Union[nx.DiGraph, None] = None,
             max_textual_memory_tokens: int = 8192,
     ):  
+        assert isinstance(textual_memory, list), "textual_memory must be a list of strings"
+        if not textual_memory:
+            textual_memory = []
         self.entity_dict: Dict[roles.open_ie.Entity, wikidata.WikidataEntity] = {} # mapping from open_ie.Entity to wikidata.WikidataEntity
         self.property_dict: Dict[str, wikidata.WikidataProperty] = {} # mapping from property name to wikidata.WikidataProperty
         self.id_dict: Dict[str, wikidata.WikidataEntity] = {} # mapping from node_id to wikidata.WikidataEntity
@@ -36,14 +44,20 @@ class Memory:
             self.parsed_graph_memory: nx.DiGraph = parsed_graph_memory
 
         self.max_textual_memory_tokens = max_textual_memory_tokens
+
+    @staticmethod
+    def format_memory_item(content: str, provenance: roles.extractor.SourceType) -> str:
+        """Format a memory item with its provenance tag."""
+        if provenance == roles.extractor.SourceType.SYSTEM_PREDICTION:
+            return f"[System Prediction]: {content.strip()}"
+        elif provenance == roles.extractor.SourceType.RETRIEVAL:
+            return f"[Retrieval]: {content.strip()}"
+        else:
+            return content.strip()
     
     def add_textual_memory(self, text: str, source: roles.extractor.SourceType=roles.extractor.SourceType.SYSTEM_PREDICTION):
         """Add text to textual memory if not already present."""
-        text = text.strip()
-        if source == roles.extractor.SourceType.SYSTEM_PREDICTION:
-            text = f"[System Prediction]: {text}"
-        elif source == roles.extractor.SourceType.RETRIEVAL:
-            text = f"[Retrieval]: {text}"
+        text = self.format_memory_item(text, source)
         if text not in self.textual_memory:
             self.textual_memory.append(text)
 
@@ -51,61 +65,61 @@ class Memory:
         """Format the textual memory as a single string."""
         memory = [f"- {text.strip()}" for text in self.textual_memory]
         return "\n".join(memory)
+    
+    @staticmethod
+    def memory_consolidation(
+        llm_agent: BaseLLMAgent, 
+        question: str, 
+        raw_memory: str,
+        interaction_memory: Optional[InteractionMemory] = None,
+        max_consolidation_tokens: int = 8192,
+        ):
+        memory_consolidation_role = roles.extractor.MemoryConsolidationRole()
+        memory_consolidation_input = roles.extractor.MemoryConsolidationInput(
+            question=question,
+            memory=raw_memory
+        )
+        memory_consolidation_messages = memory_consolidation_role.format_messages(input_data=memory_consolidation_input, interaction_memory=interaction_memory)
+        consolidation_kwargs = {
+            'output_schema': roles.extractor.MemoryConsolidationOutput,
+            'n': 1,
+            'max_tokens': max_consolidation_tokens
+        }
+        consolidation_response = llm_agent.generator_role_execute(memory_consolidation_messages, **consolidation_kwargs)[0][0]
+        consolidation_output: roles.extractor.MemoryConsolidationOutput = memory_consolidation_role.parse_response(consolidation_response)
+        return consolidation_output
 
     def consolidate_textual_memory(
             self, 
             llm_agent: BaseLLMAgent, 
             question: str, 
-            in_context_examples: List[Dict[str, str]] = None,
+            interaction_memory: Optional[InteractionMemory] = None,
             ):
         """Consolidate the textual memory with respect to the question."""
-        memory_consolidation_role = roles.extractor.MemoryConsolidationRole()
-        memory_consolidation_input = roles.extractor.MemoryConsolidationInput(
+        consolidation_output: roles.extractor.MemoryConsolidationOutput = self.memory_consolidation(
+            llm_agent=llm_agent,
             question=question,
-            memory=self.format_textual_memory()
+            raw_memory=self.format_textual_memory(),
+            interaction_memory=interaction_memory,
+            max_consolidation_tokens=self.max_textual_memory_tokens,
         )
-        memory_consolidation_messages = memory_consolidation_role.format_messages(input_data=memory_consolidation_input, history=in_context_examples)
-        consolidation_kwargs = {
-            'output_schema': roles.extractor.MemoryConsolidationOutput,
-            'n': 1,
-            'max_tokens': self.max_textual_memory_tokens
-        }
-        consolidation_response = llm_agent.generator_role_execute(memory_consolidation_messages, **consolidation_kwargs)[0][0]
-        consolidation_output: roles.extractor.MemoryConsolidationOutput = memory_consolidation_role.parse_response(consolidation_response)
         for item in consolidation_output.consolidated_memory:
             if item.provenance not in [roles.extractor.SourceType.SYSTEM_PREDICTION.value, roles.extractor.SourceType.RETRIEVAL.value]:
                 self.add_textual_memory(item.content, source=roles.extractor.SourceType.SYSTEM_PREDICTION)
             else:
                 self.add_textual_memory(item.content, source=item.provenance)
-    
-    def consolidate_textual_memory_rerank(self):
-        pass
 
-    def remove_textual_memory(self):
-        pass
-    
-    def update_textual_memory(self):
-        pass
-
-    def parse_graph_memory_from_textual_memory(self, llm_agent: BaseLLMAgent):
+    def parse_graph_memory_from_textual_memory(self, llm_agent: BaseLLMAgent, interaction_memory: InteractionMemory = None):
         textual_memory = self.format_textual_memory()
-        relation_triples = extract_relations_from_text(llm_agent=llm_agent, text=textual_memory)
-        for triple in relation_triples:
-            subject_id = get_node_id(triple.subject)
-            object_id = get_node_id(triple.object)
-            if not self.parsed_graph_memory.has_node(subject_id):
-                self.parsed_graph_memory.add_node(subject_id, data=triple.subject)
-            if not self.parsed_graph_memory.has_node(object_id):
-                self.parsed_graph_memory.add_node(object_id, data=triple.object)
-            if not self.parsed_graph_memory.has_edge(subject_id, object_id):
-                self.parsed_graph_memory.add_edge(
-                    subject_id,
-                    object_id,
-                    relation={triple.relation}
-                    )
-            else:
-                # append relation to the existing set
-                self.parsed_graph_memory.edges[subject_id, object_id]['relation'].add(triple.relation)
+        self.parsed_graph_memory, re_log = parse_graph_from_text(llm_agent=llm_agent, text=textual_memory, interaction_memory=interaction_memory)
+        if re_log and interaction_memory:
+            for k, v in re_log.items():
+                model_input, model_output = zip(*v)
+                interaction_memory.log_turn(
+                    role=k,
+                    user_input=list(model_input),
+                    assistant_output=list(model_output)
+                )
 
     def add_edge_to_graph_memory(self, wiki_triple: wikidata.WikiTriple):
         subject_id = get_node_id(wiki_triple.subject)
@@ -243,14 +257,15 @@ class Memory:
                     self.graph_memory.nodes[node_id]['data'] = ent
                     logger.info(f"Updated node {node_id} with full entity details.")
 
-    def consolidate_graph_memory(self):
-        pass
-
-    def synchronize_memories(self):
-        relation_triples = []
-        for subject_id, object_id, edge_data in self.parsed_graph_memory.edges(data=True):
-            subject_entity = self.parsed_graph_memory.nodes[subject_id].get('data')
-            object_entity = self.parsed_graph_memory.nodes[object_id].get('data')
+    def merge_graph_memory(self, other_graph: nx.DiGraph):
+        relation_triples: List[roles.open_ie.Relation] = []
+        for subject_id, object_id, edge_data in other_graph.edges(data=True):
+            subject_entity = other_graph.nodes[subject_id].get('data')
+            if not subject_entity:
+                continue
+            object_entity = other_graph.nodes[object_id].get('data')
+            if not object_entity:
+                continue
             for relation_name in edge_data.get('relation', []):
                 relation_triples.append(
                     roles.open_ie.Relation(
@@ -315,9 +330,96 @@ class Memory:
         # Make graph memory connected
         self.connect_graph_memory()
         self.update_graph_memory() # ensure all nodes have full details, mostly for newly added nodes via connectivity
+    
+    async def _process_cluster_async(
+        self,
+        cluster_raw_text: str,
+        llm_agent: BaseLLMAgent,
+        question: str,
+        interaction_memory: Optional[InteractionMemory] = None
+    ) -> nx.DiGraph:
+        """Process a single cluster asynchronously: consolidate memory and parse graph."""
+        # Run memory consolidation in thread pool to avoid blocking
+        consolidation_output: roles.extractor.MemoryConsolidationOutput = await asyncio.to_thread(
+            self.memory_consolidation,
+            llm_agent=llm_agent,
+            question=question,
+            raw_memory=cluster_raw_text,
+            interaction_memory=interaction_memory,
+            max_consolidation_tokens=self.max_textual_memory_tokens,
+        )
+        
+        consolidated_texts = []
+        for item in consolidation_output.consolidated_memory:
+            consolidated_texts.append(
+                self.format_memory_item(item.content, item.provenance)
+            )
+        consolidated_cluster_text = "\n".join([f"- {text}" for text in consolidated_texts])
+        
+        # Parse graph from consolidated cluster text
+        cluster_graph = await asyncio.to_thread(
+            parse_graph_from_text,
+            llm_agent=llm_agent,
+            text=consolidated_cluster_text
+        )
+        
+        return cluster_graph
+    
+    def consolidate_graph_memory(self, 
+                                 llm_agent: BaseLLMAgent, 
+                                 question: str, 
+                                 interaction_memory: Optional[InteractionMemory] = None):
+        components = list(nx.weakly_connected_components(self.graph_memory))
+        self.graph_memory = nx.DiGraph()  # reset graph memory
+        all_cluster_text = []
+        for comp in components:
+            all_triples, _ = textualize_graph(comp, self.graph_memory, method='dfs')
+            all_triples = [
+                self.format_memory_item(triple, roles.extractor.SourceType.RETRIEVAL) for triple in all_triples
+            ]
+            cluster_raw_text = [f"- {triple}" for triple in all_triples]
+            cluster_raw_text = "\n".join(cluster_raw_text)
+            all_cluster_text.append(cluster_raw_text)
+        
+        # Process all clusters concurrently
+        consolidated_graphs = asyncio.run(
+            asyncio.gather(*[
+                self._process_cluster_async(cluster_text, llm_agent, question, interaction_memory=interaction_memory)
+                for cluster_text in all_cluster_text
+            ])
+        )
+        
+        for cluster_graph in consolidated_graphs:
+            # Merge cluster graph into main graph memory
+            self.merge_graph_memory(cluster_graph)
 
+    def synchronize_memory(self, 
+                           llm_agent: BaseLLMAgent,
+                           question: str,
+                           interaction_memory: Optional[InteractionMemory] = None
+                           ):
+        """Sync graph memory to textual memory and vice versa."""
+
+        # Consolidate graph memory
+        self.consolidate_graph_memory(llm_agent=llm_agent, question=question, interaction_memory=interaction_memory)
+
+        # Sync textual memory to graph memory
+        if self.textual_memory:
+            if not self.parsed_graph_memory or self.parsed_graph_memory.number_of_nodes() == 0:
+                self.parse_graph_memory_from_textual_memory(llm_agent=llm_agent, interaction_memory=interaction_memory)
+            textual_memory_graph = copy.deepcopy(self.parsed_graph_memory)
+            self.merge_graph_memory(textual_memory_graph)
+        
         # Sync graph memory to textual memory
-
+        if self.graph_memory and self.graph_memory.number_of_nodes() > 0:
+            components = list(nx.weakly_connected_components(self.graph_memory))
+            for comp in components:
+                all_triples, _ = textualize_graph(comp, self.graph_memory, method='dfs')
+                for triple in all_triples:
+                    self.add_textual_memory(triple, source=roles.extractor.SourceType.RETRIEVAL)
+        
+        # Consolidate textual memory
+        self.consolidate_textual_memory(llm_agent=llm_agent, question=question, interaction_memory=interaction_memory)
     
     
 

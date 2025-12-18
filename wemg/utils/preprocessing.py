@@ -1,6 +1,6 @@
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Any
+import pydantic
 import tiktoken
-from traitlets import Any
 
 from wemg.agents import roles
 from wemg.agents.tools import wikidata
@@ -23,3 +23,15 @@ def get_node_id(entity: Any) -> str:
         return str(entity.name)
     else:
         return str(entity)
+    
+
+def format_context(memory: str = None, retrieval_info: List[str] = [], reasoning_trace: str = None) -> str:
+    retrieval_info = [f"- [Retrieval]: {content.strip()}" for content in retrieval_info]
+    retrieval_info = "\n".join(retrieval_info)
+
+    fact_context = [memory, retrieval_info]
+    fact_context = "\n".join([fc for fc in fact_context if fc])
+    fact_context = "**Information** \n" + fact_context if fact_context else ""
+    reasoning_context = f"**Reasoning Trace** \n{reasoning_trace}" if reasoning_trace else ""
+    all_context = [fact_context, reasoning_context]
+    return "\n---------------\n".join([ac for ac in all_context if ac])
