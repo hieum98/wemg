@@ -3,11 +3,9 @@ import copy
 from enum import Enum
 import logging
 import os
-from typing import Any, Dict, List, Tuple, Union, Set
+from typing import Any, Dict, List, Optional, Tuple, Union, Set
 import networkx as nx
 import asyncio
-
-from pyparsing import Optional
 
 from wemg.agents import roles
 from wemg.agents.base_llm_agent import BaseLLMAgent

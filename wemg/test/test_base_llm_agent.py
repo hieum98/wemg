@@ -510,8 +510,8 @@ class TestBaseLLMAgent:
             assert isinstance(result, str)
             print(f"✓ Sample {i+1}: {result[:50]}")
     
-    def test_retriever_role_execute_single(self, agent):
-        """Test retriever_role_execute with single text."""
+    def test_get_embeddings_single(self, agent):
+        """Test get_embeddings with single text."""
         try:
             # Note: This requires an embedding model endpoint
             embedding_agent = BaseLLMAgent(
@@ -523,19 +523,19 @@ class TestBaseLLMAgent:
             )
             
             text = "This is a test sentence."
-            embedding = embedding_agent.retriever_role_execute([text])
+            embedding = embedding_agent.get_embeddings(text)
             
             if embedding is not None:
                 assert isinstance(embedding, list)
                 assert len(embedding) > 0
-                print(f"✓ Retriever single embedding dimension: {len(embedding)}")
+                print(f"✓ Single embedding dimension: {len(embedding)}")
             else:
                 pytest.skip("Embedding generation returned None")
         except Exception as e:
             pytest.skip(f"Embedding model not available: {e}")
     
-    def test_retriever_role_execute_batch(self, agent):
-        """Test retriever_role_execute with batch texts."""
+    def test_get_embeddings_batch(self, agent):
+        """Test get_embeddings with batch texts."""
         try:
             embedding_agent = BaseLLMAgent(
                 client_type='openai',
@@ -551,12 +551,12 @@ class TestBaseLLMAgent:
                 "Third sentence.",
             ]
             
-            embeddings = embedding_agent.retriever_role_execute(texts)
+            embeddings = embedding_agent.get_embeddings(texts)
             
             if embeddings is not None:
                 assert isinstance(embeddings, list)
                 assert len(embeddings) == len(texts)
-                print(f"✓ Retriever batch: {len(embeddings)} embeddings")
+                print(f"✓ Batch embeddings: {len(embeddings)} embeddings")
             else:
                 pytest.skip("Embedding generation returned None")
         except Exception as e:

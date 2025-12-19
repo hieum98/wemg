@@ -42,10 +42,13 @@ class MajorityVoteInput(pydantic.BaseModel):
     answers: List[str] = pydantic.Field(..., description="A list of answers to the question.")
 
     def __str__(self):
-        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+        all_answers = [f"{i+1}.\n {answer}" for i, answer in enumerate(self.answers)]
+        answers_str = "\n\n".join(all_answers)
+        return f"question:\n{self.question}\n\nanswers:\n{answers_str}"
 
 class MajorityVoteOutput(pydantic.BaseModel):
     final_answer: str = pydantic.Field(..., description="The final answer determined by majority voting.")
+    concise_answer: str = pydantic.Field(..., description="A concise version of the final answer.")
     reasoning: str = pydantic.Field(..., description="The reasoning behind the final answer.")
     confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="The confidence level of the final answer (high, medium, low).")
 
@@ -85,10 +88,13 @@ class FinalAnswerSynthesisInput(pydantic.BaseModel):
     candidate_answers: List[str] = pydantic.Field(..., description="A list of candidate answers to the question.")
 
     def __str__(self):
-        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+        all_candidates = [f"{i+1}.\n {candidate}" for i, candidate in enumerate(self.candidate_answers)]
+        candidates_str = "\n\n".join(all_candidates)
+        return f"question:\n{self.question}\n\ncandidate_answers:\n{candidates_str}"
 
 class FinalAnswerSynthesisOutput(pydantic.BaseModel):
     final_answer: str = pydantic.Field(..., description="The synthesized final answer.")
+    concise_answer: str = pydantic.Field(..., description="A concise version of the final answer.")
     reasoning: str = pydantic.Field(..., description="The reasoning leading to the final answer which integrates the best elements of the candidate answers.")
     confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="The confidence level of the final answer (high, medium, low).")
 

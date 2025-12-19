@@ -1,6 +1,6 @@
 import math
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pyparsing import Union
 from typing_extensions import TypedDict
 import asyncio
@@ -10,8 +10,6 @@ from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.retriever_agent import RetrieverAgent
 from wemg.agents.tools import web_search, wikidata
 from wemg.runners.base_reasoning_node import BaseReasoningNode, NodeType, NodeState
-# from wemg.runners.procerduces.extraction import extract_info_from_raw_text
-# from wemg.runners.procerduces.generation import answer_question
 from wemg.runners.procerduces.base_role_excercution import execute_role
 from wemg.runners.procerduces.retrieval import explore
 from wemg.runners.working_memory import WorkingMemory
@@ -57,14 +55,14 @@ class MCTSReasoningNode(BaseReasoningNode):
             node.value = (node.value * (node.visits - 1) + reward) / node.visits
             node = node.parent
 
-    def _merge_results(self, results: List[tuple]) -> tuple:
+    def _merge_results(self, results: List[tuple]):
         """Merge results from multiple concurrent tasks.
         
         Each result can be either:
         - 5-tuple: (nodes, triples, entity_dict, property_dict, log)
         - 2-tuple: (nodes, log)
         """
-        all_nodes = []
+        all_nodes: List[MCTSReasoningNode] = []
         all_triples = []
         all_entity_dict = {}
         all_property_dict = {}
@@ -91,9 +89,10 @@ class MCTSReasoningNode(BaseReasoningNode):
             retriever_agent: Union[web_search.WebSearchTool, RetrieverAgent],
             working_memory: WorkingMemory, 
             interaction_memory: Optional[InteractionMemory] = None,
+            is_cot_simulation: bool = False,
             **node_generation_kwargs
-            ):
-        """Generate children nodes for this node."""
+            ) -> List["MCTSReasoningNode"]:
+        """Generate children nodes for this node and update working memory."""
         common_kwargs = {
             'llm_agent': llm_agent,
             'working_memory': working_memory,
@@ -105,6 +104,11 @@ class MCTSReasoningNode(BaseReasoningNode):
         if self.depth > self.max_depth:
             results = asyncio.run(asyncio.gather(
                 self._generate_final_answer(**retriever_kwargs)
+            ))
+        elif is_cot_simulation:
+            # Simulate to get the answer by only generate subqa node
+            results = asyncio.run(asyncio.gather(
+                self._generate_subqa(**retriever_kwargs)
             ))
         elif self.node_state.node_type == NodeType.USER_QUESTION:
             results = asyncio.run(asyncio.gather(
@@ -135,6 +139,40 @@ class MCTSReasoningNode(BaseReasoningNode):
             raise ValueError(f"Unsupported node type: {self.node_state.node_type}")
         nodes, retrieved_triples, entity_dict, property_dict, to_log_data = self._merge_results(results)
         
+        # Update working memory with retrieved information
+        working_memory.entity_dict.update(entity_dict)
+        working_memory.property_dict.update(property_dict)
+        
+        # Add retrieved triples to graph memory
+        for triple in retrieved_triples:
+            working_memory.add_edge_to_graph_memory(triple)
+        
+        # Add node content to textual memory based on node type
+        for child in nodes:
+            if child.node_state.node_type == NodeType.SUB_QA_NODE:
+                sub_q = child.node_state.content.get('sub_question', '')
+                sub_a = child.node_state.content.get('sub_answer', '')
+                if sub_q and sub_a:
+                    working_memory.add_textual_memory(
+                        f"Q: {sub_q}; A: {sub_a}",
+                        source=roles.extractor.SourceType.SYSTEM_PREDICTION
+                    )
+            elif child.node_state.node_type == NodeType.SELF_CORRECTED_NODE:
+                sub_q = child.node_state.content.get('sub_question', '')
+                sub_a = child.node_state.content.get('sub_answer', '')
+                if sub_q and sub_a:
+                    working_memory.add_textual_memory(
+                        f"Q: {sub_q}; A: {sub_a}",
+                        source=roles.extractor.SourceType.SYSTEM_PREDICTION
+                    )
+            elif child.node_state.node_type == NodeType.SYNTHESIS_NODE:
+                synthesis = child.node_state.content.get('synthesized_reasoning', '')
+                if synthesis:
+                    working_memory.add_textual_memory(
+                        f"{synthesis}",
+                        source=roles.extractor.SourceType.SYSTEM_PREDICTION
+                    )
+        
         # Update interaction memory
         if interaction_memory and to_log_data:
             for key, value in to_log_data.items():
@@ -144,7 +182,7 @@ class MCTSReasoningNode(BaseReasoningNode):
                     user_input=list(model_input),
                     assistant_output=list(model_output)
                 )
-        return nodes, retrieved_triples, entity_dict, property_dict
+        return nodes
     
     async def _generate_answer(self, 
                             llm_agent: BaseLLMAgent, 
@@ -468,13 +506,13 @@ def select(tree: MCTSSearchTree, exploration_weight=1.0) -> List[MCTSReasoningNo
     node = tree['root']
     while True:
         # 1. if node is unvisited or terminal, return the path
-        if not node.children:
+        if not node.children or node.is_terminal():
             path.append(node)
             return path
         
         # 2. a node has children, but not all of them are explored, select a random unexplored child
         # Note: In this implementation, we need to explore all children before going deeper
-        unexplored_children = [child for child in node.children if child.visits == 0]
+        unexplored_children = [child for child in node.children if child not in tree['explored_nodes']]
         if unexplored_children:
             node = random.choice(unexplored_children)
             path.append(node)
@@ -488,11 +526,324 @@ def select(tree: MCTSSearchTree, exploration_weight=1.0) -> List[MCTSReasoningNo
 
 def expand(
         tree: MCTSSearchTree, 
+        selected_node: MCTSReasoningNode,
+        llm_agent: BaseLLMAgent,
+        retriever_agent: Union[web_search.WebSearchTool, RetrieverAgent],
         working_memory: WorkingMemory, 
-        interaction_memory: Optional[InteractionMemory] = None
-        ):
-    """Expand the tree by generating children nodes for the selected node using the working memory and interaction memory."""
-    selected_path = select(tree)
-    leaf = selected_path[-1]
-
+        interaction_memory: Optional[InteractionMemory] = None,
+        is_cot_simulation: bool = False,
+        **node_generation_kwargs
+        ) -> List[MCTSReasoningNode]:
+    """Expand the tree by generating children nodes for the selected node."""
+    # Skip expansion for terminal nodes
+    if selected_node.is_terminal():
+        tree['explored_nodes'].add(selected_node)
+        return []
     
+    # Generate children nodes - this also updates working memory
+    children_nodes = selected_node.generate_children(
+        llm_agent=llm_agent,
+        retriever_agent=retriever_agent,
+        working_memory=working_memory,
+        interaction_memory=interaction_memory,
+        is_cot_simulation=is_cot_simulation,
+        **node_generation_kwargs
+    )
+    
+    # Add children to the selected node by setting their parent
+    # In anytree, setting child.parent automatically updates parent.children
+    for child in children_nodes:
+        child.parent = selected_node
+    
+    tree['explored_nodes'].add(selected_node)
+    
+    return children_nodes
+
+
+def simulate(
+        node: MCTSReasoningNode,
+        llm_agent: BaseLLMAgent,
+        retriever_agent: Union[web_search.WebSearchTool, RetrieverAgent],
+        working_memory: WorkingMemory,
+        interaction_memory: Optional[InteractionMemory] = None,
+        is_cot_simulation: bool = True,
+        max_simulation_depth: int = 5,
+        **node_generation_kwargs
+        ) -> MCTSReasoningNode:
+    """Simulate a random playout from the given node to a terminal state.
+    
+    This performs a rollout using chain-of-thought (CoT) simulation when is_cot_simulation=True,
+    which generates only subqa nodes until reaching a final answer. When is_cot_simulation=False,
+    it uses standard simulation by randomly selecting from all generated children node types.
+    
+    Working memory is updated automatically by generate_children() during the simulation.
+    """
+    current_node = node
+    simulation_depth = 0
+    
+    while not current_node.is_terminal() and simulation_depth < max_simulation_depth:
+        # Generate children - this also updates working memory internally
+        children_nodes = current_node.generate_children(
+            llm_agent=llm_agent,
+            retriever_agent=retriever_agent,
+            working_memory=working_memory,
+            interaction_memory=interaction_memory,
+            is_cot_simulation=is_cot_simulation,
+            **node_generation_kwargs
+        )
+        
+        if not children_nodes:
+            # No children generated, terminate simulation
+            break
+        
+        # Select a random child for simulation
+        current_node = random.choice(children_nodes)
+        
+        # Link the child to parent for trajectory tracking
+        current_node.parent = node if simulation_depth == 0 else current_node.parent
+        
+        simulation_depth += 1
+    
+    return current_node
+
+
+async def evaluate(
+        node: MCTSReasoningNode,
+        llm_agent: BaseLLMAgent,
+        interaction_memory: Optional[InteractionMemory] = None,
+        golden_answer: Optional[str] = None
+        ) -> float:
+    """Evaluate a terminal node and return a reward score."""
+    if node.node_state.node_type != NodeType.FINAL_ANSWER:
+        # Non-terminal nodes get a default low reward
+        return 0.1
+    
+    user_question = node.user_question
+    final_answer = node.node_state.content.get('final_answer', '')
+    
+    # Use golden_answer from node if available
+    correct_answer = golden_answer or node.golden_answer or "Not available"
+    
+    # Prepare evaluation input
+    eval_input = roles.evaluator.AnswerEvaluationInput(
+        user_question=user_question,
+        system_answer=final_answer,
+        correct_answer=correct_answer
+    )
+    
+    # Execute evaluation
+    eval_results, eval_log = await execute_role(
+        llm_agent=llm_agent,
+        role=roles.evaluator.Evaluator(),
+        input_data=eval_input,
+        interaction_memory=interaction_memory,
+        n=1
+    )
+    
+    if eval_results:
+        eval_output: roles.evaluator.AnswerEvaluationOutput = eval_results[0]
+        # Normalize rating from 0-10 to 0-1
+        reward = eval_output.rating / 10.0
+    else:
+        # Default reward if evaluation fails
+        reward = 0.5
+    
+    return reward
+
+
+def evaluate_sync(
+        node: MCTSReasoningNode,
+        llm_agent: BaseLLMAgent,
+        interaction_memory: Optional[InteractionMemory] = None,
+        golden_answer: Optional[str] = None
+        ) -> float:
+    """Synchronous wrapper for the evaluate function."""
+    return asyncio.run(evaluate(node, llm_agent, interaction_memory, golden_answer))
+
+
+def mcts_search(
+        question: str,
+        llm_agent: BaseLLMAgent,
+        retriever_agent: Union[web_search.WebSearchTool, RetrieverAgent],
+        working_memory: WorkingMemory,
+        interaction_memory: Optional[InteractionMemory] = None,
+        num_iterations: int = 10,
+        exploration_weight: float = 1.0,
+        is_cot_simulation: bool = True,
+        max_tree_depth: int = 10,
+        max_simulation_depth: int = 5,
+        golden_answer: Optional[str] = None,
+        **node_generation_kwargs
+        ) -> Tuple[Dict, MCTSSearchTree]:
+    """Run Monte Carlo Tree Search to find the best reasoning path.
+    
+    The MCTS algorithm consists of four phases:
+    1. Selection: Select a path from root to a leaf using UCT
+    2. Expansion: Expand the selected leaf by generating children
+    3. Simulation: Simulate a rollout from the expanded node to a terminal state
+    4. Backpropagation: Update values along the path based on simulation result
+    
+    Args:
+        question: The user's question (root node content)
+        llm_agent: The language model agent
+        retriever_agent: The retriever agent for external knowledge
+        working_memory: The working memory containing context
+        interaction_memory: Optional interaction memory for logging
+        num_iterations: Number of MCTS iterations to run
+        exploration_weight: Weight for exploration in UCT formula
+        is_cot_simulation: If True, use chain-of-thought style simulation
+        max_simulation_depth: Maximum depth for simulation rollouts
+        golden_answer: Optional ground truth answer for evaluation
+        **node_generation_kwargs: Additional arguments for node generation
+        
+    Returns:
+        Tuple of (best terminal node content, explored search tree)
+    """
+    # Initialize the search tree
+    root_node_state = NodeState(node_type=NodeType.USER_QUESTION, content={'user_question': question})
+    root_node = MCTSReasoningNode(node_state=root_node_state, max_depth=max_tree_depth)
+    tree: MCTSSearchTree = {
+        'root': root_node,
+        'explored_nodes': set()
+    }
+    
+    best_terminal_node: Optional[MCTSReasoningNode] = None
+    best_reward: float = -float('inf')
+    
+    for iteration in range(num_iterations):
+        # Phase 1: Selection - Select path from root to leaf
+        path = select(tree, exploration_weight)
+        selected_node = path[-1]
+        
+        # Phase 2: Expansion - Generate children for selected node
+        # Working memory is updated automatically by expand/generate_children
+        if not selected_node.is_terminal():
+            children = expand(
+                tree=tree,
+                selected_node=selected_node,
+                llm_agent=llm_agent,
+                retriever_agent=retriever_agent,
+                working_memory=working_memory,
+                interaction_memory=interaction_memory,
+                is_cot_simulation=False,  # Use full expansion, not CoT
+                **node_generation_kwargs
+            )
+            
+            # Select a child for simulation (prefer unexplored)
+            if children:
+                selected_node = random.choice(children)
+        
+        # Phase 3: Simulation - Rollout to terminal state
+        # Working memory is updated automatically by simulate/generate_children
+        if not selected_node.is_terminal():
+            terminal_node = simulate(
+                node=selected_node,
+                llm_agent=llm_agent,
+                retriever_agent=retriever_agent,
+                working_memory=working_memory,
+                interaction_memory=interaction_memory,
+                is_cot_simulation=is_cot_simulation,
+                max_simulation_depth=max_simulation_depth,
+                **node_generation_kwargs
+            )
+        else:
+            terminal_node = selected_node
+        
+        # Phase 4: Evaluation and Backpropagation
+        reward = evaluate_sync(
+            node=terminal_node,
+            llm_agent=llm_agent,
+            interaction_memory=interaction_memory,
+            golden_answer=golden_answer
+        )
+        
+        # Backpropagate reward through the path
+        for node in path:
+            node.backpropagate(reward)
+
+        # Sync the working memory after each iteration
+        working_memory.synchronize_memory(
+            llm_agent=llm_agent,
+            question=question,
+            interaction_memory=interaction_memory
+        )
+        
+        # Track best terminal node
+        if terminal_node.is_terminal() and reward > best_reward:
+            best_reward = reward
+            best_terminal_node = terminal_node
+    
+    return best_terminal_node.node_state.content, tree
+
+
+def get_answer(tree: MCTSSearchTree,
+               llm_agent: BaseLLMAgent,
+               interaction_memory: Optional[InteractionMemory] = None
+               ) -> str:
+    """Get the final answer from the explored tree."""
+    terminal_nodes: List[MCTSReasoningNode] = []
+    def collect_terminals(node: MCTSReasoningNode):
+        if node.is_terminal():
+            terminal_nodes.append(node)
+        for child in node.children:
+            collect_terminals(child)
+    collect_terminals(tree['root'])
+    
+    if not terminal_nodes:
+        return "No final answer found."
+
+    all_answers = []
+    for node in terminal_nodes:
+        final_answer = node.node_state.content.get('final_answer', '')
+        if final_answer:
+            all_answers.append(final_answer)
+    try:
+        answer_synthesis_input = roles.evaluator.FinalAnswerSynthesisInput(
+            question=tree['root'].user_question,
+            candidate_answers=all_answers
+        )
+        synthesis_results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.evaluator.FinalAnswerSynthesizer(),
+            input_data=answer_synthesis_input,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        if synthesis_results:
+            synthesis_output: roles.evaluator.FinalAnswerSynthesisOutput = synthesis_results[0]
+            answer = synthesis_output.final_answer
+            short_answer = synthesis_output.concise_answer
+        else:
+            raise ValueError("No synthesis results returned.")
+    except:
+        # Fallback: Majority vote
+        majority_vote_input = roles.evaluator.MajorityVoteInput(
+            question=tree['root'].user_question,
+            answers=all_answers
+        )
+        vote_results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.evaluator.MajorityVoter(),
+            input_data=majority_vote_input,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        if vote_results:
+            vote_output: roles.evaluator.MajorityVoteOutput = vote_results[0]
+            answer = vote_output.final_answer
+            short_answer = vote_output.concise_answer
+        else:
+            answer = "Unable to determine final answer."
+            short_answer = answer
+    
+    # Process logging
+    if log and interaction_memory:
+        for key, value in log.items():
+            model_input, model_output = zip(*value)
+            interaction_memory.log_turn(
+                role=key,
+                user_input=list(model_input),
+                assistant_output=list(model_output)
+            )
+    return answer, short_answer
+

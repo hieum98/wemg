@@ -245,7 +245,6 @@ class TestRetrieverAgent:
         )
         
         contents2, scores2 = new_agent.retrieve(query, top_k=2)
-        breakpoint()
         # The results should be the same
         assert contents1 == contents2
         
