@@ -14,7 +14,7 @@ class NodeType(Enum):
     SUB_QA_NODE = "SUBQUESTION" 
     # Node type for rephrase question, i.e., the intermediate node for rephrased question. 
     # This node must be followed by a SUBQUESTION node and be generated from a USER_QUESTION or SUBQUESTION node.
-    REPHASED_QUESTION_NODE = "REPHASE_QUESTION"
+    REPHRASED_QUESTION_NODE = "REPHASE_QUESTION"
     # Node type for self-correcting reasoning, i.e., the intermediate node for self-correcting reasoning.
     # This node must be generated from a SUBQUESTION node
     SELF_CORRECTED_NODE = "SELF_CORRECT"
@@ -38,8 +38,8 @@ class NodeState(pydantic.BaseModel):
             assert 'final_answer' in self.content, "FINAL_ANSWER node must have 'final_answer' in content."
         elif self.node_type == NodeType.SUB_QA_NODE:
             assert 'sub_question' in self.content and 'sub_answer' in self.content, "SUB_QA_NODE must have 'sub_question' and 'sub_answer' in content."
-        elif self.node_type == NodeType.REPHASED_QUESTION_NODE:
-            assert 'sub_question' in self.content, "REPHASED_QUESTION_NODE must have 'sub_question' in content."
+        elif self.node_type == NodeType.REPHRASED_QUESTION_NODE:
+            assert 'sub_question' in self.content, "REPHRASED_QUESTION_NODE must have 'sub_question' in content."
         elif self.node_type == NodeType.SELF_CORRECTED_NODE:
             assert 'sub_question' in self.content and 'sub_answer' in self.content, "SELF_CORRECTED_NODE must have 'sub_question' and 'sub_answer' in content."
         elif self.node_type == NodeType.SYNTHESIS_NODE:
@@ -56,7 +56,7 @@ class NodeState(pydantic.BaseModel):
             text = f"Sub Question: {self.content['sub_question']}\nSub Answer: {self.content['sub_answer']}"
             if 'reasoning' in self.content:
                 text += f"\nReasoning: {self.content['reasoning']}"
-        elif self.node_type == NodeType.REPHASED_QUESTION_NODE:
+        elif self.node_type == NodeType.REPHRASED_QUESTION_NODE:
             text = f"Rephrased Question: {self.content['sub_question']}"
         elif self.node_type == NodeType.SELF_CORRECTED_NODE:
             text = f"Sub Question: {self.content['sub_question']}\nSub Answer: {self.content['sub_answer']}"
@@ -84,9 +84,9 @@ class BaseReasoningNode(ABC, NodeMixin):
         self.golden_answer = content.get('golden_answer', None)
         self.max_depth = max_depth
 
-        if self.node_type == NodeType.REPHASED_QUESTION_NODE:
+        if self.node_type == NodeType.REPHRASED_QUESTION_NODE:
             assert parent.node_type in [NodeType.USER_QUESTION, NodeType.SUB_QA_NODE], \
-                "REPHASED_QUESTION_NODE must be generated from USER_QUESTION or SUB_QA_NODE."
+                "REPHRASED_QUESTION_NODE must be generated from USER_QUESTION or SUB_QA_NODE."
         elif self.node_type == NodeType.SELF_CORRECTED_NODE:
             assert parent.node_type == NodeType.SUB_QA_NODE, \
                 "SELF_CORRECTED_NODE must be generated from SUB_QA_NODE."

@@ -133,6 +133,7 @@ REPHRASE_QUESTION_PROMPT = """You are a Prompt Refiner, an AI expert skilled at 
 """
 
 class QuestionRephraserInput(pydantic.BaseModel):
+    context: Optional[str] = pydantic.Field(None, description="The context to consider when rephrasing the question.")
     original_question: str = pydantic.Field(..., description="The original question to be rephrased.")
 
     def __str__(self):
@@ -141,6 +142,40 @@ class QuestionRephraserInput(pydantic.BaseModel):
 class QuestionRephraserOutput(pydantic.BaseModel):
     rephrased_question: str = pydantic.Field(..., description="The rephrased, clearer version of the original question.")
     reasoning: str = pydantic.Field(..., description="The reasoning process behind the rephrasing of the question.")
+
+
+SYNTHESIZE_PROMPT = """You are a specialized AI assistant for multi-step reasoning. Your sole function is to perform a single, focused reasoning step. You will be given a `question` and a `context` containing a collection of facts or previous reasoning steps. Your task is to analyze this information and produce a single, consolidated synthesis. Your conclusion must consolidate what is known, represent the next logical step in the reasoning process, and be derived exclusively from the information within the `context`.
+
+## Instructions:
+1.  Analyze the Objective : Examine the main question to understand the overall goal of the reasoning task.
+2.  Review the `context` : Scrutinize all facts, definitions, and prior conclusions provided in the `context`. This is the sole source of information.
+3.  Determine the Next Logical Step : Based on `context` and `question`, decide on the most valuable reasoning action to perform. Your action should be one of the following:
+    - Synthesize a Causal or Temporal Link: Connect multiple facts to explain why something happened or to establish a sequence of events.
+    - Identify a Core Relationship: Integrate disparate pieces of information to define the relationship between key entities or concepts.
+    - Summarize Progress: Consolidate multiple findings into a single, higher-level summary that captures the current state of knowledge.
+    - Identify a Contradiction: If the `context` contains conflicting information, highlight the discrepancy.
+    - Formulate a Hypothesis: Propose a plausible conclusion that logically follows from the `context` but may need further validation in subsequent steps.
+    - Assess Sufficiency: If the `context` provides enough information to directly answer the main question, state this clearly and formulate the definitive answer.
+    - Articulate the Conclusion: Generate a single, dense paragraph that clearly states your new conclusion. This thought must be self-contained and understandable without referencing the full `context` again.
+
+## Critical Constraints:
+1. No External Information: Do NOT introduce any facts, assumptions, or information not present in the `context`.
+2. No New questions: Do not ask for new information. Your role is to synthesize, not to query.
+"""
+
+
+class ReasoningSynthesizeInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The main question to be answered.")
+    context: str = pydantic.Field(..., description="The context containing facts or previous reasoning steps.")
+
+    def __str__(self):
+        return f"Question:\n{self.question}\n\nContext:\n{self.context}"
+
+
+class ReasoningSynthesizeOutput(pydantic.BaseModel):
+    is_answerable: bool = pydantic.Field(..., description="Indicates if the question can be answered with the provided context.")
+    step_conclusion: str = pydantic.Field(..., description="The synthesized thought or intermediate conclusion derived from the context.")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="The confidence level of the refined answer (high, medium, low).")
 
 
 GENERATE_STRUCTURED_QUERIES = """You are a Reasoning Engine that decomposes questions or statements into structured (subject, relation) queries for knowledge graph retrieval. Each query represents a single fact lookup needed to answer or verify the input.
@@ -240,6 +275,19 @@ class QuestionRephraser(BaseLLMRole):
             system_prompt: str = REPHRASE_QUESTION_PROMPT, 
             input_model: Type[pydantic.BaseModel] = QuestionRephraserInput, 
             output_model: Type[pydantic.BaseModel] = QuestionRephraserOutput
+            ):
+        super().__init__(system_prompt, input_model, output_model)
+    
+
+class ReasoningSynthesizer(BaseLLMRole):
+    name = "reasoning_synthesize"
+    description = "Reasoning synthesis role for multi-step reasoning."
+
+    def __init__(
+            self, 
+            system_prompt: str = SYNTHESIZE_PROMPT, 
+            input_model: Type[pydantic.BaseModel] = ReasoningSynthesizeInput, 
+            output_model: Type[pydantic.BaseModel] = ReasoningSynthesizeOutput
             ):
         super().__init__(system_prompt, input_model, output_model)
 

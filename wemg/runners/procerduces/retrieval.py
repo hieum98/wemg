@@ -74,7 +74,7 @@ async def retrieve_entities_from_kb(
         retrieval_results = [[prop for prop in result if isinstance(prop, wikidata.WikidataProperty)] for result in retrieval_results] # filter out non-wikidata results
         for item, result in zip(not_wikidata_properties, retrieval_results):
             if result:
-                property_dict[item] = result
+                property_dict[item] = result[0] # Only take top-1 result
                 wikidata_properties.extend(result)
         logger.info(f"Retrieved {len(wikidata_properties)} Wikidata properties.")
     all_properties = list(set(wikidata_properties))
@@ -95,7 +95,7 @@ async def retrieve_entities_from_kb(
         retrieval_results = [[ent for ent in result if isinstance(ent, wikidata.WikidataEntity)] for result in retrieval_results] # filter out non-wikidata results
         for item, result in zip(not_wikidata_entities, retrieval_results):
             if result:
-                enitity_dict[item] = result
+                enitity_dict[item] = result[0] # Only take top-1 result
                 retrieved_wikidata_entities.extend(result)
         logger.info(f"Retrieved Wikidata {len(retrieved_wikidata_entities)} entities")
     all_wikidata_entities = wikidata_entities + retrieved_wikidata_entities
