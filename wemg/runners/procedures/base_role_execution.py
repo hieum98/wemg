@@ -13,6 +13,8 @@ async def execute_role(llm_agent: BaseLLMAgent, role: BaseLLMRole, input_data: U
         is_single = True
     all_messages = []
     for item in input_data:
+        expected_type = role.input_model
+        assert isinstance(item, expected_type), f"Input data must be of type {expected_type.__name__}"
         messages = await role.format_messages_async(item, interaction_memory=interaction_memory)
         all_messages.append(messages)
 

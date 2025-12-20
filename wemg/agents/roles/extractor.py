@@ -1,154 +1,115 @@
-from enum import Enum
+"""Extractor roles for information extraction and memory consolidation.
+
+This module defines LLM roles for extracting relevant information from text
+and consolidating memory items.
+"""
 import logging
 import os
-from typing import List, Type
+from enum import Enum
+from typing import List
 import pydantic
 
-from wemg.agents.roles.base_role import BaseLLMRole
+from wemg.agents.roles.base_role import _create_role
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
-EXTRACT_PROMPT = """You are a meticulous and insightful research analyst. Your primary objective is to build a comprehensive dossier of all information from the provided text that could help a user fully understand and answer their question. You prioritize thoroughness, context, and nuance. You must think step-by-step to ensure no helpful detail, however tangential, is overlooked.
 
-## Instructions: 
-- Step 1: Question Deconstruction: First, carefully analyze the user's Question. Identify and list the primary subject, all key entities (people, organizations, concepts), and the specific information or insight the user is seeking. This is your 'search brief'.
-- Step 2: Candidate Identification: Next, read the entire Raw Data and identify and quote ALL passages that seem potentially related to the concepts from Step 1. Be liberal and inclusive in this initial pass; we will filter and refine in the next step. If no passages appear even remotely related, state this and proceed to Step 5.
-- Step 3: Systematic Relevance Evaluation: Now, for each candidate passage quoted in Step 2, you must perform a systematic evaluation. Iterate through each quote and assess it against the following criteria: Directly Answering, Contextual, Supporting Evidence, Methodological, Alternative Perspectives, Related Concepts, Implications, Enrichment, Entities. For each candidate quote, you must state exactly which criterion (or criteria) it meets and provide a one-sentence justification for your assessment. If a quote meets no criteria, mark it as 'Not Relevant'.
-- Step 4: Extraction: Extract ALL relevant information. Ensure the extraction is strictly verbatim and includes full sentences to preserve context. If an extraction is deemed relevant but it is lacks context or clarity, you should add additional context to ensure clarity and self-containment (i.e., Each extraction must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document or question) but make sure that you DO NOT add any information that was not present in the original document and MAKE SURE TO KEEP THE ORIGINAL MEANING INTACT. If no passages were deemed relevant, this section should be left empty.
-- Step 5: Final Decision: Based on your analysis in the preceding steps, state your final decision: 'relevant' or 'not_relevant'. A document is only 'not_relevant' if it contains ZERO information that could relate to any entity or concept in the question. If it contains even a single piece of information that could be relevant, it is 'relevant', even if it is not directly answering the question. Refine your extractions against this final decision. If you decide the document is 'relevant', ensure that your extractions are comprehensive and contain all information that could help answer the question. If you decide the document is 'not_relevant', ensure that your extractions are empty.
-"""
-
-class ExtractionInput(pydantic.BaseModel):
-    question: str = pydantic.Field(..., description="The user's question.")
-    raw_data: str = pydantic.Field(..., description="The raw text data to be analyzed.")
-
-    def __str__(self):
-        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
-
-class ExtractionOutput(pydantic.BaseModel):
-    information: List[str] = pydantic.Field(
-        ...,
-        description="A list of extracted information from the data that is relevant to the question"
-    )
-    decision: str = pydantic.Field(
-        ...,
-        pattern=r"^(relevant|not_relevant)$",
-        description="The decision on whether the data is relevant to the question."
-    )
-    reasoning: str = pydantic.Field(
-        ...,
-        description="A explanation of the thought process behind the extractions, detailing how the information was identified as relevant or not and why it was extracted."
-    )
-
-
-class Extractor(BaseLLMRole):
-    name = "extractor"
-    description = "Information extraction role for multi-hop question answering."
-
-    def __init__(
-            self,
-            system_prompt: str = EXTRACT_PROMPT,
-            input_model: Type[pydantic.BaseModel] = ExtractionInput,
-            output_model: Type[pydantic.BaseModel] = ExtractionOutput
-    ):
-        super().__init__(system_prompt, input_model, output_model)
-
+# =============================================================================
+# Enums and Constants
+# =============================================================================
 
 class SourceType(Enum):
-    SYSTEM_PREDICTION = "System Prediction"   # information generated by the system itself
-    RETRIEVAL = "Retrieval"               # information retrieved from external sources
+    """Source types for memory provenance tracking."""
+    SYSTEM_PREDICTION = "System Prediction"  # Generated by system
+    RETRIEVAL = "Retrieval"                  # Retrieved from external sources
+
+
+# =============================================================================
+# Prompts
+# =============================================================================
+
+EXTRACT_PROMPT = """You are a meticulous research analyst. Build a comprehensive dossier of information from the provided text that could help answer the question.
+
+Instructions:
+1. Question Deconstruction: Identify primary subject, key entities, and specific information sought.
+2. Candidate Identification: Identify and quote ALL passages that seem potentially related to the concepts in the question. Be liberal and inclusive in this initial pass; we will filter and refine in the next step.
+3. Relevance Evaluation: Assess each quote against criteria (directly answering, contextual, supporting evidence, etc.).
+4. Extraction: Extract ALL relevant information verbatim. Add context for clarity but preserve original meaning, make sure each extracted information is self-contained (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items) and can be used to answer the question.
+5. Final Decision: 'relevant' or 'not_relevant'. Only 'not_relevant' if ZERO related information.
+"""
 
 MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of tagged information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question.
 
 ## Provenance Tags
-- [System Prediction]: Information generated by the system itself (inferences, hypotheses, intermediate conclusions)
-- [Retrieval]: Information retrieved from external sources (knowledge bases, documents, web search)
+- [System Prediction]: System-generated information
+- [Retrieval]: Retrieved from external sources
 
-## Core Objective
-Transform raw memory into a clean, non-redundant, question-focused memory that maximizes utility for answering the specific question.
+## Instructions
+1. Question Analysis: Identify primary subject and key entities
+2. Relevance Filtering: Keep directly relevant and supporting items, remove irrelevant
+3. Duplicate & Redundancy Removal: Remove exact duplicates (keep [Retrieval] over [System Prediction] if both exist). Merge near-duplicates into single comprehensive items. Remove items whose information is subsumed by other items.
+4. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
+5. Final Consolidation: Each item MUST be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items
 
-## Step-by-Step Instructions
-
-### Step 1: Question Analysis
-Analyze the question to identify and list the primary subject, all key entities (e.g., people, organizations, concepts), and the specific information or insight being sought.
-
-### Step 2: Relevance Filtering
-For each memory item, assess its relevance to answering the question:
-- **Directly Relevant**: Provides facts needed to answer the question
-- **Supporting**: Provides context or bridges between facts
-- **Irrelevant**: Does not contribute to answering the question → REMOVE
-
-### Step 3: Duplicate & Redundancy Removal
-Among relevant items:
-- Remove exact duplicates (keep [Retrieval] over [System Prediction] if both exist)
-- Merge near-duplicates into single comprehensive items
-- Remove items whose information is subsumed by other items
-
-### Step 4: Conflict Resolution
-For contradictory items:
-- [Retrieval] takes precedence over [System Prediction]
-- More specific takes precedence over general
-- If unresolvable, merge into an item that notes the conflict
-
-### Step 5: Final Consolidation
-Each item MUST be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items
-
-## Critical Rules
-- You MUST NOT invent new information not present in the input memory
-- You MUST NOT remove provenance tags
-- You MUST remove information irrelevant to answering the question
-- You MUST preserve all relevant, non-redundant information
-- You MUST NOT alter the factual meaning of any information
+## Rules
+- Do NOT invent new information
+- REMOVE irrelevant information
+- PRESERVE all relevant, non-redundant information
 """
 
 
-class MemoryConsolidationInput(pydantic.BaseModel):
-    question: str = pydantic.Field(
-        ..., 
-        description="The question that the consolidated memory should help answer."
-    )
-    memory: str = pydantic.Field(
-        ..., 
-        description="The raw memory to consolidate, formatted as a list of tagged items (each starting with [System Prediction] or [Retrieval])."
-    )
+# =============================================================================
+# Input/Output Models
+# =============================================================================
+
+class ExtractionInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The user's question.")
+    raw_data: str = pydantic.Field(..., description="Raw text to analyze.")
 
     def __str__(self):
-        return "\n\n".join([f"{key}:\n{value}" for key, value in self.model_dump().items()])
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class ExtractionOutput(pydantic.BaseModel):
+    information: List[str] = pydantic.Field(..., description="Extracted relevant information.")
+    decision: str = pydantic.Field(..., pattern=r"^(relevant|not_relevant)$")
 
 
 class MemoryItem(pydantic.BaseModel):
-    content: str = pydantic.Field(
-        ...,
-        description="The piece of information from memory, which is self-contained and understandable on its own."
-    )
-    provenance: SourceType = pydantic.Field(
-        ...,
-        pattern=r"^(System Prediction|Retrieval)$",
-        description="The provenance tag indicating the source of the information."
-    )
+    content: str = pydantic.Field(..., description="Self-contained information piece.")
+    provenance: SourceType = pydantic.Field(..., pattern=r"^(System Prediction|Retrieval)$")
+
+
+class MemoryConsolidationInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="Question the memory should help answer.")
+    memory: str = pydantic.Field(..., description="Raw memory as list of tagged items.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
 
 class MemoryConsolidationOutput(pydantic.BaseModel):
-    consolidated_memory: List[MemoryItem] = pydantic.Field(
-        ...,
-        description="The refined list of memory items that are relevant and useful for answering the question."
-    )
-    reasoning: str = pydantic.Field(
-        ...,
-        description="Brief explanation of what was kept, removed, or merged and why."
-    )
-
-class MemoryConsolidationRole(BaseLLMRole):
-    name = "memory_consolidation"
-    description = "Role for consolidating textual memory relevant to a question."
-
-    def __init__(
-            self,
-            system_prompt: str = MEMORY_CONSOLIDATION_PROMPT,
-            input_model: Type[pydantic.BaseModel] = MemoryConsolidationInput,
-            output_model: Type[pydantic.BaseModel] = MemoryConsolidationOutput
-    ):
-        super().__init__(system_prompt, input_model, output_model)
+    consolidated_memory: List[MemoryItem] = pydantic.Field(..., description="Refined memory items.")
 
 
+# =============================================================================
+# Role Classes
+# =============================================================================
 
+
+Extractor = _create_role(
+    "extractor",
+    EXTRACT_PROMPT,
+    ExtractionInput,
+    ExtractionOutput,
+    "Information extraction role for multi-hop question answering."
+)
+
+MemoryConsolidationRole = _create_role(
+    "memory_consolidation",
+    MEMORY_CONSOLIDATION_PROMPT,
+    MemoryConsolidationInput,
+    MemoryConsolidationOutput,
+    "Memory consolidation role for multi-hop question answering."
+)

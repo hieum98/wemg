@@ -359,7 +359,7 @@ class TestWebSearchIntegration:
     def test_search_and_extract(self, llm_agent, web_search_tool):
         """Test searching and extracting information."""
         from wemg.agents import roles
-        from wemg.runners.procerduces.base_role_excercution import execute_role
+        from wemg.runners.procedures.base_role_execution import execute_role
         
         # Search for information
         query = "When was the first smartphone invented"

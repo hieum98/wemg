@@ -106,4 +106,13 @@ class BaseLLMRole:
                 logger.error(f"Failed to parse response into {self.output_model.__name__}. Parsed dict: {parsed_dict}. Response text: {response}")
                 return None
 
-
+def _create_role(name: str, prompt: str, input_model, output_model, description: str = ""):
+    """Factory function to create role classes."""
+    class Role(BaseLLMRole):
+        def __init__(self):
+            super().__init__(prompt, input_model, output_model)
+            self.role_name = name
+    Role.name = name
+    Role.description = description
+    Role.__name__ = name
+    return Role

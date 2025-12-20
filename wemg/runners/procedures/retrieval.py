@@ -8,7 +8,7 @@ from wemg.agents.retriever_agent import RetrieverAgent
 from wemg.agents import roles
 from wemg.agents.tools import wikidata, web_search
 from wemg.runners.interaction_memory import InteractionMemory
-from wemg.runners.procerduces.base_role_excercution import execute_role
+from wemg.runners.procedures.base_role_execution import execute_role
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
@@ -82,7 +82,7 @@ async def retrieve_entities_from_kb(
     not_wikidata_entities = [ent for ent in entities if isinstance(ent, roles.open_ie.Entity)]
     not_wikidata_entities = set(not_wikidata_entities) # deduplicate
     wikidata_entities = [ent for ent in entities if isinstance(ent, wikidata.WikidataEntity)]
-    enitity_dict = {} # mapping from open_ie.Entity to wikidata.WikidataEntity
+    entity_dict = {} # mapping from open_ie.Entity to wikidata.WikidataEntity
     retrieved_wikidata_entities = []
     if not_wikidata_entities:
         logger.info("Starting Wikidata entity retrieval.")
@@ -95,14 +95,14 @@ async def retrieve_entities_from_kb(
         retrieval_results = [[ent for ent in result if isinstance(ent, wikidata.WikidataEntity)] for result in retrieval_results] # filter out non-wikidata results
         for item, result in zip(not_wikidata_entities, retrieval_results):
             if result:
-                enitity_dict[item] = result[0] # Only take top-1 result
+                entity_dict[item] = result[0] # Only take top-1 result
                 retrieved_wikidata_entities.extend(result)
         logger.info(f"Retrieved Wikidata {len(retrieved_wikidata_entities)} entities")
     all_wikidata_entities = wikidata_entities + retrieved_wikidata_entities
     # deduplicate entities based on QID
     unique_entities = list(set(all_wikidata_entities))
     logger.info(f"Gathered {len(unique_entities)} unique Wikidata entities.")
-    return unique_entities, enitity_dict, all_properties, property_dict, graph_query_log
+    return unique_entities, entity_dict, all_properties, property_dict, graph_query_log
 
 
 async def retrieve_triples(
@@ -199,7 +199,7 @@ async def explore(
             n=1
         )
     queries: List[str] = responses[0].queries
-    # Concurently run the websearch
+    # Concurrently run the websearch
     tasks = [retrieve_from_web(query, retriever_agent=retriever_agent, top_k=top_k_websearch) for query in queries]
     documents = await asyncio.gather(*tasks)
     documents = sum(documents, [])
@@ -221,21 +221,3 @@ async def explore(
     all_log_keys = set(list(websearch_query_log.keys()) + list(graph_query_log.keys()))
     to_log_data = {key: websearch_query_log.get(key, []) + graph_query_log.get(key, []) for key in all_log_keys}
     return documents, retrieved_triples, entity_dict, property_dict, to_log_data
-
-
-if __name__ == "__main__":
-    import asyncio
-    from wemg.agents.tools import wikidata
-
-    
-
-    
-
-
-
-    
-
-    
-
-
-

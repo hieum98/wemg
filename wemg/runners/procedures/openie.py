@@ -7,7 +7,7 @@ import asyncio
 from wemg.agents import roles
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.runners.interaction_memory import InteractionMemory
-from wemg.runners.procerduces.base_role_excercution import execute_role
+from wemg.runners.procedures.base_role_execution import execute_role
 from wemg.utils.preprocessing import get_node_id
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ def parse_graph_from_text(llm_agent: BaseLLMAgent, text: str, interaction_memory
     triples, re_log = asyncio.run(
         execute_role(
             llm_agent=llm_agent,
-            role=roles.generator.AnswerGenerator(),
+            role=roles.open_ie.RelationExtractionRole(),
             input_data=re_input,
             interaction_memory=interaction_memory,
             n=1
@@ -46,5 +46,3 @@ def parse_graph_from_text(llm_agent: BaseLLMAgent, text: str, interaction_memory
             graph.add_edge(subject_id, object_id, relation=set())
         graph.edges[subject_id, object_id]['relation'].add(triple.relation)
     return graph, re_log
-
-

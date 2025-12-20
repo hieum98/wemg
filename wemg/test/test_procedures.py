@@ -18,12 +18,12 @@ from wemg.agents.tools.wikidata import (
     WikidataPropertyRetrievalTool
 )
 from wemg.agents import roles
-from wemg.runners.procerduces.retrieval import (
+from wemg.runners.procedures.retrieval import (
     retrieve_from_web,
     retrieve_entities_from_kb,
     explore
 )
-from wemg.runners.procerduces.base_role_excercution import execute_role
+from wemg.runners.procedures.base_role_execution import execute_role
 from wemg.runners.interaction_memory import InteractionMemory
 from wemg.runners.working_memory import WorkingMemory
 

@@ -11,7 +11,7 @@ from typing import List
 
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents import roles
-from wemg.runners.procerduces.base_role_excercution import execute_role
+from wemg.runners.procedures.base_role_execution import execute_role
 from wemg.runners.interaction_memory import InteractionMemory
 
 
