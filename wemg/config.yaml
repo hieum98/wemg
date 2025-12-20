@@ -1,0 +1,138 @@
+# WEMG Configuration File
+# This configuration file manages all parameters for the WEMG system
+# using Hydra and OmegaConf for flexible configuration management.
+
+defaults:
+  - _self_
+
+# =====================================================================
+# LLM Agent Configuration
+# =====================================================================
+llm:
+  # Model settings
+  model_name: "gpt-4o-mini"  # Options: gpt-4o, gpt-4o-mini, claude-3-5-sonnet-20241022, etc.
+  url: "https://api.openai.com/v1"  # API endpoint URL
+  api_key: null  # Set via environment variable OPENAI_API_KEY or directly here
+  client_type: "openai"  # Client type: openai, anthropic, etc.
+  
+  # Concurrency and retry settings
+  concurrency: 64
+  max_retries: 3
+  
+  # Generation parameters
+  generation:
+    timeout: 60
+    temperature: 0.7
+    n: 1  # Number of samples to generate
+    top_p: 0.8
+    max_tokens: 8192
+    max_input_tokens: 32768
+    top_k: 20
+    enable_thinking: true  # Enable chain-of-thought reasoning
+    random_seed: null  # Set for reproducibility
+
+# =====================================================================
+# Cache Configuration (Redis)
+# =====================================================================
+cache:
+  enabled: true
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: null
+  prefix: "wemg"
+  ttl: 86400  # Cache TTL in seconds (24 hours)
+
+# =====================================================================
+# Retriever Configuration
+# =====================================================================
+retriever:
+  # Retriever type: "web_search", "corpus", or "hybrid"
+  type: "web_search"
+  
+  # Web search settings
+  web_search:
+    api_key: null  # Serper API key, set via SERPER_API_KEY environment variable
+    top_k: 5  # Number of web results to retrieve
+    crawl_full_text: true  # Whether to crawl full text of web pages
+  
+  # Corpus-based retriever settings (when type is "corpus" or "hybrid")
+  corpus:
+    embedder:
+      model_name: "text-embedding-3-small"
+      url: "https://api.openai.com/v1"
+      api_key: null  # Set via OPENAI_API_KEY
+      embedder_type: "openai"
+    corpus_path: null  # Path to corpus dataset
+    index_path: null  # Path to FAISS index
+
+# =====================================================================
+# Search Strategy Configuration
+# =====================================================================
+search:
+  # Strategy: "mcts" (Monte Carlo Tree Search) or "cot" (Chain-of-Thought)
+  strategy: "cot"
+  
+  # MCTS-specific settings
+  mcts:
+    num_iterations: 10  # Number of MCTS iterations
+    max_tree_depth: 10  # Maximum depth of the search tree
+    max_simulation_depth: 5  # Maximum depth for simulation rollouts
+    exploration_weight: 1.0  # UCT exploration parameter
+    is_cot_simulation: true  # Use CoT for simulation phase
+  
+  # CoT-specific settings
+  cot:
+    max_depth: 10  # Maximum reasoning depth
+
+# =====================================================================
+# Node Generation Parameters
+# =====================================================================
+node_generation:
+  n: 1  # Number of candidates to generate per node
+  top_k_websearch: 5  # Top-k web search results
+  top_k_entities: 1  # Top-k entities from knowledge graph
+  top_k_properties: 1  # Top-k properties from knowledge graph
+  n_hops: 1  # Number of hops for graph exploration
+  use_question_for_graph_retrieval: true  # Use question for graph retrieval
+
+# =====================================================================
+# Memory Configuration
+# =====================================================================
+memory:
+  # Working memory settings
+  working_memory:
+    max_textual_memory_tokens: 8192  # Maximum tokens in textual memory
+  
+  # Interaction memory settings (logging)
+  interaction_memory:
+    enabled: false
+    log_dir: "./logs"  # Directory for interaction logs
+    save_to_file: false
+
+# =====================================================================
+# Logging Configuration
+# =====================================================================
+logging:
+  level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# =====================================================================
+# Output Configuration
+# =====================================================================
+output:
+  include_reasoning: true  # Include reasoning trace in output
+  include_concise_answer: true  # Include concise answer
+  verbose: false  # Verbose output mode
+
+# =====================================================================
+# Hydra Configuration
+# =====================================================================
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ./multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false  # Don't change working directory
