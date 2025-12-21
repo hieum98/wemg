@@ -4,8 +4,6 @@ from typing import Any, List, Set, Tuple, Union
 
 import networkx as nx
 
-from wemg.agents import roles
-
 
 def get_densest_node(
     component: Set, 
@@ -68,6 +66,9 @@ def _format_triple(
     edge_data: dict
 ) -> List[str]:
     """Format a triple into natural language sentences."""
+    # Lazy import to avoid circular dependencies
+    from wemg.agents import roles
+    
     source_data = graph_memory.nodes[source_node].get('data')
     target_data = graph_memory.nodes[target_node].get('data')
     relations = edge_data.get('relation', set())

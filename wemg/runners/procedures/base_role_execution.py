@@ -30,15 +30,15 @@ async def execute_role(llm_agent: BaseLLMAgent, role: BaseLLMRole, input_data: U
     to_log_data: Dict[str, List[Tuple[str, str]]] = {
         role.role_name: [tuple(pair) for pair in zip(input_data, raw_response) if pair[1]]
     }
-    response: List[List[pydantic.BaseModel]] = []
+    parsed_response: List[List[pydantic.BaseModel]] = []
     for res in response:
         r = []
         for item in res:
             parsed_item = role.parse_response(item)
             if parsed_item:
                 r.append(parsed_item)
-        response.append(r)
+        parsed_response.append(r)
     if is_single:
-        return response[0], to_log_data
+        return parsed_response[0], to_log_data
     else:
-        return response, to_log_data
+        return parsed_response, to_log_data

@@ -2,9 +2,6 @@ from typing import List, Dict, Union, Any
 import pydantic
 import tiktoken
 
-from wemg.agents import roles
-from wemg.agents.tools import wikidata
-
 
 def approximate_token_count(messages: Union[List[Dict[str, str]], str]) -> int:
     """Approximate the number of tokens in a given text using tiktoken."""
@@ -17,6 +14,10 @@ def approximate_token_count(messages: Union[List[Dict[str, str]], str]) -> int:
 
 
 def get_node_id(entity: Any) -> str:
+    # Lazy imports to avoid circular dependencies
+    from wemg.agents import roles
+    from wemg.agents.tools import wikidata
+    
     if isinstance(entity, wikidata.WikidataEntity):
         return entity.qid
     elif isinstance(entity, roles.open_ie.Entity):

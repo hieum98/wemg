@@ -116,36 +116,52 @@ class BaseClient:
                 model_kwargs['top_p'] = min(1.0, model_kwargs.get('top_p', 0.8) + 0.1 * attempts)
                 continue
             for choice in response.choices:
-                if not choice.message or not choice.message.content:
+                if not choice.message:
                     continue
+                
+                # For thinking models, content might be in reasoning_content instead of content
+                content = choice.message.content
+                used_reasoning_content_as_content = False
+                if not content:
+                    try:
+                        content = choice.message.reasoning_content
+                        used_reasoning_content_as_content = True
+                    except Exception:
+                        pass
+                
+                if not content:
+                    continue
+                
+                # Extract reasoning: if we used reasoning_content as content, reasoning is None
+                # (it's already in the structured output). Otherwise, try to get reasoning_content.
                 reasoning = None
-                if should_return_reasoning:
+                if should_return_reasoning and not used_reasoning_content_as_content:
                     try:
                         reasoning = choice.message.reasoning_content 
                     except Exception:
                         reasoning = None
                 if output_schema and self.structure_output_supported:
                     try:
-                        parsed_output = output_schema.model_validate_json(choice.message.content)
+                        parsed_output = output_schema.model_validate_json(content)
                         output = {
                             'output': parsed_output.model_dump() if hasattr(parsed_output, 'model_dump') else parsed_output,
-                            'raw_output': choice.message.content,
+                            'raw_output': content,
                             'reasoning': reasoning,
                             'is_valid': True
                         }
                     except:
-                        logger.warning(f"Failed to parse structured output for {choice.message.content}")
+                        logger.warning(f"Failed to parse structured output for {content}")
                         if attempts == self.max_retries - 1:
                             output = {
-                                'output': choice.message.content,
-                                'raw_output': choice.message.content,
+                                'output': content,
+                                'raw_output': content,
                                 'reasoning': reasoning,
                                 'is_valid': False
                             }
                 else:
                     output = {
-                        'output': choice.message.content,
-                        'raw_output': choice.message.content,
+                        'output': content,
+                        'raw_output': content,
                         'reasoning': reasoning,
                         'is_valid': True
                     }
@@ -545,5 +561,20 @@ class BaseLLMAgent:
         return labels, scores
 
 
+if __name__ == "__main__":
+    agent = BaseLLMAgent(
+        client_type='openai', 
+        model_name='Qwen3-Next-80B-A3B-Thinking-FP8', 
+        url='http://n0999:4000/v1', 
+        api_key='sk-your-very-secure-master-key-here'
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "What is the capital of France?"
+        }
+    ]
+    results = agent.generator_role_execute(messages)
+    print(results)
 
 

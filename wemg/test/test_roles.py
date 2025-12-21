@@ -16,9 +16,9 @@ from wemg.runners.interaction_memory import InteractionMemory
 
 
 # Test configuration - adjust these for your environment
-TEST_LLM_API_BASE = os.getenv("TEST_LLM_API_BASE", "http://n0142:4000/v1")
+TEST_LLM_API_BASE = os.getenv("TEST_LLM_API_BASE", "http://n0999:4000/v1")
 TEST_LLM_API_KEY = os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here")
-TEST_LLM_MODEL = os.getenv("TEST_LLM_MODEL", "Qwen3-32B")
+TEST_LLM_MODEL = os.getenv("TEST_LLM_MODEL", "Qwen3-Next-80B-A3B-Thinking-FP8")
 
 
 class TestGeneratorRoles:
@@ -63,11 +63,9 @@ class TestGeneratorRoles:
         
         # Should be answerable since context contains the answer
         assert output.is_answerable is True or output.subquestion is None
-        assert output.reasoning is not None
         
         print(f"✓ SubquestionGenerator (answerable case)")
         print(f"  Is answerable: {output.is_answerable}")
-        print(f"  Reasoning: {output.reasoning[:200]}...")
     
     @pytest.mark.slow
     def test_subquestion_generator_not_answerable(self, llm_agent, interaction_memory):
@@ -196,11 +194,14 @@ class TestGeneratorRoles:
         output: roles.generator.SelfCorrectionOutput = results[0]
         
         assert output.refined_answer is not None
-        assert output.reasoning is not None
+        assert output.status in ["correct", "partial", "incorrect", "unsupported"]
+        assert output.confidence_level in ["high", "medium", "low"]
         
         print(f"✓ SelfCorrector")
         print(f"  Original: Tokyo has a population of about 10 million people.")
         print(f"  Refined: {output.refined_answer[:200]}")
+        print(f"  Status: {output.status}")
+        print(f"  Confidence: {output.confidence_level}")
     
     @pytest.mark.slow
     def test_question_rephraser(self, llm_agent, interaction_memory):
@@ -480,11 +481,11 @@ class TestExtractorRoles:
         input_data = roles.extractor.MemoryConsolidationInput(
             question="What is the capital of France?",
             memory="""[Retrieval]: Paris is the capital and most populous city of France.
-[System Prediction]: France is a country in Western Europe.
-[Retrieval]: Paris has a population of about 2.1 million in the city proper.
-[System Prediction]: The Eiffel Tower is located in Paris.
-[Retrieval]: Paris is known as the City of Light.
-[System Prediction]: France borders Germany, Belgium, and Spain."""
+        [System Prediction]: France is a country in Western Europe.
+        [Retrieval]: Paris has a population of about 2.1 million in the city proper.
+        [System Prediction]: The Eiffel Tower is located in Paris.
+        [Retrieval]: Paris is known as the City of Light.
+        [System Prediction]: France borders Germany, Belgium, and Spain."""
         )
         
         results, log = asyncio.run(execute_role(

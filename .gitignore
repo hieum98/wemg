@@ -3,3 +3,4 @@ redis/*
 wemg.egg-info/*
 draft.ipynb
 draft.py
+memory_db

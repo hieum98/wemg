@@ -136,6 +136,7 @@ class InteractionMemory:
             embedding_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
             embedding_base_url: str = "http://localhost:8000/v1",
             embedding_api_key: str = "EMPTY",
+            enable_embedding_cache: bool = True,
             ):
         if is_local_embedding_api:
             self.embedding_function = LocalCompatibleEmbedding(
@@ -164,6 +165,10 @@ class InteractionMemory:
         # Read-Write lock for concurrent access
         # Allows multiple concurrent reads (get_examples) but exclusive writes (log_turn)
         self._rw_lock = AsyncReadWriteLock()
+        
+        # Embedding cache to avoid recomputing same query embeddings
+        self._embedding_cache = {} if enable_embedding_cache else None
+        self._cache_max_size = 1000  # Limit cache size to prevent memory issues
 
     def release(self, should_delete_db: bool = False):
         if isinstance(self.embedding_function, LocalCompatibleEmbedding):
@@ -220,6 +225,10 @@ class InteractionMemory:
         Synchronous version - use get_examples_async for concurrent access.
         strategy: 'similarity' (standard) or 'mmr' (diverse)
         """
+        # Early exit if collection is empty
+        if self.collection.count() == 0:
+            return []
+        
         if strategy == "similarity":
             messages = self._fetch_similarity(role, query, k)
         elif strategy == "mmr":
@@ -227,11 +236,19 @@ class InteractionMemory:
         else:
             raise ValueError("Unknown strategy. Use 'similarity' or 'mmr'")
 
-        # check for token budget, trim if necessary
-        total_tokens = approximate_token_count([msg for pair in messages for msg in pair])
-        while total_tokens > self.token_budget and messages:
-            messages.pop(0) # remove the oldest example
-            total_tokens = approximate_token_count([msg for pair in messages for msg in pair])
+        # check for token budget, trim if necessary (optimized: compute once per removal)
+        if messages:
+            # Flatten messages once for token counting
+            all_messages = [msg for pair in messages for msg in pair]
+            total_tokens = approximate_token_count(all_messages)
+            
+            # Remove oldest examples until within budget
+            while total_tokens > self.token_budget and messages:
+                removed_pair = messages.pop(0)
+                # Subtract tokens for removed pair (more efficient than recounting)
+                removed_tokens = approximate_token_count([msg for msg in removed_pair])
+                total_tokens -= removed_tokens
+                
         return messages
     
     async def get_examples_async(self, role: str, query: str, k: int = 3, strategy: str = "mmr"):
@@ -258,9 +275,27 @@ class InteractionMemory:
         fetch_k: How many candidates to fetch initially (pool size).
         lambda_mult: 0.0 = Pure Diversity, 1.0 = Pure Relevance. 
         """
-        query_embedding = self.collection._embedding_function([query])[0]
+        # Early exit if collection is empty
+        if self.collection.count() == 0:
+            return []
+        
+        # 1. Get or compute query embedding (with caching)
+        cache_key = f"{role}:{query}" if self._embedding_cache is not None else None
+        if cache_key and cache_key in self._embedding_cache:
+            query_embedding = self._embedding_cache[cache_key]
+        else:
+            # ChromaDB will compute embedding during query, but we need it for MMR calculation
+            # We can extract it from the query results or compute it once
+            query_embedding = self.collection._embedding_function([query])[0]
+            if cache_key and self._embedding_cache is not None:
+                # Simple LRU-style cache: remove oldest if cache is full
+                if len(self._embedding_cache) >= self._cache_max_size:
+                    # Remove first item (FIFO)
+                    self._embedding_cache.pop(next(iter(self._embedding_cache)))
+                self._embedding_cache[cache_key] = query_embedding
         
         # 2. Fetch a larger pool of candidates + their embeddings
+        # Note: ChromaDB query also computes query embedding, but we need it for MMR
         results = self.collection.query(
             query_texts=[query],
             n_results=fetch_k,
@@ -272,44 +307,68 @@ class InteractionMemory:
             return []
 
         # Extract lists for easier handling
-        candidates_embeddings = results['embeddings'][0] # List of vectors
+        candidates_embeddings = results['embeddings'][0]  # List of vectors
         candidates_docs = results['documents'][0]
         candidates_metas = results['metadatas'][0]
         
-        # 3. MMR Logic
+        num_candidates = len(candidates_embeddings)
+        if num_candidates == 0:
+            return []
+        
+        k = min(k, num_candidates)  # Adjust k if we have fewer candidates
+        
+        # 3. Optimized MMR Logic - precompute all similarities
+        # Convert to numpy arrays once
+        query_vec = np.array(query_embedding, dtype=np.float32)
+        cand_vecs = np.array(candidates_embeddings, dtype=np.float32)
+        
+        # Precompute all similarities to query (vectorized)
+        # Normalize vectors for cosine similarity
+        query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+        cand_norms = cand_vecs / (np.linalg.norm(cand_vecs, axis=1, keepdims=True) + 1e-8)
+        
+        # Compute all similarities to query at once (vectorized)
+        sim_to_query_all = np.dot(cand_norms, query_norm)
+        
+        # Precompute pairwise similarities between candidates (for diversity calculation)
+        # This is O(n^2) but only done once, not in the loop
+        cand_cand_similarities = np.dot(cand_norms, cand_norms.T)
+        
+        # 4. MMR Selection with optimized loop
         selected_indices = []
-        candidate_indices = list(range(len(candidates_embeddings)))
-
-        # Convert to numpy for sklearn processing
-        query_vec = np.array([query_embedding])
-        cand_vecs = np.array(candidates_embeddings)
-
-        for _ in range(min(k, len(candidate_indices))):
-            # Calculate similarities
-            sim_to_query = cosine_similarity(query_vec, cand_vecs[candidate_indices])[0]
+        remaining_indices = set(range(num_candidates))
+        
+        for _ in range(k):
+            if not remaining_indices:
+                break
             
-            # Sim(Candidates, Selected)
+            # Calculate MMR scores for all remaining candidates
+            sim_to_query = sim_to_query_all[list(remaining_indices)]
+            
+            # Calculate max similarity to already selected examples
             if selected_indices:
-                sim_to_selected = cosine_similarity(
-                    cand_vecs[candidate_indices], 
-                    cand_vecs[selected_indices]
-                )
-                # Max similarity to ANY already selected example
+                # Get similarities between remaining candidates and selected ones
+                # Use precomputed similarity matrix
+                sim_to_selected = cand_cand_similarities[np.ix_(
+                    list(remaining_indices), 
+                    selected_indices
+                )]
                 max_sim_to_selected = np.max(sim_to_selected, axis=1)
             else:
-                max_sim_to_selected = np.zeros(len(candidate_indices))
-
+                max_sim_to_selected = np.zeros(len(remaining_indices))
+            
             # MMR Score = lambda * Rel - (1-lambda) * Redundancy
-            mmr_score = (lambda_mult * sim_to_query) - ((1 - lambda_mult) * max_sim_to_selected)
+            mmr_scores = (lambda_mult * sim_to_query) - ((1 - lambda_mult) * max_sim_to_selected)
             
             # Pick the candidate with the highest MMR score
-            best_idx_in_subset = np.argmax(mmr_score)
-            best_real_idx = candidate_indices[best_idx_in_subset]
+            best_local_idx = np.argmax(mmr_scores)
+            remaining_list = list(remaining_indices)
+            best_real_idx = remaining_list[best_local_idx]
             
             selected_indices.append(best_real_idx)
-            candidate_indices.pop(best_idx_in_subset)
+            remaining_indices.remove(best_real_idx)
 
-        # 4. Reconstruct the format based on selected indices
+        # 5. Reconstruct the format based on selected indices
         final_examples = []
         for idx in selected_indices:
             final_examples.append([

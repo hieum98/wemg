@@ -8,14 +8,11 @@ This package provides:
 """
 from wemg.agents.base_llm_agent import BaseLLMAgent, BaseClient, OpenAIClient
 from wemg.agents.retriever_agent import RetrieverAgent
-from wemg.agents import roles
-from wemg.agents import tools
 
 __all__ = [
     'BaseLLMAgent',
     'BaseClient', 
     'OpenAIClient',
     'RetrieverAgent',
-    'roles',
-    'tools',
 ]
+
