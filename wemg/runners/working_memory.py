@@ -7,13 +7,14 @@ import asyncio
 import copy
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 
 from wemg.agents import roles
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.tools import wikidata
+from wemg.agents.tools.web_search import WebSearchTool
 from wemg.runners.interaction_memory import InteractionMemory
 from wemg.runners.procedures.base_role_execution import execute_role
 from wemg.runners.procedures.openie import parse_graph_from_text
@@ -56,7 +57,10 @@ class WorkingMemory:
             roles.extractor.SourceType.SYSTEM_PREDICTION: "[System Prediction]",
             roles.extractor.SourceType.RETRIEVAL: "[Retrieval]",
         }.get(provenance, "")
-        return f"{tag}: {content.strip()}" if tag else content.strip()
+        content = content.strip()
+        if content.startswith(("[System Prediction]", "[Retrieval]")):
+            return content
+        return f"{tag}: {content}" if tag else content
     
     def add_textual_memory(
         self, 
@@ -79,10 +83,14 @@ class WorkingMemory:
         interaction_memory: Optional[InteractionMemory] = None,
     ) -> None:
         """Consolidate textual memory with respect to the question."""
-        output, log = self._run_consolidation(
-            llm_agent, question, self.format_textual_memory(), interaction_memory
-        )
-        
+        raw_memory = self.format_textual_memory()
+        output, log = asyncio.run(self._run_consolidation(
+            llm_agent=llm_agent,
+            question=question,
+            raw_memory=raw_memory,
+            interaction_memory=interaction_memory
+        ))
+        output: roles.extractor.MemoryConsolidationOutput
         for item in output.consolidated_memory:
             provenance = (
                 roles.extractor.SourceType.SYSTEM_PREDICTION 
@@ -96,26 +104,26 @@ class WorkingMemory:
         
         log_to_interaction_memory(interaction_memory, log)
 
-    def _run_consolidation(
+    async def _run_consolidation(
         self,
         llm_agent: BaseLLMAgent,
         question: str,
         raw_memory: str,
         interaction_memory: Optional[InteractionMemory] = None,
-    ):
+    ) -> Tuple[roles.extractor.MemoryConsolidationOutput, Dict]:
         """Run memory consolidation role."""
         consolidation_input = roles.extractor.MemoryConsolidationInput(
             question=question, 
             memory=raw_memory
         )
-        response, log = asyncio.run(execute_role(
+        response, log = await execute_role(
             llm_agent=llm_agent,
             role=roles.extractor.MemoryConsolidationRole(),
             input_data=consolidation_input,
             interaction_memory=interaction_memory,
             n=1,
             max_tokens=self.max_textual_memory_tokens
-        ))
+        )
         return response[0], log
 
     # =========================================================================
@@ -154,7 +162,7 @@ class WorkingMemory:
     def connect_graph_memory(
         self,
         wikidata_path_finder: Optional["wikidata.WikidataPathFindingTool"] = None,
-        max_hops: int = 3,
+        max_hops: int = 2,
     ) -> bool:
         """Connect disconnected components in graph memory using Wikidata paths."""
         if self.graph_memory.number_of_nodes() <= 1:
@@ -167,47 +175,46 @@ class WorkingMemory:
         
         logger.info(f"Found {len(components)} disconnected components")
         
-        if wikidata_path_finder is None:
-            wikidata_path_finder = wikidata.WikidataPathFindingTool()
-        
         # Get densest nodes per component
         densest_nodes = [
             get_densest_node(comp, self.graph_memory, node_type=wikidata.WikidataEntity) 
             for comp in components
         ]
-        
-        # Connect adjacent components
-        for i in range(len(densest_nodes) - 1):
+        densest_qids = [self.graph_memory.nodes[node_id].get('data').qid for node_id in densest_nodes]
+        paths: List[Optional[wikidata.WikidataPathBetweenEntities]] = asyncio.run(asyncio.gather(*[
             self._connect_nodes(
-                densest_nodes[i], densest_nodes[i + 1], 
+                densest_qids[i], densest_qids[i + 1], 
                 wikidata_path_finder, max_hops
             )
+            for i in range(len(densest_nodes) - 1)
+        ]))
+        for path in paths:
+            if path:
+                for triple in path.path:
+                    self.add_edge_to_graph_memory(triple)
         
         new_components = list(nx.weakly_connected_components(self.graph_memory))
         is_connected = len(new_components) == 1
         logger.info(f"Graph {'now connected' if is_connected else f'has {len(new_components)} components'}")
         return is_connected
 
-    def _connect_nodes(
+    async def _connect_nodes(
         self, 
-        source_id: str, 
-        target_id: str,
-        path_finder: "wikidata.WikidataPathFindingTool",
-        max_hops: int
-    ) -> None:
-        """Find and add path between two nodes."""
-        source_data = self.graph_memory.nodes[source_id].get('data')
-        target_data = self.graph_memory.nodes[target_id].get('data')
-        
-        source_qid = source_data.qid if isinstance(source_data, wikidata.WikidataEntity) else None
-        target_qid = target_data.qid if isinstance(target_data, wikidata.WikidataEntity) else None
+        source_qid: str, 
+        target_qid: str,
+        path_finder: "wikidata.WikidataPathFindingTool" = None,
+        max_hops: int = 2,
+    ) -> Optional[wikidata.WikidataPathBetweenEntities]:
+        """Find path between two nodes."""
+        if path_finder is None:
+            path_finder = wikidata.WikidataPathFindingTool()
         
         if not source_qid or not target_qid:
             logger.warning(f"Cannot find path: source or target is not a Wikidata entity")
             return
         
         logger.info(f"Searching for path between {source_qid} and {target_qid}")
-        path_result = path_finder.invoke({
+        path_result: Optional[wikidata.WikidataPathBetweenEntities] = await path_finder.ainvoke({
             "source_qid": source_qid,
             "target_qid": target_qid,
             "max_hops": max_hops,
@@ -215,8 +222,7 @@ class WorkingMemory:
         
         if path_result and path_result.path:
             logger.info(f"Found path with {len(path_result.path)} hops")
-            for triple in path_result.path:
-                self.add_edge_to_graph_memory(triple)
+            return path_result
         else:
             logger.warning(f"No path found between {source_qid} and {target_qid}")
 
@@ -227,7 +233,7 @@ class WorkingMemory:
         for node_id in self.graph_memory.nodes:
             node_data = self.graph_memory.nodes[node_id].get('data')
             if isinstance(node_data, wikidata.WikidataEntity):
-                if not node_data.description or not node_data.wikipedia_content:
+                if not node_data.description or not node_data.wikipedia_url:
                     if node_data.qid in self.id_dict:
                         self.graph_memory.nodes[node_id]['data'] = self.id_dict[node_data.qid]
                     else:
@@ -238,40 +244,44 @@ class WorkingMemory:
 
     def _fetch_and_update_entities(self, qids: List[str]) -> None:
         """Fetch entity details and update graph memory."""
-        logger.info(f"Fetching details for {len(qids)} Wikidata entities")
-        entity_retriever = wikidata.WikidataEntityRetrievalTool()
-        results = entity_retriever.invoke({
-            "query": qids,
-            "num_entities": 1,
-            "get_details": True,
-        })
+        to_fetch_entities: Set[str] = set()
+        for qid in qids:
+            if qid in self.id_dict:
+                self.graph_memory.nodes[get_node_id(self.id_dict[qid])]['data'] = self.id_dict[qid]
+            else:
+                to_fetch_entities.add(qid)
+        if to_fetch_entities:
+            logger.info(f"Fetching details for {len(to_fetch_entities)} Wikidata entities")
+            entity_retriever = wikidata.WikidataEntityRetrievalTool()
+            results = entity_retriever.invoke({
+                "query": list(to_fetch_entities),
+                "num_entities": 1,
+                "get_details": True,
+            })
+            
+            for entity in sum(results, []):
+                self.id_dict[entity.qid] = entity
+                node_id = get_node_id(entity)
+                if self.graph_memory.has_node(node_id):
+                    self.graph_memory.nodes[node_id]['data'] = entity
+                    logger.info(f"Updated node {node_id}")
         
-        for entity in sum(results, []):
-            self.id_dict[entity.qid] = entity
-            node_id = get_node_id(entity)
-            if self.graph_memory.has_node(node_id):
-                self.graph_memory.nodes[node_id]['data'] = entity
-                logger.info(f"Updated node {node_id}")
+        # Update self.id_dict with wikipedia content
+        to_fetch_wikipedia: Set[str] = set()
+        for qid in self.id_dict:
+            # wikipedia content is not available, but wikipedia url is available (fetched from last step)
+            if not self.id_dict[qid].wikipedia_content and self.id_dict[qid].wikipedia_url:
+                to_fetch_wikipedia.add(qid)
+        if to_fetch_wikipedia:
+            logger.info(f"Fetching {len(to_fetch_wikipedia)} Wikipedia content")
+            urls = [self.id_dict[qid].wikipedia_url for qid in to_fetch_wikipedia]
+            contents = WebSearchTool.crawl_web_pages(urls)
+            for qid, content in zip(to_fetch_wikipedia, contents):
+                self.id_dict[qid].wikipedia_content = content
+                logger.info(f"Updated Wikipedia content for {qid}")
 
-    def merge_graph_memory(self, other_graph: nx.DiGraph) -> None:
-        """Merge another graph into graph memory, syncing with Wikidata."""
-        # Collect triples
-        triples = self._extract_triples_from_graph(other_graph)
-        
-        # Fetch missing entities and properties
-        self._fetch_missing_entities_and_properties(triples)
-        
-        # Convert and add triples
-        for triple in triples:
-            wiki_triple = self._convert_to_wiki_triple(triple)
-            if wiki_triple:
-                self.add_edge_to_graph_memory(wiki_triple)
-                logger.info(f"Added triple: {wiki_triple}")
-        
-        self.connect_graph_memory()
-        self.update_graph_memory()
-
-    def _extract_triples_from_graph(self, graph: nx.DiGraph) -> List[roles.open_ie.Relation]:
+    @staticmethod
+    def extract_triples_from_graph(graph: nx.DiGraph) -> List[roles.open_ie.Relation]:
         """Extract relation triples from a graph."""
         triples = []
         for s_id, o_id, edge_data in graph.edges(data=True):
@@ -284,10 +294,103 @@ class WorkingMemory:
                     ))
         return triples
 
-    def _fetch_missing_entities_and_properties(
+    def merge_graph_memory(self, other_graph: nx.DiGraph) -> None:
+        """Merge another graph into graph memory, syncing with Wikidata."""
+        # Collect triples
+        triples = WorkingMemory.extract_triples_from_graph(other_graph)
+        
+        # Fetch missing entities and properties
+        self._fetch_missing_entities_and_properties(triples)
+        
+        # Batch convert and add triples (optimized for performance)
+        wiki_triples = self._batch_convert_and_add_triples(triples)
+        for wiki_triple in wiki_triples:
+            self.add_edge_to_graph_memory(wiki_triple)
+
+        self.connect_graph_memory()
+        self.update_graph_memory()
+    
+    def _batch_convert_and_add_triples(
         self, 
-        triples: List[roles.open_ie.Relation]
-    ) -> None:
+        triples: List[roles.open_ie.Relation], 
+        fetch_missing: bool = True,
+    ) -> List[wikidata.WikiTriple]:
+        """Batch convert triples to WikiTriples.
+        """
+        all_triples: List[wikidata.WikiTriple] = []
+        if fetch_missing:
+            self._fetch_missing_entities_and_properties(triples)
+        
+        to_verify_triples: List[wikidata.WikiTriple] = []
+        to_connect_triples: List[wikidata.WikiTriple] = []
+        for triple in triples:
+            subject = self.entity_dict[triple.subject]
+            relation = self.property_dict[triple.relation]
+            object = self.entity_dict[triple.object]
+            if subject and object and isinstance(subject, wikidata.WikidataEntity) and isinstance(object, wikidata.WikidataEntity):
+                if relation:
+                    wiki_triple = wikidata.WikiTriple(
+                        subject=subject,
+                        relation=relation,
+                        object=object
+                    )
+                    to_verify_triples.append(wiki_triple)
+                else:
+                    wiki_triple = wikidata.WikiTriple(
+                        subject=subject,
+                        relation=None,
+                        object=object
+                    )
+                    to_connect_triples.append(wiki_triple)
+        # Verify triples in Wikidata
+        if to_verify_triples:
+            qids = [triple.subject.qid for triple in to_verify_triples]
+            qids.extend([triple.object.qid for triple in to_verify_triples])
+            qids = list(set(qids))
+            # Here we need retrieve for default properties and properties in self.property_dict
+            wikidata_props = wikidata.DEFAULT_PROPERTIES + [item.pid for item in self.property_dict.values()]
+            wikidata_props = list(set(wikidata_props))
+            wikidata_props_with_labels = {item.pid: {'label': item.label, 'description': item.description} for item in self.property_dict.values()}
+            wikidata_props_with_labels = {**wikidata.PROPERTY_LABELS, **wikidata_props_with_labels}
+            wikidata_wrapper = wikidata.CustomWikidataAPIWrapper(
+                wikidata_props=wikidata_props,
+                wikidata_props_with_labels=wikidata_props_with_labels
+            )
+            retriever = wikidata.WikidataEntityRetrievalTool(wikidata_wrapper=wikidata_wrapper)
+            results = retriever.invoke({
+                "query": qids,
+                "is_qids": True,
+                'k': 1,
+            })
+            retrieved_triples: List[wikidata.WikiTriple] = sum(results, [])
+            id_with_triple: Dict[str, wikidata.WikiTriple] = {}
+            for triple in retrieved_triples:
+                id = (get_node_id(triple.subject), get_node_id(triple.object))
+                id_with_triple[id] = triple
+            for triple in to_verify_triples:
+                id = (get_node_id(triple.subject), get_node_id(triple.object))
+                if id in id_with_triple:
+                    all_triples.append(id_with_triple[id])
+                else:
+                    to_connect_triples.append(triple)
+        
+        # Connect triples
+        tasks = []
+        for triple in to_connect_triples:
+            tasks.append(
+                self._connect_nodes(
+                    triple.subject.qid,
+                    triple.object.qid,
+                    max_hops=2,
+                )
+            )
+        paths: List[Optional[wikidata.WikidataPathBetweenEntities]] = asyncio.run(asyncio.gather(*tasks))
+        for path in paths:
+            if path:
+                all_triples.extend(path.path)
+        return all_triples
+
+    def _fetch_missing_entities_and_properties(self, triples: List[roles.open_ie.Relation]):
         """Fetch entities and properties not in cache."""
         to_fetch_entities: Set[roles.open_ie.Entity] = set()
         to_fetch_props: Set[str] = set()
@@ -307,7 +410,7 @@ class WorkingMemory:
             results = retriever.invoke({
                 "query": [e.name for e in to_fetch_entities],
                 "num_entities": 1,
-                "get_details": True,
+                "get_details": False,
             })
             for item, result in zip(to_fetch_entities, results):
                 if result and isinstance(result[0], wikidata.WikidataEntity):
@@ -324,19 +427,6 @@ class WorkingMemory:
             for prop, result in zip(to_fetch_props, results):
                 if result and isinstance(result[0], wikidata.WikidataProperty):
                     self.property_dict[prop] = result[0]
-
-    def _convert_to_wiki_triple(
-        self, 
-        triple: roles.open_ie.Relation
-    ) -> Optional[wikidata.WikiTriple]:
-        """Convert a Relation to WikiTriple if all entities/properties exist."""
-        subject = self.entity_dict.get(triple.subject)
-        obj = self.entity_dict.get(triple.object)
-        prop = self.property_dict.get(triple.relation)
-        
-        if subject and obj and prop:
-            return wikidata.WikiTriple(subject=subject, relation=prop, object=obj)
-        return None
 
     # =========================================================================
     # Graph Consolidation
@@ -379,9 +469,11 @@ class WorkingMemory:
         interaction_memory: Optional[InteractionMemory] = None
     ):
         """Process a cluster: consolidate and parse graph."""
-        output, log = await asyncio.to_thread(
-            self._run_consolidation,
-            llm_agent, question, cluster_text, interaction_memory
+        output, log = await self._run_consolidation(
+            llm_agent=llm_agent,
+            question=question,
+            raw_memory=cluster_text,
+            interaction_memory=interaction_memory
         )
         
         consolidated = [
@@ -390,7 +482,7 @@ class WorkingMemory:
         ]
         consolidated_text = "\n".join(f"- {t}" for t in consolidated)
         
-        cluster_graph = await asyncio.to_thread(
+        cluster_graph, _ = await asyncio.to_thread(
             parse_graph_from_text, llm_agent, consolidated_text
         )
         

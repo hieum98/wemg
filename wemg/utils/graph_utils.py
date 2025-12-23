@@ -1,6 +1,7 @@
 """Graph utility functions for working memory operations."""
+import os
 from collections import deque
-from typing import Any, List, Set, Tuple, Union
+from typing import Any, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 
@@ -170,3 +171,152 @@ def _bfs_textualize(
                 queue.append((next_node, source, target))
     
     return all_triples
+
+
+def visualize_graph(graph: nx.DiGraph, title: str = "Graph Memory", save_path: Optional[str] = './tmp'):
+    """Visualize a networkx DiGraph using matplotlib.
+    
+    Args:
+        graph: The networkx DiGraph to visualize
+        title: Title for the plot
+        save_path: Path to save the figure. Can be a directory (will create filename) 
+                   or a full file path. If None, tries to display interactively, 
+                   or saves to './tmp' if display is not available.
+    """
+    # Check if we need to use non-interactive backend (no display available)
+    use_agg = os.getenv('DISPLAY') is None and os.name != 'nt'
+    
+    try:
+        import matplotlib
+        # Use non-interactive backend if no display is available (must be set before pyplot import)
+        if use_agg:
+            matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(f"Warning: matplotlib not available. Cannot visualize {title}")
+        return
+    except Exception as e:
+        print(f"Warning: Could not initialize matplotlib: {e}")
+        return
+    
+    if len(graph.nodes) == 0:
+        print(f"{title}: Empty graph (no nodes)")
+        return
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Use a layout algorithm
+    try:
+        pos = nx.spring_layout(graph, k=1, iterations=50)
+    except:
+        # Fallback to simple layout if spring_layout fails
+        pos = nx.circular_layout(graph)
+    
+    # Draw nodes
+    nx.draw_networkx_nodes(graph, pos, node_color='lightblue', 
+                          node_size=1000, alpha=0.9)
+    
+    # Draw edges
+    nx.draw_networkx_edges(graph, pos, edge_color='gray', 
+                          arrows=True, arrowsize=20, alpha=0.6)
+    
+    # Draw labels
+    labels = {}
+    for node in graph.nodes():
+        node_data = graph.nodes[node].get('data', None)
+        if node_data:
+            # Try to get a label from the data object
+            if hasattr(node_data, 'label'):
+                labels[node] = node_data.label
+            elif hasattr(node_data, 'name'):
+                labels[node] = node_data.name
+            else:
+                labels[node] = str(node)[:20]  # Truncate long node IDs
+        else:
+            labels[node] = str(node)[:20]
+    
+    nx.draw_networkx_labels(graph, pos, labels, font_size=8)
+    
+    # Draw edge labels (relations)
+    edge_labels = {}
+    for u, v, data in graph.edges(data=True):
+        relation = data.get('relation', {})
+        if isinstance(relation, set):
+            # If relation is a set of properties, get labels
+            rel_labels = []
+            for prop in relation:
+                if hasattr(prop, 'label'):
+                    rel_labels.append(prop.label)
+                else:
+                    rel_labels.append(str(prop))
+            edge_labels[(u, v)] = ', '.join(rel_labels[:2])  # Limit to 2 relations
+        elif hasattr(relation, 'label'):
+            edge_labels[(u, v)] = relation.label
+        else:
+            edge_labels[(u, v)] = str(relation)[:15]
+    
+    if edge_labels:
+        nx.draw_networkx_edge_labels(graph, pos, edge_labels, font_size=6)
+    
+    plt.title(title, fontsize=14, fontweight='bold')
+    plt.axis('off')
+    plt.tight_layout()
+    
+    # Helper function to generate file path
+    def _get_filepath(base_path: str, title: str) -> str:
+        """Generate a file path, creating directory if needed."""
+        import time
+        # Create a safe filename from the title
+        safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        safe_title = safe_title.replace(' ', '_').lower()
+        timestamp = int(time.time())
+        filename = f"graph_{safe_title}_{timestamp}.png"
+        
+        # Normalize path separators
+        base_path = base_path.replace('\\', '/')
+        
+        # Check if base_path is a directory or a file path
+        if base_path.endswith('/'):
+            # It's explicitly a directory (ends with /)
+            os.makedirs(base_path, exist_ok=True)
+            return os.path.join(base_path, filename)
+        elif os.path.isdir(base_path):
+            # It's an existing directory
+            return os.path.join(base_path, filename)
+        elif os.path.dirname(base_path) and os.path.dirname(base_path) != '.':
+            # It's a file path with directory component
+            dir_path = os.path.dirname(base_path)
+            os.makedirs(dir_path, exist_ok=True)
+            return base_path
+        elif base_path.endswith('.png') or base_path.endswith('.jpg') or base_path.endswith('.pdf'):
+            # It's a filename with extension, save to ./tmp
+            os.makedirs('./tmp', exist_ok=True)
+            return os.path.join('./tmp', base_path)
+        else:
+            # Treat as directory name, create it and save file there
+            os.makedirs(base_path, exist_ok=True)
+            return os.path.join(base_path, filename)
+    
+    # Determine if we should save or show
+    if save_path:
+        filepath = _get_filepath(save_path, title)
+        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        print(f"Graph visualization saved to {os.path.abspath(filepath)}")
+    else:
+        # If using Agg backend (no display), always save to file
+        if use_agg:
+            filepath = _get_filepath('./tmp', title)
+            plt.savefig(filepath, dpi=150, bbox_inches='tight')
+            print(f"Graph visualization saved to {os.path.abspath(filepath)} (no display available)")
+        else:
+            # Try to show interactively
+            try:
+                plt.show()
+            except Exception as e:
+                # If show() fails, save to a file instead
+                print(f"Could not display graph interactively: {e}")
+                filepath = _get_filepath('./tmp', title)
+                plt.savefig(filepath, dpi=150, bbox_inches='tight')
+                print(f"Graph visualization saved to {os.path.abspath(filepath)} (fallback)")
+    
+    plt.close()

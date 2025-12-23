@@ -8,9 +8,9 @@ from wemg.agents.base_llm_agent import OpenAIClient, BaseLLMAgent
 
 
 # Test configuration
-TEST_API_BASE = "http://n0142:4000/v1"
+TEST_API_BASE = "http://n0999:4000/v1"
 TEST_API_KEY = "sk-your-very-secure-master-key-here"
-TEST_MODEL = "Qwen3-0.6B"
+TEST_MODEL = "Qwen3-Next-80B-A3B-Thinking-FP8"
 
 
 # Pydantic models for structured output testing
@@ -400,7 +400,7 @@ class TestCaching:
             'prefix': 'test_emb_cache',
         }
         emb_client = OpenAIClient(
-            model_name="text-embedding-ada-002",
+            model_name="Qwen3-Embedding-4B",
             url=TEST_API_BASE,
             api_key=TEST_API_KEY,
             is_embedding=True,

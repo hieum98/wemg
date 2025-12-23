@@ -79,6 +79,9 @@ class NodeGenerator:
             interaction_memory=self.interaction_memory
         )
 
+        # TODO: Add wikicontent of retrieved triples to retrieved_documents
+        
+
         # Extract information from web search results
         extractor_inputs = [
             roles.extractor.ExtractionInput(question=question, raw_data=data) 
@@ -96,8 +99,8 @@ class NodeGenerator:
         all_extractions: List[roles.extractor.ExtractionOutput] = sum(extracted_results, [])
         info_from_websearch = []
         for item in all_extractions:
-            if item.decision == "relevant":
-                info_from_websearch.extend(item.information)
+            if item.relevant_information:
+                info_from_websearch.extend(item.relevant_information)
 
         # Build context
         info_from_kb = [str(t) for t in retrieved_triples]
@@ -180,11 +183,7 @@ class NodeGenerator:
         rephrased_questions = [r.rephrased_question for r in rephrased]
         return rephrased_questions, rephrase_log
     
-    async def generate_self_correction(
-        self, 
-        sub_question: str, 
-        sub_answer: str
-    ) -> GenerationResult:
+    async def generate_self_correction(self, sub_question: str, sub_answer: str) -> GenerationResult:
         """Generate a self-corrected answer for a sub-question.
         
         Returns result with corrected answers.

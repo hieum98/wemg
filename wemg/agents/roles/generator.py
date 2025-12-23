@@ -9,6 +9,7 @@ from typing import List, Optional
 import pydantic
 
 from wemg.agents.roles.base_role import _create_role
+from wemg.agents.tools.wikidata import PROPERTY_LABELS
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
@@ -41,23 +42,6 @@ ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-rea
 2. If context provided, extract all relevant information.
 3. Resolve information gaps using your knowledge. You can use your own knowledge or your own internet search.
 4. Synthesize a clear, well-reasoned answer. State assumptions clearly if you made any assumptions or used your own internet search.
-"""
-
-GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user input into precise, self-contained search queries.
-
-## Principles:
-1. Zero-Synthesis: Do NOT introduce new information not in the input.
-2. Self-Contained: Each query understandable without original input.
-3. Atomic: One single fact per query.
-4. Essential & Non-Redundant: Every query necessary and unique.
-
-## Instructions:
-1. Parse the Input: 
-    - If the input is a question: Identify its type (e.g., factual, comparative, causal, temporal), key entities, and the required reasoning steps. 
-    - If the input is a statement: Deconstruct it into its core, verifiable claims. Identify the key entities and the asserted relationships between them. 
-2. Generate Strategic Queries: Formulate a list of search queries that are necessary to answer/verify the input. Each query is a building block to reach the final answer that follows the guiding principles above. The goal is to provide the user with all the search components they would need to solve the problem from scratch.
-3. Ensure Self-Containment: Each query must be understandable and answerable on its own. Make sure each query is self-contained and does not rely on the original input, other queries, or any external context. Rewrite queries that are not self-contained.
-4. Review for Completeness and Non-Redundancy: Ensure that the set of queries collectively covers all necessary information to answer/verify the input without any overlap or unnecessary duplication.
 """
 
 SELF_CORRECT_PROMPT = """You are an expert in answer verification and refinement. Given a question, proposed answer, and context, verify correctness and provide a refined response.
@@ -105,15 +89,42 @@ SYNTHESIZE_PROMPT = """You are a specialized AI for multi-step reasoning. Perfor
 2. No New questions: Do not ask for new information. Your role is to synthesize, not to query.
 """
 
-GENERATE_STRUCTURED_QUERIES = """You are a Query Generator that decomposes questions into structured (subject, relation) queries for knowledge graph retrieval. Each query represents a single fact lookup needed to answer or verify the input.
+GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user input into precise, self-contained search queries.
 
 ## Principles:
-1. Relation Constraints: Use provided relations only if specified
+1. Self-Contained: Each query understandable without original input.
+2. Atomic: One single fact per query.
+3. Essential & Non-Redundant: Every query necessary and unique.
+
+## Instructions:
+1. Parse the Input: 
+    - If the input is a question: Identify its type (e.g., factual, comparative, causal, temporal), key entities, and the required reasoning steps. 
+    - If the input is a statement: Deconstruct it into its core, verifiable claims. Identify the key entities and the asserted relationships between them. 
+2. Generate Strategic Queries: Formulate a list of search queries that are necessary to answer/verify the input. Each query is a building block to reach the final answer that follows the guiding principles above. The goal is to provide the user with all the search components they would need to solve the problem from scratch.
+3. Ensure Self-Containment: Each query must be understandable and answerable on its own. Make sure each query is self-contained and does not rely on the original input, other queries, or any external context. Rewrite queries that are not self-contained.
+4. Review for Completeness and Non-Redundancy: Ensure that the set of queries collectively covers all necessary information to answer/verify the input without any overlap or unnecessary duplication.
+"""
+
+# Format reference relations from PROPERTY_LABELS for the prompt
+_REFERENCE_RELATIONS = "\n".join([
+    f"- {prop_data['label']}: {prop_data['description']}"
+    for prop_data in sorted(PROPERTY_LABELS.values(), key=lambda x: x['label'])
+])
+
+GENERATE_STRUCTURED_QUERIES = f"""You are a Query Generator that decomposes questions into structured (subject, relation) queries for knowledge graph retrieval. Each query represents a single fact lookup needed to answer or verify the input.
+
+## Reference Relations (commonly used in knowledge graphs):
+{_REFERENCE_RELATIONS}
+
+## Principles:
+0. Analyze the input: Identify the key entities and the required relationships between them.
+1. Relation Constraints: Use provided relations only if specified. You also should consider the relations that are not provided but are commonly used in the knowledge graph such as those in the reference relations above (this is just for reference, you can ignore it if you think it is not relevant).
 2. Entity Focus: Prioritize provided entities as subjects if specified
-3. Atomicity: One piece of information per query
+3. Atomicity: One piece of information per query. For the query required complex relationship, you can break down the complex relationship into multiple simple relationships to form the query.
 4. Self-Containment: Fully specified entities, no pronouns
 5. Completeness: All queries needed for the answer
-6. Non-Redundancy: Each query seeks unique information, do not generate redundant queries
+6. Non-Redundancy: Each query seeks unique information that provides clues to answer the question, DO NOT generate redundant or unhelpful queries that are not required to answer the question.
+
 """
 
 

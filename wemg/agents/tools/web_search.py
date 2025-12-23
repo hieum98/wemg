@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from typing import List, Optional, Dict, Type, Union
 import pydantic
@@ -35,59 +36,79 @@ class SerperAPIWrapper:
     api_key: str = "your_serper_api_key"
 
     def run(self, query: str):
-        payload = json.dumps({
-        "q": query
-        })
-        headers = {
-        'X-API-KEY': self.api_key,
-        'Content-Type': 'application/json'
-        }
+        try:
+            payload = json.dumps({
+            "q": query
+            })
+            headers = {
+            'X-API-KEY': self.api_key,
+            'Content-Type': 'application/json'
+            }
 
-        response = requests.request("POST", self.url, headers=headers, data=payload)
-        response_json = response.json()
-        all_web_results = []
-        for item in response_json.get("organic", []):
-            web_result = WebSearchResults(
-                title=item.get("title", ""),
-                link=item.get("link", ""),
-                snippet=item.get("snippet", ""),
-                full_text=item.get("snippet", "")  # Assuming full_text is same as snippet for this example
-            )
-            all_web_results.append(web_result)
-        
-        entity = response_json.get("knowledgeGraph", {})
-        if entity:
-            kg_entity = KGEntity(
-                title=entity.get("title", ""),
-                description=entity.get("description", ""),
-                url=entity.get("url", ""),
-                attributes=entity.get("attributes", {})
-            )
-        else:
-            kg_entity = None
-        assert len(all_web_results) > 0
-        logger.info(f"Web search completed for query: {query} with {len(all_web_results)} results.")
-        return all_web_results, kg_entity
+            response = requests.request("POST", self.url, headers=headers, data=payload, timeout=10)
+            response.raise_for_status()  # Raise an exception for bad status codes
+            response_json = response.json()
+            all_web_results = []
+            for item in response_json.get("organic", []):
+                web_result = WebSearchResults(
+                    title=item.get("title", ""),
+                    link=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    full_text=item.get("snippet", "")  # Assuming full_text is same as snippet for this example
+                )
+                all_web_results.append(web_result)
+            
+            entity = response_json.get("knowledgeGraph", {})
+            if entity:
+                kg_entity = KGEntity(
+                    title=entity.get("title", ""),
+                    description=entity.get("description", ""),
+                    url=entity.get("url", ""),
+                    attributes=entity.get("attributes", {})
+                )
+            else:
+                kg_entity = None
+            
+            if len(all_web_results) == 0:
+                logger.warning(f"No results found for query: {query}")
+                raise ValueError("No search results returned")
+            
+            logger.info(f"Web search completed for query: {query} with {len(all_web_results)} results.")
+            return all_web_results, kg_entity
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to access Serper API URL: {e}")
+            raise
+        except (KeyError, ValueError, json.JSONDecodeError) as e:
+            logger.error(f"Error parsing Serper API response: {e}")
+            raise
     
 
 class DDGSAPIWrapper:
     def run(self, query: str):
-        from ddgs import DDGS
+        try:
+            from ddgs import DDGS
 
-        ddgs = DDGS()
-        response = ddgs.text(query, max_results=10)
-        all_web_results = []
-        for item in response:
-            web_result = WebSearchResults(
-                title=item.get("title", ""),
-                link=item.get("href", ""),
-                snippet=item.get("body", ""),
-                full_text=item.get("body", "")  # Assuming full_text is same as body for this example
-            )
-            all_web_results.append(web_result)
-        assert len(all_web_results) > 0
-        logger.info(f"Web search completed for query: {query} with {len(all_web_results)} results.")
-        return all_web_results, None
+            ddgs = DDGS()
+            response = ddgs.text(query, max_results=10)
+            all_web_results = []
+            for item in response:
+                web_result = WebSearchResults(
+                    title=item.get("title", ""),
+                    link=item.get("href", ""),
+                    snippet=item.get("body", ""),
+                    full_text=item.get("body", "")  # Assuming full_text is same as body for this example
+                )
+                all_web_results.append(web_result)
+            
+            if len(all_web_results) == 0:
+                logger.warning(f"No results found for query: {query}")
+                raise ValueError("No search results returned")
+            
+            logger.info(f"Web search completed for query: {query} with {len(all_web_results)} results.")
+            return all_web_results, None
+        except Exception as e:
+            logger.error(f"Failed to access DDGS API: {e}")
+            raise
 
 
 class WebSearchTool(BaseTool):
@@ -102,14 +123,14 @@ class WebSearchTool(BaseTool):
         "WebSearchInput",
         query=(str, pydantic.Field(..., description="The search query string.")),
     )
-    serper_api_key: str = "your-api-key"
+    serper_api_key: str = os.getenv("SERPER_API_KEY", "your-api-key")
 
     @staticmethod
     def crawl_web_pages(urls: Union[str, List[str]]) -> List[str]:
         """Crawl web pages to extract their full text content."""
         if isinstance(urls, str):
             urls = [urls]
-        loader = WebBaseLoader(urls, requests_per_second=8)
+        loader = WebBaseLoader(urls, requests_per_second=8, continue_on_failure=True)
         documents = loader.load()
         page_contents = [doc.page_content for doc in documents]
         # simple cleanup
@@ -160,7 +181,7 @@ class WebSearchTool(BaseTool):
         """Async crawl web pages to extract their full text content."""
         if isinstance(urls, str):
             urls = [urls]
-        loader = WebBaseLoader(urls, requests_per_second=8)
+        loader = WebBaseLoader(urls, requests_per_second=8, continue_on_failure=True)
         documents = [doc async for doc in loader.alazy_load()]
         page_contents = [doc.page_content for doc in documents]
         # simple cleanup

@@ -354,7 +354,7 @@ class WikidataProperty(pydantic.BaseModel):
     
     pid: str = pydantic.Field(..., description="Wikidata Property ID (e.g., P31)")
     label: Optional[str] = pydantic.Field("", description="The property label/name")
-    description: Optional[str] = pydantic.Field(..., description="The description associated with the property")
+    description: Optional[str] = pydantic.Field(None, description="The description associated with the property")
 
     def __hash__(self):
         return hash(self.pid)
@@ -424,16 +424,21 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
     def _execute_sparql_with_retry(
         query: str,
         max_retries: int = MAX_RETRIES,
-        base_delay: float = RETRY_BASE_DELAY
+        base_delay: float = RETRY_BASE_DELAY,
+        timeout: int = 12
     ) -> Optional[Dict]:
         """Execute a SPARQL query with retry logic and rate limiting. """
-        from SPARQLWrapper import SPARQLWrapper, JSON, POST
+        import urllib.request
+        import urllib.parse
+        import urllib.error
         
-        sparql = SPARQLWrapper("https://query.wikidata.org/sparql")
-        sparql.setReturnFormat(JSON)
-        sparql.setMethod(POST)
-        sparql.addCustomHttpHeader("User-Agent", USER_AGENT)
-        sparql.setQuery(query)
+        url = "https://query.wikidata.org/sparql"
+        data = urllib.parse.urlencode({'query': query}).encode('utf-8')
+        headers = {
+            'User-Agent': USER_AGENT,
+            'Accept': 'application/sparql-results+json',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
         
         last_exception = None
         
@@ -441,23 +446,31 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
             try:
                 # Acquire semaphore to limit concurrent requests
                 with _wikidata_semaphore:
-                    # Add small random delay to avoid thundering herd
-                    if attempt > 0 or REQUEST_DELAY > 0:
+                    # Add small random delay to avoid thundering herd (only on retries or if configured)
+                    if attempt > 0:
                         delay = REQUEST_DELAY + random.uniform(0, 0.1)
                         time.sleep(delay)
+                    elif REQUEST_DELAY > 0.05:  # Only add delay if it's significant
+                        delay = REQUEST_DELAY * 0.5 + random.uniform(0, 0.05)  # Reduced delay for first attempt
+                        time.sleep(delay)
                     
-                    results = sparql.query().convert()
-                    return results
+                    # Create request with explicit timeout
+                    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+                    with urllib.request.urlopen(req, timeout=timeout) as response:
+                        results = json.loads(response.read().decode('utf-8'))
+                        return results
                     
-            except Exception as e:
+            except (urllib.error.HTTPError, urllib.error.URLError, Exception) as e:
                 last_exception = e
                 error_str = str(e).lower()
                 
-                # Check if it's a rate limit or server error
+                # Check if it's a rate limit or server error (including 504 Gateway Timeout and read timeout)
                 is_rate_limit = any(x in error_str for x in [
                     "429", "too many requests", "rate limit",
                     "503", "service unavailable", "timeout",
-                    "500", "internal server error"
+                    "504", "gateway timeout", "gateway",
+                    "500", "internal server error",
+                    "read operation timed out", "timed out"
                 ])
                 
                 if is_rate_limit and attempt < max_retries - 1:
@@ -1202,7 +1215,8 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
         
         # Build property filter for SPARQL query
         to_use_props = [prop] if prop and (prop in self.wikidata_props) else self.wikidata_props
-        if to_use_props:
+        # Keep legacy property_filter for backward compatibility, but prefer to_use_props
+        if to_use_props and len(to_use_props) > 50:  # Only use FILTER for very large property lists
             prop_filters = " || ".join([
                 f'?relation = <http://www.wikidata.org/prop/direct/{p}>'
                 for p in to_use_props
@@ -1215,6 +1229,9 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
         qid_triples: Dict[str, List[WikiTriple]] = {q: [] for q in unique_qids}
         visited_entities: Dict[str, Set[str]] = {q: set() for q in unique_qids}
         current_level: Dict[str, Set[str]] = {q: {q} for q in unique_qids}
+        
+        # Early termination: if we're getting too many entities, limit exploration
+        max_entities_per_hop = 1000  # Limit entities per hop to prevent explosion
         
         for hop in range(k):
             # Collect all entities to query at this level
@@ -1233,9 +1250,20 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
             if not all_entities_this_hop:
                 break
             
+            # Limit entities per hop to prevent query explosion
+            if len(all_entities_this_hop) > max_entities_per_hop:
+                logger.warning(f"Limiting entities at hop {hop + 1} from {len(all_entities_this_hop)} to {max_entities_per_hop}")
+                # Prioritize entities that are needed by more sources
+                entity_priority = [(len(sources), e) for e, sources in entity_to_source.items()]
+                entity_priority.sort(reverse=True)
+                all_entities_this_hop = {e for _, e in entity_priority[:max_entities_per_hop]}
+                # Rebuild entity_to_source for limited set
+                entity_to_source = {e: entity_to_source[e] for e in all_entities_this_hop if e in entity_to_source}
+            
             # Execute batch query for all entities at this level
+            # Pass to_use_props directly for more efficient query generation
             hop_triples, next_qids_map = self._execute_bidirectional_batch(
-                list(all_entities_this_hop), property_filter
+                list(all_entities_this_hop), property_filter, to_use_props=to_use_props
             )
             
             # Distribute triples to their source QIDs
@@ -1270,13 +1298,18 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
     def _execute_bidirectional_batch(
         self,
         entity_qids: List[str],
-        property_filter: str
+        property_filter: str,
+        to_use_props: Optional[List[str]] = None
     ) -> Tuple[Dict[str, List[WikiTriple]], Dict[str, Set[str]]]:
-        """Execute bidirectional SPARQL query for multiple entities in batch.
+        """Execute bidirectional SPARQL query for multiple entities.
+        
+        Processes entities ONE AT A TIME to avoid timeouts. Splits outgoing and incoming
+        into separate queries (no UNION) for maximum reliability.
         
         Args:
             entity_qids: List of entity QIDs to query
-            property_filter: SPARQL property filter string
+            property_filter: SPARQL property filter string (deprecated, use to_use_props instead)
+            to_use_props: List of property IDs to filter by (more efficient than property_filter)
             
         Returns:
             Tuple of:
@@ -1286,74 +1319,297 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
         if not entity_qids:
             return {}, {}
         
-        # Process in batches to avoid query limits
-        batch_size = 10
         all_triples: Dict[str, List[WikiTriple]] = {q: [] for q in entity_qids}
         all_next_qids: Dict[str, Set[str]] = {q: set() for q in entity_qids}
         
-        for batch_start in range(0, len(entity_qids), batch_size):
-            batch_qids = entity_qids[batch_start:batch_start + batch_size]
-            values_clause = " ".join([f"wd:{qid}" for qid in batch_qids])
+        # Use VALUES clause for properties if reasonable number (up to 100 properties)
+        # For more properties, split into chunks or use simpler query
+        use_values_for_props = to_use_props and len(to_use_props) <= 100
+        if use_values_for_props and to_use_props:
+            prop_values = " ".join([f"<http://www.wikidata.org/prop/direct/{p}>" for p in to_use_props])
+            prop_values_clause = f"VALUES ?relation {{ {prop_values} }}"
+            props_set = set(to_use_props)  # For post-filtering if needed
+        else:
+            prop_values_clause = ""
+            props_set = set(to_use_props) if to_use_props else None
+        
+        # Process each entity individually - much more reliable than batching
+        limit_per_query = 100  # Small limit for individual queries
+        
+        for qid in entity_qids:
+            # Query 1: Outgoing triples (entity as subject) - ultra-simple query
+            if use_values_for_props:
+                outgoing_query = f"""
+                SELECT ?relation ?object
+                WHERE {{
+                  wd:{qid} ?relation ?object .
+                  {prop_values_clause}
+                }}
+                LIMIT {limit_per_query}
+                """
+            else:
+                # No property filtering in query - filter in post-processing
+                outgoing_query = f"""
+                SELECT ?relation ?object
+                WHERE {{
+                  wd:{qid} ?relation ?object .
+                  FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
+                }}
+                LIMIT {limit_per_query}
+                """
             
-            query = f"""
-            SELECT ?sourceEntity ?subject ?subjectLabel ?subjectDesc ?relation ?relationLabel 
-                   ?object ?objectLabel ?objectDesc ?direction
-            WHERE {{
-              VALUES ?sourceEntity {{ {values_clause} }}
-              {{
-                # Outgoing: entity as subject
-                BIND(?sourceEntity AS ?subject)
-                ?sourceEntity ?relation ?object .
-                FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
-                {property_filter}
-                BIND("outgoing" AS ?direction)
-              }}
-              UNION
-              {{
-                # Incoming: entity as object
-                BIND(?sourceEntity AS ?object)
-                ?subject ?relation ?sourceEntity .
-                FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
-                {property_filter}
-                BIND("incoming" AS ?direction)
-              }}
-              
-              OPTIONAL {{ ?subject rdfs:label ?subjectLabel . FILTER(LANG(?subjectLabel) = "{self.lang}") }}
-              OPTIONAL {{ ?subject schema:description ?subjectDesc . FILTER(LANG(?subjectDesc) = "{self.lang}") }}
-              OPTIONAL {{ ?object rdfs:label ?objectLabel . FILTER(LANG(?objectLabel) = "{self.lang}") }}
-              OPTIONAL {{ ?object schema:description ?objectDesc . FILTER(LANG(?objectDesc) = "{self.lang}") }}
-              
-              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "{self.lang}" . }}
-            }}
-            LIMIT 2000
-            """
+            # Query 2: Incoming triples (entity as object) - ultra-simple query
+            if use_values_for_props:
+                incoming_query = f"""
+                SELECT ?subject ?relation
+                WHERE {{
+                  ?subject ?relation wd:{qid} .
+                  {prop_values_clause}
+                }}
+                LIMIT {limit_per_query}
+                """
+            else:
+                # No property filtering in query - filter in post-processing
+                incoming_query = f"""
+                SELECT ?subject ?relation
+                WHERE {{
+                  ?subject ?relation wd:{qid} .
+                  FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
+                }}
+                LIMIT {limit_per_query}
+                """
             
+            # Execute outgoing query
             try:
-                results = self._execute_sparql_with_retry(query)
-                
-                if not results or not results["results"]["bindings"]:
-                    continue
-                
-                for row in results["results"]["bindings"]:
-                    source_uri = row.get("sourceEntity", {}).get("value", "")
-                    if "/entity/" not in source_uri:
-                        continue
-                    source_qid = source_uri.split("/")[-1].upper()
-                    
-                    triple, next_qid, direction = self._parse_triple_row(row)
-                    if triple:
-                        all_triples[source_qid].append(triple)
-                        if next_qid:
-                            if direction == "outgoing":
-                                all_next_qids[source_qid].add(next_qid)
-                            elif direction == "incoming":
-                                # For incoming, the subject is the next entity to explore
-                                all_next_qids[source_qid].add(triple.subject.qid)
-                                
+                results = self._execute_sparql_with_retry(outgoing_query, timeout=10)
+                if results and results.get("results", {}).get("bindings"):
+                    for row in results["results"]["bindings"]:
+                        # Reconstruct full row for parsing
+                        relation_uri = row.get("relation", {}).get("value", "")
+                        object_uri = row.get("object", {}).get("value", "")
+                        object_type = row.get("object", {}).get("type", "")
+                        
+                        if "/prop/direct/" not in relation_uri:
+                            continue
+                        
+                        # Filter by properties if needed (post-processing when not using VALUES)
+                        pid = relation_uri.split("/")[-1]
+                        if props_set and pid not in props_set:
+                            continue
+                        
+                        subject_qid = qid
+                        
+                        # Create subject entity
+                        subject_entity = WikidataEntity(
+                            qid=subject_qid,
+                            label=subject_qid,  # Will be enriched later if needed
+                            description="",
+                            aliases=[],
+                            url=f"https://www.wikidata.org/wiki/{subject_qid}"
+                        )
+                        
+                        # Create triple
+                        if object_type == "uri" and "/entity/" in object_uri:
+                            object_qid = object_uri.split("/")[-1]
+                            object_entity = WikidataEntity(
+                                qid=object_qid,
+                                label=object_qid,
+                                description="",
+                                aliases=[],
+                                url=f"https://www.wikidata.org/wiki/{object_qid}"
+                            )
+                            triple = WikiTriple(
+                                subject=subject_entity,
+                                relation=WikidataProperty(pid=pid, label="", description=""),
+                                object=object_entity
+                            )
+                            all_triples[qid].append(triple)
+                            all_next_qids[qid].add(object_qid)
+                        else:
+                            object_value = object_uri if object_uri else str(row.get("object", {}).get("value", ""))
+                            triple = WikiTriple(
+                                subject=subject_entity,
+                                relation=WikidataProperty(pid=pid, label="", description=""),
+                                object=object_value
+                            )
+                            all_triples[qid].append(triple)
             except Exception as e:
-                logger.warning(f"Error executing bidirectional batch query: {e}")
+                logger.debug(f"Outgoing query failed for {qid}: {e}")
+            
+            # Small delay between queries to avoid rate limiting
+            time.sleep(0.15)
+            
+            # Execute incoming query
+            try:
+                results = self._execute_sparql_with_retry(incoming_query, timeout=10)
+                if results and results.get("results", {}).get("bindings"):
+                    for row in results["results"]["bindings"]:
+                        # Reconstruct full row for parsing
+                        relation_uri = row.get("relation", {}).get("value", "")
+                        subject_uri = row.get("subject", {}).get("value", "")
+                        
+                        if "/prop/direct/" not in relation_uri or "/entity/" not in subject_uri:
+                            continue
+                        
+                        # Filter by properties if needed (post-processing when not using VALUES)
+                        pid = relation_uri.split("/")[-1]
+                        if props_set and pid not in props_set:
+                            continue
+                        
+                        subject_qid = subject_uri.split("/")[-1]
+                        object_qid = qid
+                        
+                        # Create entities
+                        subject_entity = WikidataEntity(
+                            qid=subject_qid,
+                            label=subject_qid,
+                            description="",
+                            aliases=[],
+                            url=f"https://www.wikidata.org/wiki/{subject_qid}"
+                        )
+                        object_entity = WikidataEntity(
+                            qid=object_qid,
+                            label=object_qid,
+                            description="",
+                            aliases=[],
+                            url=f"https://www.wikidata.org/wiki/{object_qid}"
+                        )
+                        
+                        triple = WikiTriple(
+                            subject=subject_entity,
+                            relation=WikidataProperty(pid=pid, label="", description=""),
+                            object=object_entity
+                        )
+                        all_triples[qid].append(triple)
+                        # For incoming, the subject is the next entity to explore
+                        all_next_qids[qid].add(subject_qid)
+            except Exception as e:
+                logger.debug(f"Incoming query failed for {qid}: {e}")
+            
+            # Small delay before next entity
+            time.sleep(0.1)
         
         return all_triples, all_next_qids
+
+    def _get_neighbors_fast(
+        self,
+        qid: str,
+        limit: int = 50
+    ) -> List[Tuple[str, WikiTriple]]:
+        """Get immediate neighbors of an entity for path finding.
+        
+        Optimized version that only fetches what's needed for BFS path finding.
+        Returns list of (neighbor_qid, triple) tuples.
+        Uses minimal queries with reduced limits for speed.
+        
+        Args:
+            qid: Entity QID to get neighbors for
+            limit: Maximum number of neighbors to return (reduced for speed)
+            
+        Returns:
+            List of (neighbor_qid, triple) tuples
+        """
+        neighbors: List[Tuple[str, WikiTriple]] = []
+        
+        # Ultra-simple queries - only fetch QIDs, minimal filtering
+        # Reduced limit to avoid timeouts on entities with many connections
+        outgoing_query = f"""
+        SELECT DISTINCT ?object
+        WHERE {{
+          wd:{qid} ?relation ?object .
+          FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
+          FILTER(STRSTARTS(STR(?object), "http://www.wikidata.org/entity/"))
+        }}
+        LIMIT {limit}
+        """
+        
+        incoming_query = f"""
+        SELECT DISTINCT ?subject
+        WHERE {{
+          ?subject ?relation wd:{qid} .
+          FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
+          FILTER(STRSTARTS(STR(?subject), "http://www.wikidata.org/entity/"))
+        }}
+        LIMIT {limit}
+        """
+        
+        # Execute outgoing query
+        try:
+            results = self._execute_sparql_with_retry(outgoing_query, timeout=5)
+            if results and results.get("results", {}).get("bindings"):
+                for row in results["results"]["bindings"]:
+                    object_uri = row.get("object", {}).get("value", "")
+                    
+                    if "/entity/" not in object_uri:
+                        continue
+                    
+                    object_qid = object_uri.split("/")[-1]
+                    
+                    # Create minimal entities and triple for path finding
+                    subject_entity = WikidataEntity(
+                        qid=qid,
+                        label=qid,
+                        description="",
+                        aliases=[],
+                        url=f"https://www.wikidata.org/wiki/{qid}"
+                    )
+                    object_entity = WikidataEntity(
+                        qid=object_qid,
+                        label=object_qid,
+                        description="",
+                        aliases=[],
+                        url=f"https://www.wikidata.org/wiki/{object_qid}"
+                    )
+                    # Use a generic relation - we don't need the exact property for path finding
+                    triple = WikiTriple(
+                        subject=subject_entity,
+                        relation=WikidataProperty(pid="P0", label="", description=""),  # Placeholder
+                        object=object_entity
+                    )
+                    neighbors.append((object_qid, triple))
+        except Exception as e:
+            logger.debug(f"Outgoing query failed for {qid}: {e}")
+        
+        # Small delay between queries
+        time.sleep(0.05)
+        
+        # Execute incoming query
+        try:
+            results = self._execute_sparql_with_retry(incoming_query, timeout=5)
+            if results and results.get("results", {}).get("bindings"):
+                for row in results["results"]["bindings"]:
+                    subject_uri = row.get("subject", {}).get("value", "")
+                    
+                    if "/entity/" not in subject_uri:
+                        continue
+                    
+                    subject_qid = subject_uri.split("/")[-1]
+                    
+                    subject_entity = WikidataEntity(
+                        qid=subject_qid,
+                        label=subject_qid,
+                        description="",
+                        aliases=[],
+                        url=f"https://www.wikidata.org/wiki/{subject_qid}"
+                    )
+                    object_entity = WikidataEntity(
+                        qid=qid,
+                        label=qid,
+                        description="",
+                        aliases=[],
+                        url=f"https://www.wikidata.org/wiki/{qid}"
+                    )
+                    # Use a generic relation - we don't need the exact property for path finding
+                    triple = WikiTriple(
+                        subject=subject_entity,
+                        relation=WikidataProperty(pid="P0", label="", description=""),  # Placeholder
+                        object=object_entity
+                    )
+                    neighbors.append((subject_qid, triple))
+        except Exception as e:
+            logger.debug(f"Incoming query failed for {qid}: {e}")
+        
+        return neighbors
 
     def _parse_triple_row(self, row: Dict) -> Tuple[Optional[WikiTriple], Optional[str], str]:
         """Parse a SPARQL result row into a WikiTriple.
@@ -1366,15 +1622,17 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
             return None, None, ""
         
         pid = relation_uri.split("/")[-1]
-        relation_label = row.get("relationLabel", {}).get("value", "")
+        # Labels may not be present in simplified queries - use empty string as fallback
+        relation_label = row.get("relationLabel", {}).get("value", "") if "relationLabel" in row else ""
         direction = row.get("direction", {}).get("value", "")
         
         subject_uri = row.get("subject", {}).get("value", "")
         if "/entity/" not in subject_uri:
             return None, None, ""
         subject_qid = subject_uri.split("/")[-1]
-        subject_label = row.get("subjectLabel", {}).get("value", subject_qid)
-        subject_desc = row.get("subjectDesc", {}).get("value", "")
+        # Labels may not be present - use QID as fallback
+        subject_label = row.get("subjectLabel", {}).get("value", subject_qid) if "subjectLabel" in row else subject_qid
+        subject_desc = row.get("subjectDesc", {}).get("value", "") if "subjectDesc" in row else ""
         
         object_uri = row.get("object", {}).get("value", "")
         object_type = row.get("object", {}).get("type", "")
@@ -1390,8 +1648,9 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
         next_qid = None
         if object_type == "uri" and "/entity/" in object_uri:
             object_qid = object_uri.split("/")[-1]
-            object_label = row.get("objectLabel", {}).get("value", object_qid)
-            object_desc = row.get("objectDesc", {}).get("value", "")
+            # Labels may not be present - use QID as fallback
+            object_label = row.get("objectLabel", {}).get("value", object_qid) if "objectLabel" in row else object_qid
+            object_desc = row.get("objectDesc", {}).get("value", "") if "objectDesc" in row else ""
             
             object_entity = WikidataEntity(
                 qid=object_qid,
@@ -1766,10 +2025,10 @@ class WikidataEntityRetrievalTool(BaseTool):
                 qids_per_query = [[qid] for qid in query]
         else:
             if is_single:
-                search_results = self.wikidata_wrapper._get_id(query)
+                search_results = await asyncio.to_thread(self.wikidata_wrapper._get_id, query)
                 qids_per_query = [search_results[:num_entities] if search_results else []]
             else:
-                all_search_results = self.wikidata_wrapper._get_id(query)
+                all_search_results = await asyncio.to_thread(self.wikidata_wrapper._get_id, query)
                 qids_per_query = [results[:num_entities] if results else [] for results in all_search_results]
         
         # Flatten all QIDs for batch retrieval
@@ -1854,7 +2113,7 @@ class WikidataPropertyRetrievalTool(BaseTool):
         return output[0] if is_single else output
     
     async def _arun(self, query: Union[str, List[str]], top_k_results: int = 3) -> Union[List[WikidataProperty], List[List[WikidataProperty]]]:
-        return asyncio.to_thread(self._run, query, top_k_results)
+        return await asyncio.to_thread(self._run, query, top_k_results)
         
 class WikidataKHopTriplesRetrievalTool(BaseTool):
     """Tool for retrieving k-hop Wikidata triples based on a textual query."""
@@ -2107,10 +2366,10 @@ class WikidataKHopTriplesRetrievalTool(BaseTool):
                 qids_per_query = [[qid] for qid in query]
         else:
             if is_single:
-                search_results = self.wikidata_wrapper._get_id(query)
+                search_results = await asyncio.to_thread(self.wikidata_wrapper._get_id, query)
                 qids_per_query = [search_results[:num_entities] if search_results else []]
             else:
-                all_search_results = self.wikidata_wrapper._get_id(query)
+                all_search_results = await asyncio.to_thread(self.wikidata_wrapper._get_id, query)
                 qids_per_query = [results[:num_entities] if results else [] for results in all_search_results]
         
         # Flatten all QIDs for batch retrieval
@@ -2322,6 +2581,7 @@ class WikidataPathFindingTool(BaseTool):
         # Combine paths
         full_path = forward_path + backward_path
         
+        # TODO: Update all entities in the path with details
         # Get entity details
         source_entity = self.wikidata_wrapper._get_item(source_qid, get_details=False)
         target_entity = self.wikidata_wrapper._get_item(target_qid, get_details=False)

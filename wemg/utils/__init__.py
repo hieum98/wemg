@@ -13,7 +13,7 @@ from wemg.utils.preprocessing import (
     get_node_id,
     format_context,
 )
-from wemg.utils.graph_utils import get_densest_node, textualize_graph
+from wemg.utils.graph_utils import get_densest_node, textualize_graph, visualize_graph
 
 __all__ = [
     'merge_logs',
@@ -23,4 +23,5 @@ __all__ = [
     'format_context',
     'get_densest_node',
     'textualize_graph',
+    'visualize_graph',
 ]

@@ -20,29 +20,35 @@ from wemg.agents.tools.wikidata import (
     WikiTriple,
     WikidataEntityRetrievalTool,
     WikidataPropertyRetrievalTool,
-    WikidataKHopTriplesRetrievalTool
+    WikidataKHopTriplesRetrievalTool,
+    WikidataPathFindingTool,
+    WikidataPathBetweenEntities
 )
 from wemg.agents.base_llm_agent import BaseLLMAgent
 
 
 # Test configuration
-TEST_LLM_API_BASE = os.getenv("TEST_LLM_API_BASE", "http://n0142:4000/v1")
+TEST_LLM_API_BASE = os.getenv("TEST_LLM_API_BASE", "http://n0999:4000/v1")
 TEST_LLM_API_KEY = os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here")
-TEST_LLM_MODEL = os.getenv("TEST_LLM_MODEL", "Qwen3-32B")
+TEST_LLM_MODEL = os.getenv("TEST_LLM_MODEL", "Qwen3-Next-80B-A3B-Thinking-FP8")
 
-TEST_EMBEDDING_API_BASE = os.getenv("TEST_EMBEDDING_API_BASE", "http://n0372:4000/v1")
+TEST_EMBEDDING_API_BASE = os.getenv("TEST_EMBEDDING_API_BASE", "http://n0999:4000/v1")
 TEST_EMBEDDING_MODEL = os.getenv("TEST_EMBEDDING_MODEL", "Qwen3-Embedding-4B")
 
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "your-serper-api-key")
 
 class TestWebSearchTool:
     """Test suite for WebSearchTool functionality."""
     
     @pytest.fixture
     def ddgs_search_tool(self):
-        """Create a WebSearchTool with DuckDuckGo backend."""
+        """Create a WebSearchTool that will use DuckDuckGo backend.
+        
+        Since WebSearchTool tries Serper first and falls back to DDGS,
+        we use an invalid serper_api_key to force it to use DDGS.
+        """
         return WebSearchTool(
-            api_wrapper=DDGSAPIWrapper(),
-            max_tokens=8192
+            serper_api_key=SERPER_API_KEY
         )
     
     @pytest.mark.slow
@@ -126,12 +132,12 @@ class TestWikidataEntityRetrieval:
         return WikidataEntityRetrievalTool()
     
     @pytest.mark.slow
-    def test_retrieve_single_entity(self, entity_retriever):
+    def test_retrieve_single_entity(self, entity_retriever: WikidataEntityRetrievalTool):
         """Test retrieving a single entity by name."""
         query = ["Albert Einstein"]
         
         results = asyncio.run(
-            entity_retriever.ainvoke({"query": query, "top_k_results": 3})
+            entity_retriever.ainvoke({"query": query, "num_entities": 3})
         )
         
         assert len(results) == 1
@@ -142,9 +148,9 @@ class TestWikidataEntityRetrieval:
         assert entity.label is not None
         assert entity.qid is not None
         assert "einstein" in entity.label.lower() or "albert" in entity.label.lower()
-        
         print(f"✓ Single Entity Retrieval")
         print(f"  Query: Albert Einstein")
+        print(f"  Results: {len(results[0])}")
         print(f"  Found: {entity.label} ({entity.qid})")
         print(f"  Description: {entity.description[:100] if entity.description else 'N/A'}")
     
@@ -154,7 +160,7 @@ class TestWikidataEntityRetrieval:
         queries = ["Paris", "Tokyo", "New York"]
         
         results = asyncio.run(
-            entity_retriever.ainvoke({"query": queries, "top_k_results": 2})
+            entity_retriever.ainvoke({"query": queries, "num_entities": 2})
         )
         
         assert len(results) == 3
@@ -164,6 +170,7 @@ class TestWikidataEntityRetrieval:
             if result_list:
                 entity = result_list[0]
                 print(f"  {query}: {entity.label} ({entity.qid})")
+                print(entity)
             else:
                 print(f"  {query}: No results")
     
@@ -173,7 +180,7 @@ class TestWikidataEntityRetrieval:
         query = ["Apple"]  # Could be fruit or company
         
         results = asyncio.run(
-            entity_retriever.ainvoke({"query": query, "top_k_results": 5})
+            entity_retriever.ainvoke({"query": query, "num_entities": 5})
         )
         
         assert len(results) == 1
@@ -183,6 +190,7 @@ class TestWikidataEntityRetrieval:
         print(f"  Query: Apple")
         print(f"  Found {len(results[0])} candidates:")
         for entity in results[0][:3]:
+            print(entity)
             print(f"    - {entity.label}: {entity.description[:50] if entity.description else 'N/A'}...")
 
 
@@ -349,10 +357,13 @@ class TestWebSearchIntegration:
     
     @pytest.fixture
     def web_search_tool(self):
-        """Create a WebSearchTool."""
+        """Create a WebSearchTool that will use DuckDuckGo backend.
+        
+        Since WebSearchTool tries Serper first and falls back to DDGS,
+        we use an invalid serper_api_key to force it to use DDGS.
+        """
         return WebSearchTool(
-            api_wrapper=DDGSAPIWrapper(),
-            max_tokens=8192
+            serper_api_key=SERPER_API_KEY
         )
     
     @pytest.mark.slow
@@ -393,8 +404,7 @@ class TestWebSearchIntegration:
             print(f"✓ Search and Extract Integration")
             print(f"  Query: {query}")
             print(f"  Search results: {len(search_output.results)}")
-            print(f"  Extraction decision: {output.decision}")
-            print(f"  Extracted info: {len(output.information)} items")
+            print(f"  Relevant information: {output.relevant_information}")
 
 
 class TestWikidataIntegration:
@@ -417,7 +427,7 @@ class TestWikidataIntegration:
         
         # Start with an entity
         entity_results = asyncio.run(
-            entity_retriever.ainvoke({"query": ["Barack Obama"], "top_k_results": 1})
+            entity_retriever.ainvoke({"query": ["Barack Obama"], "num_entities": 1})
         )
         
         assert len(entity_results[0]) > 0
@@ -451,15 +461,189 @@ class TestWikidataIntegration:
             print(f"    {u[:30]} --[{data.get('relation', 'N/A')[:20]}]--> {v[:30]}")
 
 
+class TestWikidataPathFinding:
+    """Test suite for Wikidata path finding between entities."""
+    
+    @pytest.fixture
+    def path_finder(self):
+        """Create a WikidataPathFindingTool."""
+        return WikidataPathFindingTool()
+    
+    @pytest.mark.slow
+    def test_find_path_between_entities(self, path_finder):
+        """Test finding a path between two related entities."""
+        # Q142 is France, Q183 is Germany - should be connected (both are countries in Europe)
+        source_qid = "Q142"  # France
+        target_qid = "Q183"  # Germany
+        
+        path_result = asyncio.run(
+            path_finder.ainvoke({
+                "source_qid": source_qid,
+                "target_qid": target_qid,
+                "max_hops": 3
+            })
+        )
+        
+        # Path might be found or not, depending on Wikidata structure
+        if path_result:
+            assert isinstance(path_result, WikidataPathBetweenEntities)
+            assert path_result.source.qid == source_qid
+            assert path_result.target.qid == target_qid
+            assert path_result.path_length >= 0
+            assert len(path_result.path) == path_result.path_length
+            
+            print(f"✓ Path Finding Between Entities")
+            print(f"  Source: {path_result.source.label} ({source_qid})")
+            print(f"  Target: {path_result.target.label} ({target_qid})")
+            print(f"  Path length: {path_result.path_length}")
+            if path_result.path:
+                print(f"  Path found with {len(path_result.path)} hops:")
+                for i, triple in enumerate(path_result.path[:5]):
+                    obj_label = triple.object.label if hasattr(triple.object, 'label') else str(triple.object)
+                    print(f"    {i+1}. {triple.subject.label} --[{triple.relation.label}]--> {obj_label}")
+            else:
+                print(f"  No path found (same entity or direct connection)")
+        else:
+            print(f"✓ Path Finding Between Entities")
+            print(f"  Source: {source_qid} (France)")
+            print(f"  Target: {target_qid} (Germany)")
+            print(f"  No path found within max_hops=3")
+    
+    @pytest.mark.slow
+    def test_find_path_same_entity(self, path_finder):
+        """Test finding a path from an entity to itself."""
+        # Q142 is France
+        qid = "Q142"
+        
+        path_result = asyncio.run(
+            path_finder.ainvoke({
+                "source_qid": qid,
+                "target_qid": qid,
+                "max_hops": 3
+            })
+        )
+        
+        # Should return a path with length 0 (same entity)
+        assert path_result is not None
+        assert isinstance(path_result, WikidataPathBetweenEntities)
+        assert path_result.source.qid == qid
+        assert path_result.target.qid == qid
+        assert path_result.path_length == 0
+        assert len(path_result.path) == 0
+        
+        print(f"✓ Path Finding Same Entity")
+        print(f"  Entity: {path_result.source.label} ({qid})")
+        print(f"  Path length: {path_result.path_length} (same entity)")
+    
+    @pytest.mark.slow
+    def test_find_path_with_different_max_hops(self, path_finder):
+        """Test finding a path with different max_hops values."""
+        # Q30 is United States, Q142 is France
+        source_qid = "Q30"   # United States
+        target_qid = "Q142"  # France
+        
+        # Try with max_hops=2
+        path_result_2 = asyncio.run(
+            path_finder.ainvoke({
+                "source_qid": source_qid,
+                "target_qid": target_qid,
+                "max_hops": 2
+            })
+        )
+        
+        # Try with max_hops=3
+        path_result_3 = asyncio.run(
+            path_finder.ainvoke({
+                "source_qid": source_qid,
+                "target_qid": target_qid,
+                "max_hops": 3
+            })
+        )
+        
+        print(f"✓ Path Finding with Different Max Hops")
+        print(f"  Source: {source_qid} (United States)")
+        print(f"  Target: {target_qid} (France)")
+        print(f"  Max hops=2: {'Path found' if path_result_2 and path_result_2.path else 'No path'}")
+        print(f"  Max hops=3: {'Path found' if path_result_3 and path_result_3.path else 'No path'}")
+        
+        # If path found with max_hops=3, it should be valid
+        if path_result_3 and path_result_3.path:
+            assert path_result_3.path_length <= 3
+            assert len(path_result_3.path) == path_result_3.path_length
+            print(f"    Path length with max_hops=3: {path_result_3.path_length}")
+    
+    @pytest.mark.slow
+    def test_find_path_nonexistent_entities(self, path_finder):
+        """Test finding a path with nonexistent QIDs."""
+        # Use invalid QIDs
+        source_qid = "Q999999999"
+        target_qid = "Q999999998"
+        
+        path_result = asyncio.run(
+            path_finder.ainvoke({
+                "source_qid": source_qid,
+                "target_qid": target_qid,
+                "max_hops": 3
+            })
+        )
+        
+        # Should return None if entities don't exist
+        # or return a path result with None entities if partially found
+        print(f"✓ Path Finding Nonexistent Entities")
+        print(f"  Source: {source_qid}")
+        print(f"  Target: {target_qid}")
+        if path_result is None:
+            print(f"  Result: None (entities not found)")
+        else:
+            print(f"  Result: Path result returned (may have None entities)")
+    
+    @pytest.mark.slow
+    def test_find_path_well_known_connection(self, path_finder):
+        """Test finding a path between well-known connected entities."""
+        # Q42 is Douglas Adams, Q937 is E. Coli - might be connected through works
+        # Or use Q76 (Barack Obama) and Q30 (United States) - should be connected
+        source_qid = "Q76"   # Barack Obama
+        target_qid = "Q30"    # United States
+        
+        path_result = asyncio.run(
+            path_finder.ainvoke({
+                "source_qid": source_qid,
+                "target_qid": target_qid,
+                "max_hops": 3
+            })
+        )
+        
+        if path_result and path_result.path:
+            assert path_result.path_length > 0
+            assert len(path_result.path) > 0
+            
+            print(f"✓ Path Finding Well-Known Connection")
+            print(f"  Source: {path_result.source.label} ({source_qid})")
+            print(f"  Target: {path_result.target.label} ({target_qid})")
+            print(f"  Path length: {path_result.path_length}")
+            print(f"  Path:")
+            for i, triple in enumerate(path_result.path):
+                obj_label = triple.object.label if hasattr(triple.object, 'label') else str(triple.object)
+                print(f"    {i+1}. {triple.subject.label} --[{triple.relation.label}]--> {obj_label}")
+        else:
+            print(f"✓ Path Finding Well-Known Connection")
+            print(f"  Source: {source_qid} (Barack Obama)")
+            print(f"  Target: {target_qid} (United States)")
+            print(f"  No path found within max_hops=3")
+
+
 class TestToolErrorHandling:
     """Test error handling in tools."""
     
     @pytest.fixture
     def web_search_tool(self):
-        """Create a WebSearchTool."""
+        """Create a WebSearchTool that will use DuckDuckGo backend.
+        
+        Since WebSearchTool tries Serper first and falls back to DDGS,
+        we use an invalid serper_api_key to force it to use DDGS.
+        """
         return WebSearchTool(
-            api_wrapper=DDGSAPIWrapper(),
-            max_tokens=8192
+            serper_api_key=SERPER_API_KEY
         )
     
     @pytest.fixture
@@ -485,7 +669,7 @@ class TestToolErrorHandling:
         query = ["xyznonexistententity123"]
         
         results = asyncio.run(
-            entity_retriever.ainvoke({"query": query, "top_k_results": 3})
+            entity_retriever.ainvoke({"query": query, "num_entities": 3})
         )
         
         # Should return empty results, not error

@@ -33,7 +33,9 @@ class BaseLLMRole:
             history = [system_message]
         else:
             in_context_examples = interaction_memory.get_examples(role=self.role_name, query=str(input_data))
-            logger.warning("The interaction memory provided examples for this role. Ensure that all examples are compatible with this role.")
+            if in_context_examples:
+                logger.warning("The interaction memory provided examples for this role. Ensure that all examples are compatible with this role.")
+                logger.info(f"In-context examples: {'\n-'.join([msg['content'] for msg in in_context_examples])}")
             assert 'system' not in [msg['role'] for msg in in_context_examples], "in_context_examples should not contain a system message."
             history = [system_message] + in_context_examples
         user_message = {"role": "user", "content": str(input_data)}
@@ -57,7 +59,9 @@ class BaseLLMRole:
         else:
             # Use async version with read lock for concurrent access
             in_context_examples = await interaction_memory.get_examples_async(role=self.role_name, query=str(input_data))
-            logger.warning("The interaction memory provided examples for this role. Ensure that all examples are compatible with this role.")
+            if in_context_examples:
+                logger.warning("The interaction memory provided examples for this role. Ensure that all examples are compatible with this role.")
+                logger.info(f"In-context examples: {'\n-'.join([msg['content'] for msg in in_context_examples])}")
             assert 'system' not in [msg['role'] for msg in in_context_examples], "in_context_examples should not contain a system message."
             history = [system_message] + in_context_examples
         user_message = {"role": "user", "content": str(input_data)}

@@ -58,6 +58,7 @@ class RetrieverAgent:
     
     def get_index(self):
         corpus = None
+        logger.info(f"Loading corpus from {self.corpus_path}")
         if not self.corpus_path.exists():
             corpus = datasets.load_dataset(str(self.corpus_path), split="train")
             self.corpus_path = Path(f"./retriever_corpora/{self.corpus_path}")

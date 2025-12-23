@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 import gc
-from typing import List, Union
+from typing import List, Optional, Union
 import logging
 import os
 import uuid
@@ -129,7 +129,8 @@ class LocalCompatibleEmbedding(EmbeddingFunction):
 class InteractionMemory:
     def __init__(
             self, 
-            db_path="./memory_db", 
+            db_client: Optional[chromadb.Client] = None,
+            db_path: Optional[str] = None, 
             collection_name="interaction_memory",
             token_budget: int = 8192,
             is_local_embedding_api: bool = False,
@@ -155,7 +156,15 @@ class InteractionMemory:
         self.token_budget = token_budget
         self.collection_name = collection_name
         
-        self.db_client = chromadb.PersistentClient(path=db_path)
+        if db_client:
+            logger.info("Using provided database client")
+            self.db_client = db_client
+        elif db_path:
+            logger.info(f"Using persistent database at {db_path}")
+            self.db_client = chromadb.PersistentClient(path=db_path)
+        else:
+            logger.info("Using in-memory database")
+            self.db_client = chromadb.EphemeralClient()
         self.collection = self.db_client.get_or_create_collection(
             name=collection_name,
             embedding_function=self.embedding_function,
@@ -169,14 +178,33 @@ class InteractionMemory:
         # Embedding cache to avoid recomputing same query embeddings
         self._embedding_cache = {} if enable_embedding_cache else None
         self._cache_max_size = 1000  # Limit cache size to prevent memory issues
+    
+    def get_info(self):
+        count = self.collection.count()
+        if count == 0:
+            unique_roles = set()
+        else:
+            results = self.collection.get()
+            unique_roles = set([metadata['role'] for metadata in results.get('metadatas', [])])
+        
+        return {
+            "collections": self.db_client.list_collections(),
+            'used_collection': self.collection_name,
+            "documents": count,
+            "unique_roles": unique_roles,
+        }
 
     def release(self, should_delete_db: bool = False):
         if isinstance(self.embedding_function, LocalCompatibleEmbedding):
             self.embedding_function.close()
         
-        # 1. Optionally delete the database files
-        if should_delete_db:
-            self.db_client.delete_collection(name=self.collection_name)
+        # 1. Optionally delete the collection before breaking references
+        if should_delete_db and self.collection is not None and self.db_client is not None:
+            try:
+                self.db_client.delete_collection(name=self.collection_name)
+            except Exception as e:
+                # Collection might already be deleted, ignore
+                logger.debug(f"Could not delete collection {self.collection_name}: {e}")
         
         # 2. Break references to ChromaDB objects
         # This signals to Python that these heavy objects can be destroyed

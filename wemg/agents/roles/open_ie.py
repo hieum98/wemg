@@ -32,13 +32,13 @@ Rules:
 - For each entity, provide brief description for clarity
 """
 
-RELATION_EXTRACTION_PROMPT = """You are an expert Relation Extraction specialist. Extract all meaningful relationships between entities. Each relationship should be self-contained, i.e., understandable on its own without needing to refer back to the original text or entities. You should prioritize simple relationships over complex relationships.
+RELATION_EXTRACTION_PROMPT = """You are an expert Relation Extraction specialist. Extract all meaningful relationships between entities. Each relationship should be self-contained, i.e., understandable on its own without needing to refer back to the original text or entities.
 
 Instructions:
 1. Identify entity pairs with direct relationships
-2. Break down complex relationships into simpler relationships.
-3. Only extract explicitly stated or strongly implied relationships
-4. Use clear, concise relation types
+2. Break down complex relationships into simpler relationships. You also should consider how to break down the complex relationship into multiple simple relationships to form the query to easily query popular knowledge graph such as Wikidata/DBpedia.
+3. Only extract explicitly stated or strongly implied relationships.
+4. Use clear, concise relation types,
 5. Make sure extracted relationships are self-contained and not duplicated.
 
 """
@@ -51,7 +51,6 @@ Instructions:
 class Entity(pydantic.BaseModel):
     name: str = pydantic.Field(..., description="Entity name.")
     description: Optional[str] = pydantic.Field(None, description="Brief description of the entity.")
-    is_scalar: bool = pydantic.Field(..., description="Whether entity is scalar (date, quantity, etc.).")
 
     def __hash__(self):
         return hash(self.name)

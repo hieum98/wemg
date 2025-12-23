@@ -254,6 +254,109 @@ class TestGeneratorRoles:
         print(f"✓ ReasoningSynthesizer")
         print(f"  Is answerable: {output.is_answerable}")
         print(f"  Conclusion: {output.step_conclusion[:200]}")
+    
+    @pytest.mark.slow
+    def test_structured_query_generator(self, llm_agent, interaction_memory):
+        """Test StructuredQueryGenerator for knowledge graph query generation."""
+        input_data = roles.generator.QueryGraphGeneratorInput(
+            input_text="Who was the first person to walk on the moon and when did it happen?"
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.generator.StructuredQueryGenerator(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.generator.QueryGraphGeneratorOutput = results[0]
+        
+        assert output.queries is not None
+        assert len(output.queries) > 0
+        
+        # Validate query structure
+        for query in output.queries:
+            assert query.subject is not None and len(query.subject) > 0
+            assert query.relation is not None and len(query.relation) > 0
+            # reasoning is optional
+        
+        print(f"✓ StructuredQueryGenerator")
+        print(f"  Generated {len(output.queries)} structured queries:")
+        for i, query in enumerate(output.queries, 1):
+            print(f"    {i}. Subject: {query.subject}")
+            print(f"       Relation: {query.relation}")
+            if query.reasoning:
+                print(f"       Reasoning: {query.reasoning[:100]}...")
+    
+    @pytest.mark.slow
+    def test_structured_query_generator_with_entities(self, llm_agent, interaction_memory):
+        """Test StructuredQueryGenerator with provided entities."""
+        input_data = roles.generator.QueryGraphGeneratorInput(
+            input_text="What is the relationship between Paris and France?",
+            entities=["Paris", "France"]
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.generator.StructuredQueryGenerator(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.generator.QueryGraphGeneratorOutput = results[0]
+        
+        assert output.queries is not None
+        assert len(output.queries) > 0
+        
+        # Check that provided entities are used as subjects
+        subjects = [q.subject for q in output.queries]
+        # At least one query should use one of the provided entities
+        entity_used = any(
+            entity.lower() in subject.lower() 
+            for entity in ["Paris", "France"] 
+            for subject in subjects
+        )
+        assert entity_used, f"Expected provided entities to be used, got subjects: {subjects}"
+        
+        print(f"✓ StructuredQueryGenerator (with entities)")
+        print(f"  Generated {len(output.queries)} structured queries:")
+        for i, query in enumerate(output.queries, 1):
+            print(f"    {i}. {query.subject} --[{query.relation}]--> ?")
+    
+    @pytest.mark.slow
+    def test_structured_query_generator_with_relations(self, llm_agent, interaction_memory):
+        """Test StructuredQueryGenerator with provided relations."""
+        input_data = roles.generator.QueryGraphGeneratorInput(
+            input_text="Where was Albert Einstein born and what did he discover?",
+            relations=["born_in", "discovered", "located_in"]
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.generator.StructuredQueryGenerator(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.generator.QueryGraphGeneratorOutput = results[0]
+        
+        assert output.queries is not None
+        assert len(output.queries) > 0
+        
+        # Check that queries use the provided relations (or similar)
+        relations = [q.relation.lower() for q in output.queries]
+        print(f"✓ StructuredQueryGenerator (with relations)")
+        print(f"  Generated {len(output.queries)} structured queries:")
+        for i, query in enumerate(output.queries, 1):
+            print(f"    {i}. {query.subject} --[{query.relation}]--> ?")
+            if query.reasoning:
+                print(f"       Reasoning: {query.reasoning[:80]}...")
 
 
 class TestEvaluatorRoles:
@@ -407,7 +510,7 @@ class TestExtractorRoles:
             url=TEST_LLM_API_BASE,
             api_key=TEST_LLM_API_KEY,
             temperature=0.7,
-            max_tokens=4096,
+            max_tokens=128000,
             concurrency=2,
             max_retries=3
         )
@@ -421,13 +524,11 @@ class TestExtractorRoles:
     def test_extractor_relevant(self, llm_agent, interaction_memory):
         """Test Extractor with relevant data."""
         input_data = roles.extractor.ExtractionInput(
-            question="When was the Eiffel Tower built?",
-            raw_data="""The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris, France. 
-            It is named after the engineer Gustave Eiffel, whose company designed and built the tower. 
-            Locally nicknamed "La dame de fer" (French for "Iron Lady"), it was constructed from 1887 to 1889 
-            as the centerpiece of the 1889 World's Fair. The tower is 330 metres (1,083 ft) tall."""
+            question="Who build the great wall of china?",
+            raw_data="""The Great Wall of China is a series of fortifications made of stone, brick, 
+            tamped earth, and other materials. It was built along the historical northern borders 
+            of China to protect against various nomadic groups. The wall spans over 13,000 miles and was started building in 7th century BC under the Qin dynasty."""
         )
-        
         results, log = asyncio.run(execute_role(
             llm_agent=llm_agent,
             role=roles.extractor.Extractor(),
@@ -435,18 +536,14 @@ class TestExtractorRoles:
             interaction_memory=interaction_memory,
             n=1
         ))
-        
         assert len(results) == 1
         output: roles.extractor.ExtractionOutput = results[0]
         
-        assert output.decision == "relevant"
-        assert len(output.information) > 0
+        assert output.relevant_information is not None
+        assert len(output.relevant_information) > 0
         
         print(f"✓ Extractor (relevant)")
-        print(f"  Decision: {output.decision}")
-        print(f"  Extracted {len(output.information)} pieces of information:")
-        for info in output.information[:3]:
-            print(f"    - {info[:100]}...")
+        print(f"  Relevant information: {output.relevant_information}")
     
     @pytest.mark.slow
     def test_extractor_not_relevant(self, llm_agent, interaction_memory):
@@ -468,13 +565,11 @@ class TestExtractorRoles:
         
         assert len(results) == 1
         output: roles.extractor.ExtractionOutput = results[0]
-        
-        assert output.decision == "not_relevant"
-        assert len(output.information) == 0
-        
+        assert len(output.relevant_information) == 0
         print(f"✓ Extractor (not relevant)")
-        print(f"  Decision: {output.decision}")
+        print(f"  Relevant information: {output.relevant_information}")
     
+        
     @pytest.mark.slow
     def test_memory_consolidation(self, llm_agent, interaction_memory):
         """Test MemoryConsolidation role."""
@@ -504,7 +599,281 @@ class TestExtractorRoles:
         print(f"✓ MemoryConsolidation")
         print(f"  Consolidated memory:")
         for item in output.consolidated_memory[:5]:
-            print(f"    - {item[:80]}...")
+            print(f"    - {str(item)}...")
+
+
+class TestOpenIERoles:
+    """Test suite for OpenIE roles (NER and Relation Extraction)."""
+    
+    @pytest.fixture
+    def llm_agent(self):
+        """Create a BaseLLMAgent for testing."""
+        return BaseLLMAgent(
+            model_name=TEST_LLM_MODEL,
+            url=TEST_LLM_API_BASE,
+            api_key=TEST_LLM_API_KEY,
+            temperature=0.7,
+            max_tokens=4096,
+            concurrency=2,
+            max_retries=3
+        )
+    
+    @pytest.fixture
+    def interaction_memory(self):
+        """Create an InteractionMemory instance."""
+        return InteractionMemory()
+    
+    @pytest.mark.slow
+    def test_ner_simple(self, llm_agent, interaction_memory):
+        """Test NER with simple text containing clear entities."""
+        input_data = roles.open_ie.NERInput(
+            text="Barack Obama was the 44th President of the United States. He was born in Hawaii."
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.NERRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.NEROutput = results[0]
+        
+        assert output.entities is not None
+        assert len(output.entities) > 0
+        
+        # Check that expected entities are extracted
+        entity_names = [e.name for e in output.entities]
+        assert any("Obama" in name or "Barack" in name for name in entity_names), \
+            f"Expected 'Obama' or 'Barack Obama' in entities, got: {entity_names}"
+        assert any("United States" in name or "USA" in name or "U.S." in name for name in entity_names), \
+            f"Expected 'United States' in entities, got: {entity_names}"
+        
+        print(f"✓ NER (simple)")
+        print(f"  Extracted {len(output.entities)} entities:")
+        for entity in output.entities[:5]:
+            print(f"    - {entity.name}")
+    
+    @pytest.mark.slow
+    def test_ner_question(self, llm_agent, interaction_memory):
+        """Test NER with a question - should focus on essential entities."""
+        input_data = roles.open_ie.NERInput(
+            text="Who was the first person to walk on the moon?"
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.NERRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 0
+        print(f"✓ NER (question)")
+    
+    @pytest.mark.slow
+    def test_ner_ambiguous(self, llm_agent, interaction_memory):
+        """Test NER with ambiguous entities that need context."""
+        input_data = roles.open_ie.NERInput(
+            text="Apple announced a new iPhone. The apple on the table is red."
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.NERRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.NEROutput = results[0]
+        
+        assert output.entities is not None
+        # Should extract Apple (company) and iPhone, but distinguish from fruit
+        entity_names = [e.name.lower() for e in output.entities]
+        assert any("iphone" in name for name in entity_names), \
+            f"Expected 'iPhone' in entities, got: {entity_names}"
+        
+        print(f"✓ NER (ambiguous)")
+        print(f"  Extracted {len(output.entities)} entities:")
+        for entity in output.entities:
+            print(f"    - {entity.name}")
+    
+    @pytest.mark.slow
+    def test_relation_extraction_simple(self, llm_agent, interaction_memory):
+        """Test Relation Extraction with simple relationships."""
+        input_data = roles.open_ie.RelationExtractionInput(
+            text="Barack Obama was born in Hawaii. He served as the President of the United States from 2009 to 2017."
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.RelationExtractionRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.RelationExtractionOutput = results[0]
+        
+        assert output.relations is not None
+        assert len(output.relations) > 0
+        
+        # Check that relationships are extracted
+        relation_strs = [str(r) for r in output.relations]
+        print(f"✓ Relation Extraction (simple)")
+        print(f"  Extracted {len(output.relations)} relations:")
+        for relation in output.relations[:5]:
+            print(f"    - {relation.subject} --[{relation.relation}]--> {relation.object}")
+    
+    @pytest.mark.slow
+    def test_relation_extraction_with_entities(self, llm_agent, interaction_memory):
+        """Test Relation Extraction with provided entities to focus on."""
+        input_data = roles.open_ie.RelationExtractionInput(
+            text="The Eiffel Tower is located in Paris, France. Paris is the capital of France. France is a country in Western Europe.",
+            entities=["Eiffel Tower", "Paris", "France"]
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.RelationExtractionRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.RelationExtractionOutput = results[0]
+        
+        assert output.relations is not None
+        assert len(output.relations) > 0
+        
+        # Should extract relationships involving the provided entities
+        relation_subjects = [r.subject for r in output.relations]
+        relation_objects = [r.object for r in output.relations]
+        all_entities = set(relation_subjects + relation_objects)
+        
+        print(f"✓ Relation Extraction (with entities)")
+        print(f"  Extracted {len(output.relations)} relations:")
+        for relation in output.relations:
+            print(f"    - {relation.subject} --[{relation.relation}]--> {relation.object}")
+            if relation.context:
+                print(f"      Context: {relation.context[:100]}...")
+    
+    @pytest.mark.slow
+    def test_relation_extraction_complex(self, llm_agent, interaction_memory):
+        """Test Relation Extraction with complex relationships that should be broken down."""
+        input_data = roles.open_ie.RelationExtractionInput(
+            text="Tim Cook became the CEO of Apple in 2011 after Steve Jobs stepped down due to health issues. Apple is a technology company founded by Steve Jobs, Steve Wozniak, and Ronald Wayne in 1976."
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.RelationExtractionRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.RelationExtractionOutput = results[0]
+        
+        assert output.relations is not None
+        assert len(output.relations) > 0
+        
+        # Should extract multiple simple relationships
+        print(f"✓ Relation Extraction (complex)")
+        print(f"  Extracted {len(output.relations)} relations:")
+        for relation in output.relations:
+            print(f"    - {relation.subject} --[{relation.relation}]--> {relation.object}")
+    
+    @pytest.mark.slow
+    def test_relation_extraction_self_contained(self, llm_agent, interaction_memory):
+        """Test that extracted relations are self-contained."""
+        input_data = roles.open_ie.RelationExtractionInput(
+            text="The Great Wall of China was built during the Ming Dynasty to protect against invasions from the north."
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.RelationExtractionRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.RelationExtractionOutput = results[0]
+        
+        assert output.relations is not None
+        
+        # Check that relations have context or are self-contained
+        for relation in output.relations:
+            # Relations should have either context or be clear enough on their own
+            assert relation.subject is not None and len(relation.subject) > 0
+            assert relation.relation is not None and len(relation.relation) > 0
+            assert relation.object is not None and len(relation.object) > 0
+        
+        print(f"✓ Relation Extraction (self-contained)")
+        print(f"  Extracted {len(output.relations)} self-contained relations:")
+        for relation in output.relations:
+            print(f"    - {relation.subject} --[{relation.relation}]--> {relation.object}")
+            if relation.context:
+                print(f"      Context: {relation.context}")
+    
+    @pytest.mark.slow
+    def test_ner_empty_text(self, llm_agent, interaction_memory):
+        """Test NER with empty text."""
+        input_data = roles.open_ie.NERInput(
+            text=""
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.NERRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.NEROutput = results[0]
+        
+        # Empty text should return empty entities list
+        assert output.entities is not None
+        # May be empty or may have some default behavior
+        
+        print(f"✓ NER (empty text)")
+        print(f"  Extracted {len(output.entities)} entities")
+    
+    @pytest.mark.slow
+    def test_relation_extraction_no_relations(self, llm_agent, interaction_memory):
+        """Test Relation Extraction with text that has no clear relationships."""
+        input_data = roles.open_ie.RelationExtractionInput(
+            text="The weather is nice today. It is sunny and warm."
+        )
+        
+        results, log = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.open_ie.RelationExtractionRole(),
+            input_data=input_data,
+            interaction_memory=interaction_memory,
+            n=1
+        ))
+        
+        assert len(results) == 1
+        output: roles.open_ie.RelationExtractionOutput = results[0]
+        
+        assert output.relations is not None
+        # May have few or no relations for descriptive text
+        
+        print(f"✓ Relation Extraction (no clear relations)")
+        print(f"  Extracted {len(output.relations)} relations")
 
 
 class TestBatchExecution:
@@ -550,8 +919,8 @@ class TestBatchExecution:
         
         assert len(results) == 3
         for i, output in enumerate(results):
-            assert output[0].decision == "relevant"
-            print(f"  Input {i+1}: {len(output[0].information)} extractions")
+            assert output[0].relevant_information is not None
+            print(f"  Input {i+1}: {len(output[0].relevant_information)} extractions")
         
         print(f"✓ Batch extraction with {len(inputs)} inputs")
 

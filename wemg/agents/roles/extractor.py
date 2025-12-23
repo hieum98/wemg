@@ -31,15 +31,23 @@ class SourceType(Enum):
 
 EXTRACT_PROMPT = """You are a meticulous research analyst. Build a comprehensive dossier of information from the provided text that could help answer the question.
 
+Rules:
+- Consider both direct and indirect relevant information. An information is considered relevant if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
+- Extracted information must be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items.
+
 Instructions:
 1. Question Deconstruction: Identify primary subject, key entities, and specific information sought.
 2. Candidate Identification: Identify and quote ALL passages that seem potentially related to the concepts in the question. Be liberal and inclusive in this initial pass; we will filter and refine in the next step.
 3. Relevance Evaluation: Assess each quote against criteria (directly answering, contextual, supporting evidence, etc.).
 4. Extraction: Extract ALL relevant information verbatim. Add context for clarity but preserve original meaning, make sure each extracted information is self-contained (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items) and can be used to answer the question.
-5. Final Decision: 'relevant' or 'not_relevant'. Only 'not_relevant' if ZERO related information.
+5. Final evaluation: 
+    - Examine the extracted information to make sure each information is self-contained. If it is not, rewrite it to make it self-contained.
+    - Remove information that is not relevant to the question. The information considers not relevant if and only if it contains ZERO information that could relate to any entity or concept in the question.
+    - If the extracted information is relevant, return the extracted information as a list of strings.
+    - If the extracted information is not relevant, return an empty list.
 """
 
-MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of tagged information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question.
+MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of tagged information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 
 ## Provenance Tags
 - [System Prediction]: System-generated information
@@ -47,10 +55,12 @@ MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Y
 
 ## Instructions
 1. Question Analysis: Identify primary subject and key entities
-2. Relevance Filtering: Keep directly relevant and supporting items, remove irrelevant
+2. Relevance Evaluation: Assess each information whether it is relevant and useful for answering the question.
 3. Duplicate & Redundancy Removal: Remove exact duplicates (keep [Retrieval] over [System Prediction] if both exist). Merge near-duplicates into single comprehensive items. Remove items whose information is subsumed by other items.
 4. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
-5. Final Consolidation: Each item MUST be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items
+5. Final Consolidation: 
+    - Each item MUST be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items
+    - Remove information that is not relevant or useful to the question. The information considers not relevant or useful if and only if it contains ZERO information that could relate to any entity or concept in the question.
 
 ## Rules
 - Do NOT invent new information
@@ -70,10 +80,8 @@ class ExtractionInput(pydantic.BaseModel):
     def __str__(self):
         return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
 
-
 class ExtractionOutput(pydantic.BaseModel):
-    information: List[str] = pydantic.Field(..., description="Extracted relevant information.")
-    decision: str = pydantic.Field(..., pattern=r"^(relevant|not_relevant)$")
+    relevant_information: List[str] = pydantic.Field(..., description="Self-contained information that is (directly or indirectly) relevant to the question.")
 
 
 class MemoryItem(pydantic.BaseModel):

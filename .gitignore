@@ -4,3 +4,5 @@ wemg.egg-info/*
 draft.ipynb
 draft.py
 memory_db
+tmp
+retriever_corpora

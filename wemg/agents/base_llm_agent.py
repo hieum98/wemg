@@ -103,17 +103,21 @@ class BaseClient:
         attempts = 0
         while len(valid_choices) < n and attempts < self.max_retries:
             attempts += 1
+            logger.info(f"Generating with parameters: {model_kwargs} in attempt {attempts}")
             try:
-                messages = litellm.utils.trim_messages(messages, max_tokens=self.max_inputs_tokens)
+                messages = litellm.utils.trim_messages(messages, max_tokens=self.max_inputs_tokens + 1024 * attempts) # increase max input tokens by 1024 tokens per attempt
                 response: litellm.ModelResponse = self.completion(messages, **model_kwargs)
             except Exception as e:
                 logger.warning(f"Error during completion: {e}. Retrying...")
                 response = None
                 time.sleep(2 * attempts)
+            # Adjust generation parameters for next attempt to shake things up
+            model_kwargs['temperature'] = min(1.0, model_kwargs.get('temperature', 0.7) + 0.1 * attempts)
+            model_kwargs['top_p'] = min(1.0, model_kwargs.get('top_p', 0.8) + 0.1 * attempts)
+            model_kwargs['max_tokens'] = min(model_kwargs.get('max_tokens', self.max_tokens) + 1024 * attempts, 65536)
+            model_kwargs['n'] = min(model_kwargs.get('n', self.num_samples) + attempts, 8)
+            # If response is not valid, retry
             if response is None or not hasattr(response, 'choices'):
-                # Slightly adjust generation parameters tp shake things up
-                model_kwargs['temperature'] = min(1.0, model_kwargs.get('temperature', 0.7) + 0.1 * attempts)
-                model_kwargs['top_p'] = min(1.0, model_kwargs.get('top_p', 0.8) + 0.1 * attempts)
                 continue
             for choice in response.choices:
                 if not choice.message:
@@ -127,9 +131,11 @@ class BaseClient:
                         content = choice.message.reasoning_content
                         used_reasoning_content_as_content = True
                     except Exception:
-                        pass
+                        logger.warning(f"No content in response for attempt {attempts}")
+                        continue
                 
                 if not content:
+                    logger.warning(f"No content in response for attempt {attempts}")
                     continue
                 
                 # Extract reasoning: if we used reasoning_content as content, reasoning is None
@@ -140,7 +146,14 @@ class BaseClient:
                         reasoning = choice.message.reasoning_content 
                     except Exception:
                         reasoning = None
+                output = {
+                        'output': content,
+                        'raw_output': content,
+                        'reasoning': reasoning,
+                        'is_valid': True
+                    }
                 if output_schema and self.structure_output_supported:
+                    output = None
                     try:
                         parsed_output = output_schema.model_validate_json(content)
                         output = {
@@ -149,8 +162,8 @@ class BaseClient:
                             'reasoning': reasoning,
                             'is_valid': True
                         }
-                    except:
-                        logger.warning(f"Failed to parse structured output for {content}")
+                    except Exception as e:
+                        logger.warning(f"Failed to parse structured output for {content[:100]}... at attempt {attempts}: {e}")
                         if attempts == self.max_retries - 1:
                             output = {
                                 'output': content,
@@ -158,14 +171,8 @@ class BaseClient:
                                 'reasoning': reasoning,
                                 'is_valid': False
                             }
-                else:
-                    output = {
-                        'output': content,
-                        'raw_output': content,
-                        'reasoning': reasoning,
-                        'is_valid': True
-                    }
-                valid_choices.append(output)
+                if output is not None:
+                    valid_choices.append(output)
         
         if len(valid_choices) == 0:
             logger.error(f"No valid completions after {self.max_retries} attempts. With the last response: {response}")
