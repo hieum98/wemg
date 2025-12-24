@@ -130,7 +130,7 @@ class WebSearchTool(BaseTool):
         """Crawl web pages to extract their full text content."""
         if isinstance(urls, str):
             urls = [urls]
-        loader = WebBaseLoader(urls, requests_per_second=8, continue_on_failure=True)
+        loader = WebBaseLoader(urls, requests_per_second=16, continue_on_failure=True)
         documents = loader.load()
         page_contents = [doc.page_content for doc in documents]
         # simple cleanup

@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime
 import gc
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 import logging
 import os
 import uuid
@@ -406,7 +406,7 @@ class InteractionMemory:
             
         return final_examples
 
-    def _format_results(self, results):
+    def _format_results(self, results) -> List[List[Dict[str, str]]]:
         """Helper to format Chroma results into list of messages."""
         examples = []
         if results['documents']:

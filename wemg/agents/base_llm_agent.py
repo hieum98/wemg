@@ -118,6 +118,7 @@ class BaseClient:
             model_kwargs['n'] = min(model_kwargs.get('n', self.num_samples) + attempts, 8)
             # If response is not valid, retry
             if response is None or not hasattr(response, 'choices'):
+                logger.warning(f"Response is None or does not have choices at attempt {attempts}")
                 continue
             for choice in response.choices:
                 if not choice.message:
@@ -179,6 +180,10 @@ class BaseClient:
             return index, []
         
         valid_choices = valid_choices[:n]
+        # Log out the valid choices but with short reasoning content
+        for vc in valid_choices:
+            logger.info(f"Valid choice: {vc['output']} - {vc['is_valid']} with reasoning: {vc['reasoning'][:100]}...")
+        logger.info(f"Total valid choices: {len(valid_choices)}")
         
         # Cache the result which are all valid
         all_valid = all([vc['is_valid'] for vc in valid_choices])
@@ -410,20 +415,40 @@ class BaseLLMAgent:
         assert client_type in ['openai'], f"Unsupported client type: {client_type}"
         self.client_kwargs = client_kwargs
         self.client_type = client_type
+        # Lazily initialized and cached client instance to avoid re-instantiation
+        # on every generator_role_execute call.
+        self._client: Optional[BaseClient] = None
 
     def get_client(self) -> BaseClient:
+        """Return a cached LLM client instance.
+
+        We cache the client so that repeated calls to generator_role_execute
+        (which are common in procedures like execute_role with large batches)
+        do not pay the overhead of constructing a new client each time.
+        """
+        if self._client is not None:
+            return self._client
+
         if self.client_type == 'openai':
-            return OpenAIClient(**self.client_kwargs)
-        else:
-            raise ValueError(f"Unsupported client type: {self.client_type}")
+            self._client = OpenAIClient(**self.client_kwargs)
+            return self._client
+        raise ValueError(f"Unsupported client type: {self.client_type}")
 
     def generator_role_execute(self, 
                      messages: Union[List[Dict[str, str]], List[List[Dict[str, str]]]],
                      **kwargs
                      ) -> Tuple[List[List[Any]], List[Optional[str]]]:
         output_schema = kwargs.get('output_schema', None)
+        schema_keys = None
+        schema_value_types = None
         if output_schema is not None:
             assert issubclass(output_schema, pydantic.BaseModel), "Output schema must be a subclass of pydantic.BaseModel"
+            # Precompute schema field names and value types once instead of
+            # recomputing them for every invalid generation item.
+            schema_keys = list(output_schema.model_fields.keys())
+            schema_value_types = [
+                field.annotation.__name__ for field in output_schema.model_fields.values()
+            ]
         client = self.get_client()
         if isinstance(messages[0], list):
             results = client.batch_generate(messages, **kwargs)
@@ -445,15 +470,16 @@ class BaseLLMAgent:
                         parsed_output = output_schema(**item['output'])
                         outputs.append(parsed_output)
                     else:
-                        keys = output_schema.model_fields.keys()
-                        value_types = [field.annotation.__name__ for field in output_schema.model_fields.values()]
+                        # Fall back to text-based extraction when the output is not valid.
+                        # Use precomputed schema_keys and schema_value_types to avoid
+                        # repeated introspection on the schema for each item.
                         if isinstance(item['output'], str):
                             data = item['output']
                         elif isinstance(item['output'], dict):
                             data = json.dumps(item['output'])
                         else:
                             data = str(item['output'])
-                        extracted = extract_info_from_text(data, keys, value_types)
+                        extracted = extract_info_from_text(data, schema_keys, schema_value_types)
                         try:
                             parsed_output = output_schema(**extracted)
                             outputs.append(parsed_output)

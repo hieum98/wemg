@@ -28,6 +28,7 @@ TEST_CONFIG = {
     'llm_model': os.getenv("TEST_LLM_MODEL", "Qwen3-32B"),
     'embedding_api_base': os.getenv("TEST_EMBEDDING_API_BASE", "http://n0372:4000/v1"),
     'embedding_model': os.getenv("TEST_EMBEDDING_MODEL", "Qwen3-Embedding-4B"),
+    'serper_api_key': os.getenv("SERPER_API_KEY", "your-serper-api-key"),
 }
 
 
@@ -102,8 +103,7 @@ def llm_agent():
 def web_search_tool():
     """Create a WebSearchTool with DuckDuckGo backend."""
     return WebSearchTool(
-        api_wrapper=DDGSAPIWrapper(),
-        max_tokens=8192
+        serper_api_key=TEST_CONFIG['serper_api_key'],
     )
 
 

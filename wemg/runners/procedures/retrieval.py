@@ -1,7 +1,10 @@
 import os
-from typing import List, Dict, Optional, Tuple, Union
+from tkinter import W
+from typing import List, Dict, Optional, Set, Tuple, Union
 import logging
 import asyncio
+from wemg.agents.roles.open_ie import Entity
+from wemg.agents.tools.wikidata import WikidataEntity
 
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.retriever_agent import RetrieverAgent
@@ -37,8 +40,10 @@ async def retrieve_entities_from_kb(
         top_k_properties: int = 1,
         interaction_memory: Optional[InteractionMemory] = None,
         ):
-    assert query or entities, "Either query or entities must be provided for knowledge base retrieval."
-
+    if not query and not entities:
+        logger.error("Either query or entities must be provided for knowledge base retrieval.")
+        return [], {}, [], {}, {}
+    graph_query_log = {}
     if query:
         # Query generation
         graph_query_input = roles.generator.QueryGraphGeneratorInput(input_text=query)
@@ -76,7 +81,7 @@ async def retrieve_entities_from_kb(
             if result:
                 property_dict[item] = result[0] # Only take top-1 result
                 wikidata_properties.extend(result)
-        logger.info(f"Retrieved {len(wikidata_properties)} Wikidata properties.")
+        logger.info(f"Retrieved {wikidata_properties} Wikidata properties.")
     all_properties = list(set(wikidata_properties))
 
     not_wikidata_entities = [ent for ent in entities if isinstance(ent, roles.open_ie.Entity)]
@@ -89,7 +94,8 @@ async def retrieve_entities_from_kb(
         retrieval_results = await wikidata_entity_retriever.ainvoke(
             {
                 "query": [ent.name for ent in not_wikidata_entities],
-                "num_entities": top_k_entities
+                "num_entities": top_k_entities,
+                "get_details": True
             }
         )
         retrieval_results = [[ent for ent in result if isinstance(ent, wikidata.WikidataEntity)] for result in retrieval_results] # filter out non-wikidata results
@@ -97,11 +103,11 @@ async def retrieve_entities_from_kb(
             if result:
                 entity_dict[item] = result[0] # Only take top-1 result
                 retrieved_wikidata_entities.extend(result)
-        logger.info(f"Retrieved Wikidata {len(retrieved_wikidata_entities)} entities")
+        logger.info(f"Retrieved Wikidata {retrieved_wikidata_entities} entities")
     all_wikidata_entities = wikidata_entities + retrieved_wikidata_entities
     # deduplicate entities based on QID
     unique_entities = list(set(all_wikidata_entities))
-    logger.info(f"Gathered {len(unique_entities)} unique Wikidata entities.")
+    logger.info(f"Gathered {unique_entities} unique Wikidata entities.")
     return unique_entities, entity_dict, all_properties, property_dict, graph_query_log
 
 
@@ -164,6 +170,7 @@ async def retrieve_from_kb(
         wikidata_props=[r.pid for r in relations],
         wikidata_props_with_labels={r.pid: {'label': r.label, 'description': r.description} for r in relations}
     )
+    logger.info(f"Initializing Wikidata triple retriever with properties: {wikidata_wrapper.wikidata_props} and labels: {wikidata_wrapper.wikidata_props_with_labels}")
     wikidata_triple_retriever = wikidata.WikidataKHopTriplesRetrievalTool(wikidata_wrapper=wikidata_wrapper)
 
     retrieved_triples = await retrieve_triples(
@@ -171,8 +178,54 @@ async def retrieve_from_kb(
         entities=entities,
         n_hops=n_hops
     )
+    qid_to_entity = {ent.qid: ent for ent in entities}
+    for triple in retrieved_triples:
+        if triple.subject.qid not in qid_to_entity:
+            qid_to_entity[triple.subject.qid] = triple.subject
+        if isinstance(triple.object, wikidata.WikidataEntity):
+            if triple.object.qid not in qid_to_entity:
+                qid_to_entity[triple.object.qid] = triple.object
+    
+    all_entities = list(qid_to_entity.values())
+    to_fetch_urls = {}
+    to_fetch_entities: List[WikidataEntity] = []
+    for i, entity in enumerate(all_entities):
+        if not entity.wikipedia_content and entity.wikipedia_url:
+            to_fetch_urls[i] = entity.wikipedia_url
+        elif not entity.wikipedia_url:
+            to_fetch_entities.append(entity)
 
-    return retrieved_triples, entity_dict, property_dict, graph_query_log
+    # Only feed max 100 entities to web search and wikidata entity retrieval to avoid rate limiting and speed up the process
+    if to_fetch_urls.values():
+        _to_fetch_urls = list(to_fetch_urls.values())[:100]
+        logger.info(f"Crawling {len(_to_fetch_urls)} web pages")
+        contents = web_search.WebSearchTool.crawl_web_pages(_to_fetch_urls)
+        for i, content in zip(to_fetch_urls.keys(), contents):
+            all_entities[i].wikipedia_content = content
+    if to_fetch_entities:
+        wikidata_entity_retriever = wikidata.WikidataEntityRetrievalTool()
+        logger.info(f"Starting Wikidata entity retrieval for {len(to_fetch_entities)} entities")
+        results = await wikidata_entity_retriever.ainvoke(
+            {
+                "query": [ent.qid for ent in to_fetch_entities[:100]],
+                "num_entities": 1,
+                "get_details": True,
+            }
+        )
+        results = [[ent for ent in result if isinstance(ent, wikidata.WikidataEntity)] for result in results]
+        results = sum(results, [])
+        for ent in results:
+            if ent.qid not in qid_to_entity:
+                qid_to_entity[ent.qid] = ent
+    entities = list(qid_to_entity.values())
+    # Update entity_dict
+    entity_dict = {k: qid_to_entity[v.qid] for k, v in entity_dict.items()}
+    # Update retrieved triples with updated entities
+    for triple in retrieved_triples:
+        triple.subject = qid_to_entity[triple.subject.qid]
+        if isinstance(triple.object, wikidata.WikidataEntity):
+            triple.object = qid_to_entity[triple.object.qid]
+    return retrieved_triples, entities, entity_dict, property_dict, graph_query_log
 
 
 async def explore(
@@ -206,7 +259,7 @@ async def explore(
     documents = list(set(documents))
 
     # KB search
-    retrieved_triples, entity_dict, property_dict, graph_query_log = await retrieve_from_kb(
+    retrieved_triples, entities, entity_dict, property_dict, graph_query_log = await retrieve_from_kb(
         llm_agent=llm_agent,
         question=question,
         entities=entities,
@@ -217,6 +270,12 @@ async def explore(
         use_question_for_graph_retrieval=use_question_for_graph_retrieval,
         interaction_memory=interaction_memory
     )
+    # Add wikicontent and wikidata content of retrieved entities to documents
+    for entity in entities:
+        if entity.wikipedia_content:
+            documents.append(entity.wikipedia_content)
+        if entity.wikidata_content:
+            documents.append(entity.wikidata_content)
     # Process log data
     all_log_keys = set(list(websearch_query_log.keys()) + list(graph_query_log.keys()))
     to_log_data = {key: websearch_query_log.get(key, []) + graph_query_log.get(key, []) for key in all_log_keys}

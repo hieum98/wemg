@@ -358,9 +358,6 @@ class TestWebSearchIntegration:
     @pytest.fixture
     def web_search_tool(self):
         """Create a WebSearchTool that will use DuckDuckGo backend.
-        
-        Since WebSearchTool tries Serper first and falls back to DDGS,
-        we use an invalid serper_api_key to force it to use DDGS.
         """
         return WebSearchTool(
             serper_api_key=SERPER_API_KEY

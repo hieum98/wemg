@@ -55,6 +55,9 @@ class Entity(pydantic.BaseModel):
     def __hash__(self):
         return hash(self.name)
 
+    def __str__(self):
+        return f"{self.name} - {self.description}" if self.description else self.name
+
 
 class NERInput(pydantic.BaseModel):
     text: str = pydantic.Field(..., description="Text to extract entities from.")

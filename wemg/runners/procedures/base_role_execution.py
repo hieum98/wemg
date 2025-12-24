@@ -1,4 +1,5 @@
 from typing import Dict, Optional, Tuple, Union, List
+import asyncio
 import pydantic
 
 from wemg.agents.base_llm_agent import BaseLLMAgent
@@ -11,12 +12,18 @@ async def execute_role(llm_agent: BaseLLMAgent, role: BaseLLMRole, input_data: U
     if isinstance(input_data, pydantic.BaseModel):
         input_data = [input_data]
         is_single = True
-    all_messages = []
+    
+    # Validate all inputs first
+    expected_type = role.input_model
     for item in input_data:
-        expected_type = role.input_model
         assert isinstance(item, expected_type), f"Input data must be of type {expected_type.__name__}"
-        messages = await role.format_messages_async(item, interaction_memory=interaction_memory)
-        all_messages.append(messages)
+    
+    # Parallelize format_messages_async calls for better performance with large batches
+    # This is safe because get_examples_async uses read locks that allow concurrent access
+    all_messages = await asyncio.gather(*[
+        role.format_messages_async(item, interaction_memory=interaction_memory)
+        for item in input_data
+    ])
 
     kwargs = {
         'n': kwargs.pop('n', 1),

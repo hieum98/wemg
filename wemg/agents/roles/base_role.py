@@ -33,6 +33,7 @@ class BaseLLMRole:
             history = [system_message]
         else:
             in_context_examples = interaction_memory.get_examples(role=self.role_name, query=str(input_data))
+            in_context_examples = sum(in_context_examples, []) # Flatten the list of lists
             if in_context_examples:
                 logger.warning("The interaction memory provided examples for this role. Ensure that all examples are compatible with this role.")
                 logger.info(f"In-context examples: {'\n-'.join([msg['content'] for msg in in_context_examples])}")
@@ -59,6 +60,7 @@ class BaseLLMRole:
         else:
             # Use async version with read lock for concurrent access
             in_context_examples = await interaction_memory.get_examples_async(role=self.role_name, query=str(input_data))
+            in_context_examples = sum(in_context_examples, []) # Flatten the list of lists
             if in_context_examples:
                 logger.warning("The interaction memory provided examples for this role. Ensure that all examples are compatible with this role.")
                 logger.info(f"In-context examples: {'\n-'.join([msg['content'] for msg in in_context_examples])}")

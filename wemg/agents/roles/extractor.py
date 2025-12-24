@@ -42,30 +42,20 @@ Instructions:
 4. Extraction: Extract ALL relevant information verbatim. Add context for clarity but preserve original meaning, make sure each extracted information is self-contained (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items) and can be used to answer the question.
 5. Final evaluation: 
     - Examine the extracted information to make sure each information is self-contained. If it is not, rewrite it to make it self-contained.
-    - Remove information that is not relevant to the question. The information considers not relevant if and only if it contains ZERO information that could relate to any entity or concept in the question.
+    - Remove information that is not relevant to the question. The information considers relevant if it contains ANY information that could clue the answer to the question or related with any concept in the question.
     - If the extracted information is relevant, return the extracted information as a list of strings.
     - If the extracted information is not relevant, return an empty list.
 """
 
-MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of tagged information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
-
-## Provenance Tags
-- [System Prediction]: System-generated information
-- [Retrieval]: Retrieved from external sources
+MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 
 ## Instructions
 1. Question Analysis: Identify primary subject and key entities
-2. Relevance Evaluation: Assess each information whether it is relevant and useful for answering the question.
-3. Duplicate & Redundancy Removal: Remove exact duplicates (keep [Retrieval] over [System Prediction] if both exist). Merge near-duplicates into single comprehensive items. Remove items whose information is subsumed by other items.
+2. Duplicate & Redundancy Removal: Remove duplicates and redundant information. Make sure the consolidated memory not contain any duplicate or redundant information.
+3. Relevance Evaluation: Assess each item against criteria (directly answering, contextual, supporting evidence, etc.). The information considers relevant or useful if it contains ANY information that could clue the answer to the question or related with any concept in the question. Remove information that is not relevant or useful.
 4. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
-5. Final Consolidation: 
-    - Each item MUST be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items
-    - Remove information that is not relevant or useful to the question. The information considers not relevant or useful if and only if it contains ZERO information that could relate to any entity or concept in the question.
-
-## Rules
-- Do NOT invent new information
-- REMOVE irrelevant information
-- PRESERVE all relevant, non-redundant information
+5. Final evaluation: 
+    - Each item MUST be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items. If it is not, rewrite it to make it self-contained.
 """
 
 

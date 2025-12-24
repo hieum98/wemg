@@ -291,7 +291,7 @@ class TestWorkingMemory:
         
         assert result is True  # Already connected
     
-    def test_connect_graph_memory_disconnected(self, working_memory, sample_entities):
+    def test_connect_graph_memory_disconnected(self, working_memory: WorkingMemory, sample_entities):
         """Test connecting graph with disconnected components."""
         # Create two disconnected components
         # Component 1: Paris -> France
@@ -301,12 +301,18 @@ class TestWorkingMemory:
         triple1 = WikiTriple(subject=paris, relation=prop1, object=france)
         working_memory.add_edge_to_graph_memory(triple1)
         
-        # Component 2: Tokyo -> Japan (disconnected from Paris-France)
-        tokyo = sample_entities['tokyo']
-        japan = WikidataEntity(qid="Q17", label="Japan", description="country in East Asia")
-        prop2 = WikidataProperty(pid="P1376", label="capital of")
-        triple2 = WikiTriple(subject=tokyo, relation=prop2, object=japan)
-        working_memory.add_edge_to_graph_memory(triple2)
+        # # Component 2: Tokyo -> Japan (disconnected from Paris-France)
+        # tokyo = sample_entities['tokyo']
+        # japan = WikidataEntity(qid="Q17", label="Japan", description="country in East Asia")
+        # prop2 = WikidataProperty(pid="P1376", label="capital of")
+        # triple2 = WikiTriple(subject=tokyo, relation=prop2, object=japan)
+        # working_memory.add_edge_to_graph_memory(triple2)
+
+        triple3 = WikiTriple(
+            subject=WikidataEntity(qid="Q937", label="Albert Einstein", description="'German-born theoretical physicist (1879–1955)"),
+            relation=WikidataProperty(pid="P27", label="country of citizenship"), 
+            object=WikidataEntity(qid="Q39", label="Switzerland", description="country in Central Europe"))
+        working_memory.add_edge_to_graph_memory(triple3)
         
         # Verify we have disconnected components
         components_before = list(nx.weakly_connected_components(working_memory.graph_memory))
@@ -317,7 +323,8 @@ class TestWorkingMemory:
         visualize_graph(working_memory.graph_memory, title="Graph Memory - Before Connecting (Disconnected)")
         
         # Try to connect the graph
-        result = working_memory.connect_graph_memory()
+        result = working_memory.connect_graph_memory(max_hops=3)
+        working_memory.update_graph_memory()
         
         # Visualize graph after connecting
         print("\n=== Graph Memory AFTER connecting (disconnected) ===")
@@ -407,6 +414,7 @@ class TestWorkingMemory:
         
         # Memory should be consolidated (may have fewer or same items)
         assert len(working_memory.textual_memory) >= 0
+        print(working_memory.textual_memory)
     
     @pytest.mark.slow
     def test_parse_graph_memory_from_textual_memory(self, llm_agent, working_memory, interaction_memory):
@@ -439,7 +447,7 @@ class TestWorkingMemory:
         assert working_memory.parsed_graph_memory is not None
         assert isinstance(working_memory.parsed_graph_memory, nx.DiGraph)
     
-    def test_merge_graph_memory(self, working_memory, sample_entities, sample_property):
+    def test_merge_graph_memory(self, working_memory: WorkingMemory, sample_entities, sample_property):
         """Test merging another graph into graph memory."""
         # Create another graph with triples using roles.open_ie.Entity objects
         # (as expected by extract_triples_from_graph)
@@ -459,7 +467,6 @@ class TestWorkingMemory:
         working_memory.entity_dict[paris_entity] = sample_entities['paris']
         working_memory.entity_dict[france_entity] = sample_entities['france']
         working_memory.property_dict["capital of"] = sample_property
-        
         # Visualize graph before merge
         print("\n=== Graph Memory BEFORE merging ===")
         visualize_graph(working_memory.graph_memory, title="Graph Memory - Before Merging")
@@ -523,6 +530,8 @@ class TestWorkingMemory:
         # Visualize graph before synchronization
         print("\n=== Graph Memory BEFORE synchronization ===")
         visualize_graph(working_memory.graph_memory, title="Graph Memory - Before Synchronization")
+        print("\n=== Textual Memory BEFORE synchronization ===")
+        print(working_memory.textual_memory)
         
         question = "What is the capital of France?"
         working_memory.synchronize_memory(llm_agent, question, interaction_memory)
@@ -530,6 +539,8 @@ class TestWorkingMemory:
         # Visualize graph after synchronization
         print("\n=== Graph Memory AFTER synchronization ===")
         visualize_graph(working_memory.graph_memory, title="Graph Memory - After Synchronization")
+        print("\n=== Textual Memory AFTER synchronization ===")
+        print(working_memory.textual_memory)
         
         # Both memories should be synchronized
         assert len(working_memory.textual_memory) >= 0

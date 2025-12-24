@@ -41,17 +41,17 @@ def _get_async_semaphore() -> asyncio.Semaphore:
         _async_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     return _async_semaphore
 DEFAULT_PROPERTIES = [
-    "P31",
-    "P279",
+    # "P31",
+    # "P279",
     "P27",
     "P361",
     "P527",
     "P495",
     "P17",
     "P585",
-    "P131",
+    # "P131",
     "P106",
-    "P21",
+    # "P21",
     "P569",
     "P570",
     "P577",
@@ -142,10 +142,10 @@ PROPERTY_LABELS = {
         'label': 'cause of death',
         'description': "underlying or immediate cause of death. Underlying cause (e.g. car accident, stomach cancer) preferred. Use 'manner of death' (P1196) for broadest category, e.g. natural causes, accident, homicide, suicide"
     },
-    'P31': {
-        'label': 'instance of',
-        'description': 'type to which this subject corresponds/belongs. Different from P279 (subclass of); for example: K2 is an instance of mountain; volcano is a subclass of mountain'
-    },
+    # 'P31': {
+    #     'label': 'instance of',
+    #     'description': 'type to which this subject corresponds/belongs. Different from P279 (subclass of); for example: K2 is an instance of mountain; volcano is a subclass of mountain'
+    # },
     'P287': {
         'label': 'designed by',
         'description': 'person or organization which designed the object. For buildings use "architect" (Property:P84)'
@@ -158,10 +158,10 @@ PROPERTY_LABELS = {
         'label': 'inception',
         'description': 'time when an entity begins to exist; for date of official opening use P1619'
     },
-    'P279': {
-        'label': 'subclass of',
-        'description': 'this item is a subclass (subset) of that item; ALL instances of this item are instances of that item; different from P31 (instance of), e.g.: volcano is a subclass of mountain; Everest is an instance of mountain'
-    },
+    # 'P279': {
+    #     'label': 'subclass of',
+    #     'description': 'this item is a subclass (subset) of that item; ALL instances of this item are instances of that item; different from P31 (instance of), e.g.: volcano is a subclass of mountain; Everest is an instance of mountain'
+    # },
     'P25': {
         'label': 'mother',
         'description': 'female parent of the subject. For stepmother, use "stepparent" (P3448)'
@@ -242,10 +242,10 @@ PROPERTY_LABELS = {
         'label': 'student',
         'description': 'notable student(s) of the subject individual'
     },
-    'P21': {
-        'label': 'sex or gender',
-        'description': 'sex or gender identity of human or animal. For human: male, female, non-binary, intersex, transgender female, transgender male, agender, etc. For animal: male organism, female organism. Groups of same gender use subclass of (P279)'
-    },
+    # 'P21': {
+    #     'label': 'sex or gender',
+    #     'description': 'sex or gender identity of human or animal. For human: male, female, non-binary, intersex, transgender female, transgender male, agender, etc. For animal: male organism, female organism. Groups of same gender use subclass of (P279)'
+    # },
     'P140': {
         'label': 'religion or worldview',
         'description': 'religion of a person, organization or religious building, or associated with this subject'
@@ -258,10 +258,10 @@ PROPERTY_LABELS = {
         'label': 'place of death',
         'description': 'most specific known (e.g. city instead of country, or hospital instead of city) death location of a person, animal or fictional character'
     },
-    'P131': {
-        'label': 'located in the administrative territorial entity',
-        'description': 'the item is located on the territory of the following administrative entity. Use P276 for specifying locations that are non-administrative places and for items about events. Use P1382 if the item falls only partially into the administrative entity'
-    },
+    # 'P131': {
+    #     'label': 'located in the administrative territorial entity',
+    #     'description': 'the item is located on the territory of the following administrative entity. Use P276 for specifying locations that are non-administrative places and for items about events. Use P1382 if the item falls only partially into the administrative entity'
+    # },
     'P800': {
         'label': 'notable work',
         'description': "notable scientific, artistic or literary work, or other work of significance among subject's works"
@@ -1402,7 +1402,7 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
                         # Create subject entity
                         subject_entity = WikidataEntity(
                             qid=subject_qid,
-                            label=subject_qid,  # Will be enriched later if needed
+                            label="",  # Will be enriched later if needed
                             description="",
                             aliases=[],
                             url=f"https://www.wikidata.org/wiki/{subject_qid}"
@@ -1413,7 +1413,7 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
                             object_qid = object_uri.split("/")[-1]
                             object_entity = WikidataEntity(
                                 qid=object_qid,
-                                label=object_qid,
+                                label="",
                                 description="",
                                 aliases=[],
                                 url=f"https://www.wikidata.org/wiki/{object_qid}"
@@ -1462,14 +1462,14 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
                         # Create entities
                         subject_entity = WikidataEntity(
                             qid=subject_qid,
-                            label=subject_qid,
+                            label="",
                             description="",
                             aliases=[],
                             url=f"https://www.wikidata.org/wiki/{subject_qid}"
                         )
                         object_entity = WikidataEntity(
                             qid=object_qid,
-                            label=object_qid,
+                            label="",
                             description="",
                             aliases=[],
                             url=f"https://www.wikidata.org/wiki/{object_qid}"
@@ -1490,126 +1490,6 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
             time.sleep(0.1)
         
         return all_triples, all_next_qids
-
-    def _get_neighbors_fast(
-        self,
-        qid: str,
-        limit: int = 50
-    ) -> List[Tuple[str, WikiTriple]]:
-        """Get immediate neighbors of an entity for path finding.
-        
-        Optimized version that only fetches what's needed for BFS path finding.
-        Returns list of (neighbor_qid, triple) tuples.
-        Uses minimal queries with reduced limits for speed.
-        
-        Args:
-            qid: Entity QID to get neighbors for
-            limit: Maximum number of neighbors to return (reduced for speed)
-            
-        Returns:
-            List of (neighbor_qid, triple) tuples
-        """
-        neighbors: List[Tuple[str, WikiTriple]] = []
-        
-        # Ultra-simple queries - only fetch QIDs, minimal filtering
-        # Reduced limit to avoid timeouts on entities with many connections
-        outgoing_query = f"""
-        SELECT DISTINCT ?object
-        WHERE {{
-          wd:{qid} ?relation ?object .
-          FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
-          FILTER(STRSTARTS(STR(?object), "http://www.wikidata.org/entity/"))
-        }}
-        LIMIT {limit}
-        """
-        
-        incoming_query = f"""
-        SELECT DISTINCT ?subject
-        WHERE {{
-          ?subject ?relation wd:{qid} .
-          FILTER(STRSTARTS(STR(?relation), "http://www.wikidata.org/prop/direct/"))
-          FILTER(STRSTARTS(STR(?subject), "http://www.wikidata.org/entity/"))
-        }}
-        LIMIT {limit}
-        """
-        
-        # Execute outgoing query
-        try:
-            results = self._execute_sparql_with_retry(outgoing_query, timeout=5)
-            if results and results.get("results", {}).get("bindings"):
-                for row in results["results"]["bindings"]:
-                    object_uri = row.get("object", {}).get("value", "")
-                    
-                    if "/entity/" not in object_uri:
-                        continue
-                    
-                    object_qid = object_uri.split("/")[-1]
-                    
-                    # Create minimal entities and triple for path finding
-                    subject_entity = WikidataEntity(
-                        qid=qid,
-                        label=qid,
-                        description="",
-                        aliases=[],
-                        url=f"https://www.wikidata.org/wiki/{qid}"
-                    )
-                    object_entity = WikidataEntity(
-                        qid=object_qid,
-                        label=object_qid,
-                        description="",
-                        aliases=[],
-                        url=f"https://www.wikidata.org/wiki/{object_qid}"
-                    )
-                    # Use a generic relation - we don't need the exact property for path finding
-                    triple = WikiTriple(
-                        subject=subject_entity,
-                        relation=WikidataProperty(pid="P0", label="", description=""),  # Placeholder
-                        object=object_entity
-                    )
-                    neighbors.append((object_qid, triple))
-        except Exception as e:
-            logger.debug(f"Outgoing query failed for {qid}: {e}")
-        
-        # Small delay between queries
-        time.sleep(0.05)
-        
-        # Execute incoming query
-        try:
-            results = self._execute_sparql_with_retry(incoming_query, timeout=5)
-            if results and results.get("results", {}).get("bindings"):
-                for row in results["results"]["bindings"]:
-                    subject_uri = row.get("subject", {}).get("value", "")
-                    
-                    if "/entity/" not in subject_uri:
-                        continue
-                    
-                    subject_qid = subject_uri.split("/")[-1]
-                    
-                    subject_entity = WikidataEntity(
-                        qid=subject_qid,
-                        label=subject_qid,
-                        description="",
-                        aliases=[],
-                        url=f"https://www.wikidata.org/wiki/{subject_qid}"
-                    )
-                    object_entity = WikidataEntity(
-                        qid=qid,
-                        label=qid,
-                        description="",
-                        aliases=[],
-                        url=f"https://www.wikidata.org/wiki/{qid}"
-                    )
-                    # Use a generic relation - we don't need the exact property for path finding
-                    triple = WikiTriple(
-                        subject=subject_entity,
-                        relation=WikidataProperty(pid="P0", label="", description=""),  # Placeholder
-                        object=object_entity
-                    )
-                    neighbors.append((subject_qid, triple))
-        except Exception as e:
-            logger.debug(f"Incoming query failed for {qid}: {e}")
-        
-        return neighbors
 
     def _parse_triple_row(self, row: Dict) -> Tuple[Optional[WikiTriple], Optional[str], str]:
         """Parse a SPARQL result row into a WikiTriple.
@@ -2287,6 +2167,7 @@ class WikidataKHopTriplesRetrievalTool(BaseTool):
         
         if update_with_details:
             # Collect all entity QIDs across all outputs
+            logger.info(f"Updating triples with entity details")
             all_entity_qids: Set[str] = set()
             for triples_list in output:
                 for triple in triples_list:
@@ -2418,6 +2299,7 @@ class WikidataKHopTriplesRetrievalTool(BaseTool):
             output[query_idx] = self.dedup_triples_tool(query_triples)
         
         if update_with_details:
+            logger.info(f"Updating triples with entity details")
             all_entity_qids: Set[str] = set()
             for triples_list in output:
                 for triple in triples_list:

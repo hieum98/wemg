@@ -79,9 +79,6 @@ class NodeGenerator:
             interaction_memory=self.interaction_memory
         )
 
-        # TODO: Add wikicontent of retrieved triples to retrieved_documents
-        
-
         # Extract information from web search results
         extractor_inputs = [
             roles.extractor.ExtractionInput(question=question, raw_data=data) 

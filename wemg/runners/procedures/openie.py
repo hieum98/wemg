@@ -14,20 +14,18 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 
-def parse_graph_from_text(llm_agent: BaseLLMAgent, text: str, interaction_memory: Optional[InteractionMemory] = None):
+async def parse_graph_from_text(llm_agent: BaseLLMAgent, text: str, interaction_memory: Optional[InteractionMemory] = None):
     """Parse a graph (entities and relations) from the given text using OpenIE."""
     
     re_input = roles.open_ie.RelationExtractionInput(text=text)
-    triples, re_log = asyncio.run(
-        execute_role(
+    triples, re_log = await execute_role(
             llm_agent=llm_agent,
             role=roles.open_ie.RelationExtractionRole(),
             input_data=re_input,
             interaction_memory=interaction_memory,
             n=1
         )
-    )
-    relation_triples = triples[0][0] # bs=1, n=1
+    relation_triples = triples[0]
     if relation_triples and isinstance(relation_triples, roles.open_ie.RelationExtractionOutput):
         relation_triples = relation_triples.relations
     else:
