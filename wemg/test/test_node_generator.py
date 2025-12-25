@@ -58,7 +58,7 @@ def llm_agent():
         api_key=TEST_LLM_API_KEY,
         temperature=0.7,
         max_tokens=65536,
-        concurrency=2,
+        concurrency=32,
         max_retries=3
     )
 
@@ -290,7 +290,7 @@ class TestGenerateAnswer:
         print(f"✓ generate_answer with RetrieverAgent")
         print(f"  Question: {question}")
         print(f"  Answer: {result.answers[0].answer[:200]}")
-        print(f"  Retrieved documents: {len(result.retrieved_triples)}")
+        print(f"  Retrieved triples: {len(result.retrieved_triples)}")
     
     @pytest.mark.slow
     def test_generate_answer_with_memory_entities(self, llm_agent, web_search_tool, working_memory, interaction_memory):
@@ -343,7 +343,7 @@ class TestGenerateAnswer:
         
         question = "What are the main causes of climate change?"
         result = asyncio.run(generator.generate_answer(question))
-        
+        breakpoint()
         assert len(result.answers) == 3
         for i, answer in enumerate(result.answers):
             assert answer.answer is not None

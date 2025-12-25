@@ -1,5 +1,7 @@
 """Shared node generation logic for reasoning nodes.
 """
+import logging
+import os
 from wemg.agents.tools.wikidata import WikidataEntity, WikidataProperty
 
 
@@ -17,6 +19,9 @@ from wemg.runners.working_memory import WorkingMemory
 from wemg.runners.interaction_memory import InteractionMemory
 from wemg.utils.preprocessing import format_context
 from wemg.utils.common import merge_logs
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 
 @dataclass

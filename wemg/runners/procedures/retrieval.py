@@ -178,53 +178,6 @@ async def retrieve_from_kb(
         entities=entities,
         n_hops=n_hops
     )
-    qid_to_entity = {ent.qid: ent for ent in entities}
-    for triple in retrieved_triples:
-        if triple.subject.qid not in qid_to_entity:
-            qid_to_entity[triple.subject.qid] = triple.subject
-        if isinstance(triple.object, wikidata.WikidataEntity):
-            if triple.object.qid not in qid_to_entity:
-                qid_to_entity[triple.object.qid] = triple.object
-    
-    all_entities = list(qid_to_entity.values())
-    to_fetch_urls = {}
-    to_fetch_entities: List[WikidataEntity] = []
-    for i, entity in enumerate(all_entities):
-        if not entity.wikipedia_content and entity.wikipedia_url:
-            to_fetch_urls[i] = entity.wikipedia_url
-        elif not entity.wikipedia_url:
-            to_fetch_entities.append(entity)
-
-    # Only feed max 100 entities to web search and wikidata entity retrieval to avoid rate limiting and speed up the process
-    if to_fetch_urls.values():
-        _to_fetch_urls = list(to_fetch_urls.values())[:100]
-        logger.info(f"Crawling {len(_to_fetch_urls)} web pages")
-        contents = web_search.WebSearchTool.crawl_web_pages(_to_fetch_urls)
-        for i, content in zip(to_fetch_urls.keys(), contents):
-            all_entities[i].wikipedia_content = content
-    if to_fetch_entities:
-        wikidata_entity_retriever = wikidata.WikidataEntityRetrievalTool()
-        logger.info(f"Starting Wikidata entity retrieval for {len(to_fetch_entities)} entities")
-        results = await wikidata_entity_retriever.ainvoke(
-            {
-                "query": [ent.qid for ent in to_fetch_entities[:100]],
-                "num_entities": 1,
-                "get_details": True,
-            }
-        )
-        results = [[ent for ent in result if isinstance(ent, wikidata.WikidataEntity)] for result in results]
-        results = sum(results, [])
-        for ent in results:
-            if ent.qid not in qid_to_entity:
-                qid_to_entity[ent.qid] = ent
-    entities = list(qid_to_entity.values())
-    # Update entity_dict
-    entity_dict = {k: qid_to_entity[v.qid] for k, v in entity_dict.items()}
-    # Update retrieved triples with updated entities
-    for triple in retrieved_triples:
-        triple.subject = qid_to_entity[triple.subject.qid]
-        if isinstance(triple.object, wikidata.WikidataEntity):
-            triple.object = qid_to_entity[triple.object.qid]
     return retrieved_triples, entities, entity_dict, property_dict, graph_query_log
 
 
@@ -276,6 +229,8 @@ async def explore(
             documents.append(entity.wikipedia_content)
         if entity.wikidata_content:
             documents.append(entity.wikidata_content)
+    # deduplicate documents
+    documents = list(set(documents))
     # Process log data
     all_log_keys = set(list(websearch_query_log.keys()) + list(graph_query_log.keys()))
     to_log_data = {key: websearch_query_log.get(key, []) + graph_query_log.get(key, []) for key in all_log_keys}

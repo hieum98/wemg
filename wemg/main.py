@@ -30,6 +30,7 @@ from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.retriever_agent import RetrieverAgent
 from wemg.agents.tools.web_search import WebSearchTool
 from wemg.config import (
+    create_config_from_dict,
     get_cache_config,
     get_generation_kwargs,
     get_node_generation_kwargs,
@@ -88,7 +89,6 @@ class WEMGSystem:
         """
         # Load configuration
         if config_dict is not None:
-            from wemg.config import create_config_from_dict
             self.cfg = create_config_from_dict(config_dict)
         else:
             self.cfg = load_config(config_path, config_overrides)
@@ -108,13 +108,15 @@ class WEMGSystem:
     
     def _setup_logging(self) -> None:
         """Configure logging based on configuration."""
-        log_level = getattr(logging, self.cfg.logging.level.upper(), logging.INFO)
+        log_level_str = OmegaConf.get(self.cfg, "logging.level", "INFO")
+        log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+        log_format = OmegaConf.get(self.cfg, "logging.format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         logging.basicConfig(
             level=log_level,
-            format=self.cfg.logging.format,
+            format=log_format,
         )
         # Set environment variable for other modules
-        os.environ["LOGGING_LEVEL"] = self.cfg.logging.level
+        os.environ["LOGGING_LEVEL"] = log_level_str
     
     def _initialize(self) -> None:
         """Lazy initialization of components."""
@@ -138,45 +140,49 @@ class WEMGSystem:
         generation_kwargs = get_generation_kwargs(self.cfg)
         
         return BaseLLMAgent(
-            client_type=self.cfg.llm.client_type,
-            model_name=self.cfg.llm.model_name,
-            url=self.cfg.llm.url,
-            api_key=self.cfg.llm.api_key,
-            concurrency=self.cfg.llm.concurrency,
-            max_retries=self.cfg.llm.max_retries,
+            client_type=OmegaConf.get(self.cfg, "llm.client_type", "openai"),
+            model_name=OmegaConf.get(self.cfg, "llm.model_name", "gpt-4o-mini"),
+            url=OmegaConf.get(self.cfg, "llm.url", "https://api.openai.com/v1"),
+            api_key=OmegaConf.get(self.cfg, "llm.api_key", None),
+            concurrency=OmegaConf.get(self.cfg, "llm.concurrency", 64),
+            max_retries=OmegaConf.get(self.cfg, "llm.max_retries", 3),
             cache_config=cache_config,
             **generation_kwargs,
         )
     
     def _create_retriever_agent(self) -> Union[WebSearchTool, RetrieverAgent]:
         """Create the retriever agent based on configuration."""
-        retriever_type = self.cfg.retriever.type
+        retriever_type = OmegaConf.get(self.cfg, "retriever.type", "web_search")
         
         if retriever_type == "web_search":
             retriever = WebSearchTool()
-            if self.cfg.retriever.web_search.api_key:
-                retriever.serper_api_key = self.cfg.retriever.web_search.api_key
+            api_key = OmegaConf.get(self.cfg, "retriever.web_search.api_key", None)
+            if api_key:
+                retriever.serper_api_key = api_key
             return retriever
         
         elif retriever_type == "corpus":
             embedder_config = {
-                "model_name": self.cfg.retriever.corpus.embedder.model_name,
-                "url": self.cfg.retriever.corpus.embedder.url,
-                "api_key": self.cfg.retriever.corpus.embedder.api_key,
+                "model_name": OmegaConf.get(self.cfg, "retriever.corpus.embedder.model_name", "text-embedding-3-small"),
+                "url": OmegaConf.get(self.cfg, "retriever.corpus.embedder.url", "https://api.openai.com/v1"),
+                "api_key": OmegaConf.get(self.cfg, "retriever.corpus.embedder.api_key", None),
             }
+            corpus_path = OmegaConf.get(self.cfg, "retriever.corpus.corpus_path", None)
+            index_path = OmegaConf.get(self.cfg, "retriever.corpus.index_path", None)
             return RetrieverAgent(
                 embedder_config=embedder_config,
-                corpus_path=Path(self.cfg.retriever.corpus.corpus_path),
-                index_path=Path(self.cfg.retriever.corpus.index_path) if self.cfg.retriever.corpus.index_path else None,
-                embedder_type=self.cfg.retriever.corpus.embedder.embedder_type,
+                corpus_path=Path(corpus_path) if corpus_path else None,
+                index_path=Path(index_path) if index_path else None,
+                embedder_type=OmegaConf.get(self.cfg, "retriever.corpus.embedder.embedder_type", "openai"),
             )
         
         elif retriever_type == "hybrid":
             # For hybrid, we default to web search but could implement both
             logger.warning("Hybrid retriever not fully implemented, using web search.")
             retriever = WebSearchTool()
-            if self.cfg.retriever.web_search.api_key:
-                retriever.serper_api_key = self.cfg.retriever.web_search.api_key
+            api_key = OmegaConf.get(self.cfg, "retriever.web_search.api_key", None)
+            if api_key:
+                retriever.serper_api_key = api_key
             return retriever
         
         else:
@@ -185,16 +191,17 @@ class WEMGSystem:
     def _create_working_memory(self) -> WorkingMemory:
         """Create a fresh working memory instance."""
         return WorkingMemory(
-            max_textual_memory_tokens=self.cfg.memory.working_memory.max_textual_memory_tokens,
+            max_textual_memory_tokens=OmegaConf.get(self.cfg, "memory.working_memory.max_textual_memory_tokens", 8192),
         )
     
     def _create_interaction_memory(self) -> Optional[InteractionMemory]:
         """Create interaction memory if enabled."""
-        if not self.cfg.memory.interaction_memory.enabled:
+        enabled = OmegaConf.get(self.cfg, "memory.interaction_memory.enabled", False)
+        if not enabled:
             return None
         
         return InteractionMemory(
-            log_dir=self.cfg.memory.interaction_memory.log_dir,
+            log_dir=OmegaConf.get(self.cfg, "memory.interaction_memory.log_dir", "./logs"),
         )
     
     def answer(
@@ -227,7 +234,7 @@ class WEMGSystem:
         node_gen_kwargs = get_node_generation_kwargs(self.cfg)
         
         # Choose search strategy
-        strategy = self.cfg.search.strategy
+        strategy = OmegaConf.get(self.cfg, "search.strategy", "cot")
         
         if strategy == "cot":
             return self._answer_with_cot(
@@ -257,7 +264,7 @@ class WEMGSystem:
         """Answer using Chain-of-Thought reasoning."""
         logger.info(f"Answering with CoT strategy: {question}")
         
-        max_depth = self.cfg.search.cot.max_depth
+        max_depth = OmegaConf.get(self.cfg, "search.cot.max_depth", 10)
         
         # Run CoT search
         terminal_content, reasoning_path = cot_search(
@@ -273,11 +280,12 @@ class WEMGSystem:
         # Extract answer
         full_answer, concise_answer = cot_get_answer(terminal_content, reasoning_path)
         
+        include_reasoning = OmegaConf.get(self.cfg, "output.include_reasoning", True)
         return AnswerResult(
             question=question,
             answer=full_answer,
             concise_answer=concise_answer,
-            reasoning_path=reasoning_path if self.cfg.output.include_reasoning else None,
+            reasoning_path=reasoning_path if include_reasoning else None,
             metadata={
                 "strategy": "cot",
                 "max_depth": max_depth,
@@ -296,8 +304,6 @@ class WEMGSystem:
         """Answer using Monte Carlo Tree Search."""
         logger.info(f"Answering with MCTS strategy: {question}")
         
-        mcts_cfg = self.cfg.search.mcts
-        
         # Run MCTS search
         best_terminal_content, search_tree = mcts_search(
             question=question,
@@ -305,11 +311,11 @@ class WEMGSystem:
             retriever_agent=self.retriever_agent,
             working_memory=working_memory,
             interaction_memory=interaction_memory,
-            num_iterations=mcts_cfg.num_iterations,
-            max_tree_depth=mcts_cfg.max_tree_depth,
-            max_simulation_depth=mcts_cfg.max_simulation_depth,
-            exploration_weight=mcts_cfg.exploration_weight,
-            is_cot_simulation=mcts_cfg.is_cot_simulation,
+            num_iterations=OmegaConf.get(self.cfg, "search.mcts.num_iterations", 10),
+            max_tree_depth=OmegaConf.get(self.cfg, "search.mcts.max_tree_depth", 10),
+            max_simulation_depth=OmegaConf.get(self.cfg, "search.mcts.max_simulation_depth", 5),
+            exploration_weight=OmegaConf.get(self.cfg, "search.mcts.exploration_weight", 1.0),
+            is_cot_simulation=OmegaConf.get(self.cfg, "search.mcts.is_cot_simulation", True),
             golden_answer=golden_answer,
             **node_gen_kwargs,
         )
@@ -321,16 +327,17 @@ class WEMGSystem:
             interaction_memory=interaction_memory,
         )
         
+        include_reasoning = OmegaConf.get(self.cfg, "output.include_reasoning", True)
         return AnswerResult(
             question=question,
             answer=full_answer,
             concise_answer=concise_answer,
-            search_tree=search_tree if self.cfg.output.include_reasoning else None,
+            search_tree=search_tree if include_reasoning else None,
             metadata={
                 "strategy": "mcts",
-                "num_iterations": mcts_cfg.num_iterations,
-                "max_tree_depth": mcts_cfg.max_tree_depth,
-                "exploration_weight": mcts_cfg.exploration_weight,
+                "num_iterations": OmegaConf.get(self.cfg, "search.mcts.num_iterations", 10),
+                "max_tree_depth": OmegaConf.get(self.cfg, "search.mcts.max_tree_depth", 10),
+                "exploration_weight": OmegaConf.get(self.cfg, "search.mcts.exploration_weight", 1.0),
             },
         )
     
@@ -446,14 +453,13 @@ def main(cfg: DictConfig) -> None:
     system_cfg.pop("hydra", None)  # Remove hydra internal config
     
     # Create system with the configuration
-    from wemg.config import create_config_from_dict
     system = WEMGSystem(config_dict=system_cfg)
     
     try:
         print(f"\n{'='*60}")
         print(f"Question: {question}")
-        print(f"Strategy: {cfg.search.strategy}")
-        print(f"Model: {cfg.llm.model_name}")
+        print(f"Strategy: {OmegaConf.get(cfg, 'search.strategy', 'cot')}")
+        print(f"Model: {OmegaConf.get(cfg, 'llm.model_name', 'gpt-4o-mini')}")
         print(f"{'='*60}\n")
         
         result = system.answer(question)
@@ -463,13 +469,15 @@ def main(cfg: DictConfig) -> None:
         print(f"{'='*60}")
         print(f"\n{result.answer}\n")
         
-        if cfg.output.include_concise_answer and result.concise_answer:
+        include_concise = OmegaConf.get(cfg, "output.include_concise_answer", True)
+        if include_concise and result.concise_answer:
             print(f"{'='*60}")
             print("CONCISE ANSWER:")
             print(f"{'='*60}")
             print(f"\n{result.concise_answer}\n")
         
-        if cfg.output.verbose and result.metadata:
+        verbose = OmegaConf.get(cfg, "output.verbose", False)
+        if verbose and result.metadata:
             print(f"{'='*60}")
             print("METADATA:")
             print(f"{'='*60}")

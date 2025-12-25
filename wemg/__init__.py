@@ -4,7 +4,6 @@ __version__ = "0.1.0"
 
 from wemg.agents.base_llm_agent import BaseClient, OpenAIClient, BaseLLMAgent
 from wemg.config import (
-    WEMGConfig,
     load_config,
     create_config_from_dict,
     validate_config,
@@ -24,7 +23,6 @@ __all__ = [
     "OpenAIClient",
     "BaseLLMAgent",
     # Configuration
-    "WEMGConfig",
     "load_config",
     "create_config_from_dict",
     "validate_config",

@@ -1,175 +1,16 @@
-"""Configuration module for WEMG using Hydra and OmegaConf.
+"""Configuration module for WEMG using OmegaConf.
 
 This module provides configuration management for the WEMG system,
 allowing flexible parameter configuration through YAML files, command-line
-overrides, and environment variables.
+overrides, and environment variables. All configuration is handled through
+OmegaConf DictConfig objects for maximum flexibility.
 """
 
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from omegaconf import DictConfig, OmegaConf, MISSING
-
-
-# =====================================================================
-# Dataclass Configurations
-# =====================================================================
-
-@dataclass
-class GenerationConfig:
-    """LLM generation parameters."""
-    timeout: int = 60
-    temperature: float = 0.7
-    n: int = 1
-    top_p: float = 0.8
-    max_tokens: int = 8192
-    max_input_tokens: int = 32768
-    top_k: int = 20
-    enable_thinking: bool = True
-    random_seed: Optional[int] = None
-
-
-@dataclass
-class LLMConfig:
-    """LLM agent configuration."""
-    model_name: str = "gpt-4o-mini"
-    url: str = "https://api.openai.com/v1"
-    api_key: Optional[str] = None
-    client_type: str = "openai"
-    concurrency: int = 64
-    max_retries: int = 3
-    generation: GenerationConfig = field(default_factory=GenerationConfig)
-
-
-@dataclass
-class CacheConfig:
-    """Redis cache configuration."""
-    enabled: bool = True
-    host: str = "localhost"
-    port: int = 6379
-    db: int = 0
-    password: Optional[str] = None
-    prefix: str = "wemg"
-    ttl: int = 86400
-
-
-@dataclass
-class WebSearchConfig:
-    """Web search retriever configuration."""
-    api_key: Optional[str] = None
-    top_k: int = 5
-    crawl_full_text: bool = True
-
-
-@dataclass
-class EmbedderConfig:
-    """Embedder configuration for corpus retriever."""
-    model_name: str = "text-embedding-3-small"
-    url: str = "https://api.openai.com/v1"
-    api_key: Optional[str] = None
-    embedder_type: str = "openai"
-
-
-@dataclass
-class CorpusConfig:
-    """Corpus-based retriever configuration."""
-    embedder: EmbedderConfig = field(default_factory=EmbedderConfig)
-    corpus_path: Optional[str] = None
-    index_path: Optional[str] = None
-
-
-@dataclass
-class RetrieverConfig:
-    """Retriever configuration."""
-    type: str = "web_search"  # "web_search", "corpus", or "hybrid"
-    web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
-    corpus: CorpusConfig = field(default_factory=CorpusConfig)
-
-
-@dataclass
-class MCTSConfig:
-    """MCTS search strategy configuration."""
-    num_iterations: int = 10
-    max_tree_depth: int = 10
-    max_simulation_depth: int = 5
-    exploration_weight: float = 1.0
-    is_cot_simulation: bool = True
-
-
-@dataclass
-class CoTConfig:
-    """Chain-of-Thought search strategy configuration."""
-    max_depth: int = 10
-
-
-@dataclass
-class SearchConfig:
-    """Search strategy configuration."""
-    strategy: str = "cot"  # "mcts" or "cot"
-    mcts: MCTSConfig = field(default_factory=MCTSConfig)
-    cot: CoTConfig = field(default_factory=CoTConfig)
-
-
-@dataclass
-class NodeGenerationConfig:
-    """Node generation parameters."""
-    n: int = 1
-    top_k_websearch: int = 5
-    top_k_entities: int = 1
-    top_k_properties: int = 1
-    n_hops: int = 1
-    use_question_for_graph_retrieval: bool = True
-
-
-@dataclass
-class WorkingMemoryConfig:
-    """Working memory configuration."""
-    max_textual_memory_tokens: int = 8192
-
-
-@dataclass
-class InteractionMemoryConfig:
-    """Interaction memory (logging) configuration."""
-    enabled: bool = False
-    log_dir: str = "./logs"
-    save_to_file: bool = False
-
-
-@dataclass
-class MemoryConfig:
-    """Memory configuration."""
-    working_memory: WorkingMemoryConfig = field(default_factory=WorkingMemoryConfig)
-    interaction_memory: InteractionMemoryConfig = field(default_factory=InteractionMemoryConfig)
-
-
-@dataclass
-class LoggingConfig:
-    """Logging configuration."""
-    level: str = "INFO"
-    format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-
-@dataclass
-class OutputConfig:
-    """Output configuration."""
-    include_reasoning: bool = True
-    include_concise_answer: bool = True
-    verbose: bool = False
-
-
-@dataclass
-class WEMGConfig:
-    """Main WEMG configuration."""
-    llm: LLMConfig = field(default_factory=LLMConfig)
-    cache: CacheConfig = field(default_factory=CacheConfig)
-    retriever: RetrieverConfig = field(default_factory=RetrieverConfig)
-    search: SearchConfig = field(default_factory=SearchConfig)
-    node_generation: NodeGenerationConfig = field(default_factory=NodeGenerationConfig)
-    memory: MemoryConfig = field(default_factory=MemoryConfig)
-    logging: LoggingConfig = field(default_factory=LoggingConfig)
-    output: OutputConfig = field(default_factory=OutputConfig)
+from omegaconf import DictConfig, OmegaConf
 
 
 # =====================================================================
@@ -195,8 +36,8 @@ def load_config(
         OmegaConf DictConfig object with the loaded configuration.
     
     Example:
-        >>> cfg = load_config(overrides=["llm.temperature=0.5", "search.strategy=mcts"])
-        >>> print(cfg.llm.temperature)
+        >>> cfg = load_config(overrides=["llm.generation.temperature=0.5", "search.strategy=mcts"])
+        >>> print(OmegaConf.get(cfg, "llm.generation.temperature"))
         0.5
     """
     if config_path is None:
@@ -214,7 +55,7 @@ def load_config(
     if overrides:
         for override in overrides:
             key, value = override.split("=", 1)
-            OmegaConf.update(cfg, key, _parse_value(value))
+            OmegaConf.set(cfg, key, _parse_value(value))
     
     # Resolve environment variables
     cfg = _resolve_env_vars(cfg)
@@ -254,22 +95,27 @@ def _resolve_env_vars(cfg: DictConfig) -> DictConfig:
     """Resolve environment variables in the configuration.
     
     Automatically fills in API keys from environment variables if not set.
+    Uses OmegaConf.get() with defaults for flexible access.
     """
     # LLM API key
-    if cfg.llm.api_key is None:
-        cfg.llm.api_key = os.environ.get("OPENAI_API_KEY")
+    llm_api_key = OmegaConf.get(cfg, "llm.api_key", None)
+    if llm_api_key is None:
+        OmegaConf.set(cfg, "llm.api_key", os.environ.get("OPENAI_API_KEY"))
     
     # Web search API key
-    if cfg.retriever.web_search.api_key is None:
-        cfg.retriever.web_search.api_key = os.environ.get("SERPER_API_KEY")
+    web_search_api_key = OmegaConf.get(cfg, "retriever.web_search.api_key", None)
+    if web_search_api_key is None:
+        OmegaConf.set(cfg, "retriever.web_search.api_key", os.environ.get("SERPER_API_KEY"))
     
     # Embedder API key
-    if cfg.retriever.corpus.embedder.api_key is None:
-        cfg.retriever.corpus.embedder.api_key = os.environ.get("OPENAI_API_KEY")
+    embedder_api_key = OmegaConf.get(cfg, "retriever.corpus.embedder.api_key", None)
+    if embedder_api_key is None:
+        OmegaConf.set(cfg, "retriever.corpus.embedder.api_key", os.environ.get("OPENAI_API_KEY"))
     
     # Cache password
-    if cfg.cache.password is None:
-        cfg.cache.password = os.environ.get("REDIS_PASSWORD")
+    cache_password = OmegaConf.get(cfg, "cache.password", None)
+    if cache_password is None:
+        OmegaConf.set(cfg, "cache.password", os.environ.get("REDIS_PASSWORD"))
     
     return cfg
 
@@ -285,7 +131,7 @@ def create_config_from_dict(config_dict: Dict[str, Any]) -> DictConfig:
     
     Example:
         >>> cfg = create_config_from_dict({
-        ...     "llm": {"model_name": "gpt-4o", "temperature": 0.5},
+        ...     "llm": {"model_name": "gpt-4o", "generation": {"temperature": 0.5}},
         ...     "search": {"strategy": "mcts"}
         ... })
     """
@@ -326,25 +172,29 @@ def validate_config(cfg: DictConfig) -> bool:
     Raises:
         ValueError: If configuration is invalid.
     """
-    # Check required fields
-    if cfg.llm.api_key is None:
+    # Check required fields using OmegaConf.get() with defaults
+    llm_api_key = OmegaConf.get(cfg, "llm.api_key", None)
+    if llm_api_key is None:
         raise ValueError(
             "LLM API key is required. Set it in config or via OPENAI_API_KEY environment variable."
         )
     
     # Validate search strategy
-    if cfg.search.strategy not in ("mcts", "cot"):
-        raise ValueError(f"Invalid search strategy: {cfg.search.strategy}. Must be 'mcts' or 'cot'.")
+    search_strategy = OmegaConf.get(cfg, "search.strategy", "cot")
+    if search_strategy not in ("mcts", "cot"):
+        raise ValueError(f"Invalid search strategy: {search_strategy}. Must be 'mcts' or 'cot'.")
     
     # Validate retriever type
-    if cfg.retriever.type not in ("web_search", "corpus", "hybrid"):
+    retriever_type = OmegaConf.get(cfg, "retriever.type", "web_search")
+    if retriever_type not in ("web_search", "corpus", "hybrid"):
         raise ValueError(
-            f"Invalid retriever type: {cfg.retriever.type}. Must be 'web_search', 'corpus', or 'hybrid'."
+            f"Invalid retriever type: {retriever_type}. Must be 'web_search', 'corpus', or 'hybrid'."
         )
     
     # Validate corpus retriever settings
-    if cfg.retriever.type in ("corpus", "hybrid"):
-        if cfg.retriever.corpus.corpus_path is None:
+    if retriever_type in ("corpus", "hybrid"):
+        corpus_path = OmegaConf.get(cfg, "retriever.corpus.corpus_path", None)
+        if corpus_path is None:
             raise ValueError("Corpus path is required for corpus/hybrid retriever.")
     
     return True
@@ -366,28 +216,35 @@ def print_config(cfg: DictConfig) -> None:
 def get_cache_config(cfg: DictConfig) -> Optional[Dict[str, Any]]:
     """Extract cache configuration for BaseLLMAgent.
     
+    Uses OmegaConf.get() with defaults for flexible access. New cache
+    parameters can be added to config.yaml without code changes.
+    
     Args:
         cfg: Main configuration.
     
     Returns:
         Cache configuration dictionary or None if disabled.
     """
-    if not cfg.cache.enabled:
+    enabled = OmegaConf.get(cfg, "cache.enabled", True)
+    if not enabled:
         return None
     
     return {
         "enabled": True,
-        "host": cfg.cache.host,
-        "port": cfg.cache.port,
-        "db": cfg.cache.db,
-        "password": cfg.cache.password,
-        "prefix": cfg.cache.prefix,
-        "ttl": cfg.cache.ttl,
+        "host": OmegaConf.get(cfg, "cache.host", "localhost"),
+        "port": OmegaConf.get(cfg, "cache.port", 6379),
+        "db": OmegaConf.get(cfg, "cache.db", 0),
+        "password": OmegaConf.get(cfg, "cache.password", None),
+        "prefix": OmegaConf.get(cfg, "cache.prefix", "wemg"),
+        "ttl": OmegaConf.get(cfg, "cache.ttl", 86400),
     }
 
 
 def get_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
     """Extract generation kwargs for LLM agent.
+    
+    Uses OmegaConf.get() with defaults for flexible access. New generation
+    parameters can be added to config.yaml without code changes.
     
     Args:
         cfg: Main configuration.
@@ -396,20 +253,23 @@ def get_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
         Generation kwargs dictionary.
     """
     return {
-        "timeout": cfg.llm.generation.timeout,
-        "temperature": cfg.llm.generation.temperature,
-        "n": cfg.llm.generation.n,
-        "top_p": cfg.llm.generation.top_p,
-        "max_tokens": cfg.llm.generation.max_tokens,
-        "max_input_tokens": cfg.llm.generation.max_input_tokens,
-        "top_k": cfg.llm.generation.top_k,
-        "enable_thinking": cfg.llm.generation.enable_thinking,
-        "random_seed": cfg.llm.generation.random_seed,
+        "timeout": OmegaConf.get(cfg, "llm.generation.timeout", 60),
+        "temperature": OmegaConf.get(cfg, "llm.generation.temperature", 0.7),
+        "n": OmegaConf.get(cfg, "llm.generation.n", 1),
+        "top_p": OmegaConf.get(cfg, "llm.generation.top_p", 0.8),
+        "max_tokens": OmegaConf.get(cfg, "llm.generation.max_tokens", 8192),
+        "max_input_tokens": OmegaConf.get(cfg, "llm.generation.max_input_tokens", 32768),
+        "top_k": OmegaConf.get(cfg, "llm.generation.top_k", 20),
+        "enable_thinking": OmegaConf.get(cfg, "llm.generation.enable_thinking", True),
+        "random_seed": OmegaConf.get(cfg, "llm.generation.random_seed", None),
     }
 
 
 def get_node_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
     """Extract node generation kwargs for search algorithms.
+    
+    Uses OmegaConf.get() with defaults for flexible access. New node generation
+    parameters can be added to config.yaml without code changes.
     
     Args:
         cfg: Main configuration.
@@ -418,10 +278,10 @@ def get_node_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
         Node generation kwargs dictionary.
     """
     return {
-        "n": cfg.node_generation.n,
-        "top_k_websearch": cfg.node_generation.top_k_websearch,
-        "top_k_entities": cfg.node_generation.top_k_entities,
-        "top_k_properties": cfg.node_generation.top_k_properties,
-        "n_hops": cfg.node_generation.n_hops,
-        "use_question_for_graph_retrieval": cfg.node_generation.use_question_for_graph_retrieval,
+        "n": OmegaConf.get(cfg, "node_generation.n", 1),
+        "top_k_websearch": OmegaConf.get(cfg, "node_generation.top_k_websearch", 5),
+        "top_k_entities": OmegaConf.get(cfg, "node_generation.top_k_entities", 1),
+        "top_k_properties": OmegaConf.get(cfg, "node_generation.top_k_properties", 1),
+        "n_hops": OmegaConf.get(cfg, "node_generation.n_hops", 1),
+        "use_question_for_graph_retrieval": OmegaConf.get(cfg, "node_generation.use_question_for_graph_retrieval", True),
     }

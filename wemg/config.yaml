@@ -26,7 +26,7 @@ llm:
     n: 1  # Number of samples to generate
     top_p: 0.8
     max_tokens: 8192
-    max_input_tokens: 32768
+    max_input_tokens: 65536
     top_k: 20
     enable_thinking: true  # Enable chain-of-thought reasoning
     random_seed: null  # Set for reproducibility

@@ -40,12 +40,12 @@ class BaseClient:
         self.is_embedding = is_embedding
 
         ## Generate kwargs
-        self.timeout = generate_kwargs.get('timeout', 60)
+        self.timeout = generate_kwargs.get('timeout', 300)
         self.temperature = generate_kwargs.get('temperature', 0.7)
         self.num_samples = generate_kwargs.get('n', 1)
         self.top_p = generate_kwargs.get('top_p', 0.8)
         self.max_tokens = generate_kwargs.get('max_tokens', 8192) # default max tokens to generate
-        self.max_inputs_tokens = generate_kwargs.get('max_input_tokens', 32768) # default max input tokens
+        self.max_inputs_tokens = generate_kwargs.get('max_input_tokens', 65536) # default max input tokens
         self.top_k = generate_kwargs.get('top_k', 20)
         self.enable_thinking = generate_kwargs.get('enable_thinking', True) # enable chain-of-thought by default
         self.random_seed = generate_kwargs.get('random_seed', None)
@@ -178,18 +178,17 @@ class BaseClient:
         if len(valid_choices) == 0:
             logger.error(f"No valid completions after {self.max_retries} attempts. With the last response: {response}")
             return index, []
-        
+    
         valid_choices = valid_choices[:n]
-        # Log out the valid choices but with short reasoning content
+        # Log out the valid choices
         for vc in valid_choices:
-            logger.info(f"Valid choice: {vc['output']} - {vc['is_valid']} with reasoning: {vc['reasoning'][:100]}...")
+            logger.info(f"Valid choice: {vc['output']} - {vc['is_valid']}")
         logger.info(f"Total valid choices: {len(valid_choices)}")
         
         # Cache the result which are all valid
         all_valid = all([vc['is_valid'] for vc in valid_choices])
         if use_cache and self.cache and all_valid:
             self.cache.set(cache_key_data, valid_choices, ttl=cache_ttl)
-        
         return index, valid_choices
 
     def batch_generate(
