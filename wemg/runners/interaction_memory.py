@@ -177,7 +177,7 @@ class InteractionMemory:
         
         # Embedding cache to avoid recomputing same query embeddings
         self._embedding_cache = {} if enable_embedding_cache else None
-        self._cache_max_size = 1000  # Limit cache size to prevent memory issues
+        self._cache_max_size = 10000  # Limit cache size to prevent memory issues
     
     def get_info(self):
         count = self.collection.count()
@@ -216,37 +216,87 @@ class InteractionMemory:
         # This is critical for Vector DBs to actually free the RAM immediately
         gc.collect()
     
-    def log_turn(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]]):
-        """Synchronous version - use log_turn_async for concurrent access."""
+    def log_turn(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]], batch_size: int = 32):
+        """Synchronous version - use log_turn_async for concurrent access.
+        """
         if isinstance(user_input, str):
             user_input = [user_input]
         if isinstance(assistant_output, str):
             assistant_output = [assistant_output]
         assert len(user_input) == len(assistant_output), "user_input and assistant_output must have the same length"
 
-        turn_ids = []
-        metadatas = []
-        documents = []
+        # Filter out entries that exceed token budget
+        filtered_inputs = []
+        filtered_outputs = []
+        skipped_count = 0
+        
         for u_input, a_output in zip(user_input, assistant_output):
-            turn_id = str(uuid.uuid4())
-            metadata = {
-                    "role": role,
-                    "assistant_output": a_output,
-                    "timestamp": datetime.now().isoformat()
-                }
-            turn_ids.append(turn_id)
-            metadatas.append(metadata)
-            documents.append(u_input)
-        self.collection.add(
-            documents=documents,
-            metadatas=metadatas,
-            ids=turn_ids
-        )
+            # Check if combined input + output exceeds token budget
+            combined_text = f"{u_input}\n{a_output}"
+            token_count = approximate_token_count(combined_text)
+            
+            if token_count > self.token_budget:
+                skipped_count += 1
+                logger.warning(
+                    f"Skipping log entry for role '{role}' - token count ({token_count}) exceeds budget ({self.token_budget})"
+                )
+                continue
+            
+            filtered_inputs.append(u_input)
+            filtered_outputs.append(a_output)
+        
+        if skipped_count > 0:
+            logger.info(f"Skipped {skipped_count} entries that exceeded token budget")
+        
+        if not filtered_inputs:
+            logger.info("No entries to log after filtering by token budget")
+            return
+
+        # Process in batches to avoid OOM
+        total_entries = len(filtered_inputs)
+        logger.info(f"Logging {total_entries} entries to interaction memory in batches of {batch_size}")
+        for batch_start in range(0, total_entries, batch_size):
+            batch_end = min(batch_start + batch_size, total_entries)
+            batch_inputs = filtered_inputs[batch_start:batch_end]
+            batch_outputs = filtered_outputs[batch_start:batch_end]
+            
+            turn_ids = []
+            metadatas = []
+            documents = []
+            for u_input, a_output in zip(batch_inputs, batch_outputs):
+                turn_id = str(uuid.uuid4())
+                metadata = {
+                        "role": role,
+                        "assistant_output": a_output,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                turn_ids.append(turn_id)
+                metadatas.append(metadata)
+                documents.append(u_input)
+
+            # Add batch to collection
+            self.collection.add(
+                documents=documents,
+                metadatas=metadatas,
+                ids=turn_ids
+            )
+            
+            # Clear references to help with memory management
+            del turn_ids, metadatas, documents
+            if batch_end < total_entries:
+                gc.collect()  # Suggest garbage collection between batches
     
-    async def log_turn_async(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]]):
-        """Async version with write lock - exclusive access during writes."""
+    async def log_turn_async(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]], batch_size: int = 100):
+        """Async version with write lock - exclusive access during writes.
+        
+        Args:
+            role: Role name for the log entries
+            user_input: Input string or list of input strings
+            assistant_output: Output string or list of output strings
+            batch_size: Number of entries to process per batch to avoid OOM (default: 100)
+        """
         async with self._rw_lock.write_lock():
-            self.log_turn(role, user_input, assistant_output)
+            self.log_turn(role, user_input, assistant_output, batch_size=batch_size)
     
     def get_examples(self, role: str, query: str, k: int = 3, strategy: str = "mmr"):
         """
@@ -255,6 +305,11 @@ class InteractionMemory:
         """
         # Early exit if collection is empty
         if self.collection.count() == 0:
+            return []
+
+        query_token_count = approximate_token_count(query)
+        if query_token_count > self.token_budget * 2:
+            logger.warning(f"Query token count ({query_token_count}) exceeds token budget ({self.token_budget * 2})")
             return []
         
         if strategy == "similarity":

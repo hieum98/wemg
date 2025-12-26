@@ -475,7 +475,7 @@ class TestGenerateSelfCorrection:
     """Test suite for generate_self_correction method."""
     
     @pytest.mark.slow
-    def test_generate_self_correction_success(self, node_generator_with_websearch):
+    def test_generate_self_correction_success(self, node_generator_with_websearch: NodeGenerator):
         """Test successful self-correction."""
         sub_question = "What is the capital of France?"
         sub_answer = "Lyon"  # Incorrect answer

@@ -45,7 +45,7 @@ class BaseClient:
         self.num_samples = generate_kwargs.get('n', 1)
         self.top_p = generate_kwargs.get('top_p', 0.8)
         self.max_tokens = generate_kwargs.get('max_tokens', 8192) # default max tokens to generate
-        self.max_inputs_tokens = generate_kwargs.get('max_input_tokens', 65536) # default max input tokens
+        self.max_inputs_tokens = generate_kwargs.get('max_input_tokens', 32768) # default max input tokens
         self.top_k = generate_kwargs.get('top_k', 20)
         self.enable_thinking = generate_kwargs.get('enable_thinking', True) # enable chain-of-thought by default
         self.random_seed = generate_kwargs.get('random_seed', None)
@@ -591,6 +591,12 @@ class BaseLLMAgent:
         labels = [labels[i] for i in sorted_indices]
         scores = [scores[i] for i in sorted_indices]
         return labels, scores
+    
+    def close(self) -> None:
+        """Close client connections and clean up resources."""
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
 
 if __name__ == "__main__":

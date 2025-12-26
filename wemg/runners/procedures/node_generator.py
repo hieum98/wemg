@@ -26,7 +26,7 @@ logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 @dataclass
 class GenerationResult:
-    answers: List[roles.generator.AnswerGenerationOutput] = None
+    answers: List[Union[roles.generator.AnswerGenerationOutput, roles.generator.SelfCorrectionOutput, roles.generator.ReasoningSynthesizeOutput]] = None
     retrieved_triples: List = None
     entity_dict: Dict = None
     property_dict: Dict = None
@@ -54,14 +54,14 @@ class NodeGenerator:
         working_memory: WorkingMemory,
         interaction_memory: Optional[InteractionMemory] = None,
         **generation_kwargs
-        ) -> None:
+    ) -> None:
         self.llm_agent = llm_agent
         self.retriever_agent = retriever_agent
         self.working_memory = working_memory
         self.interaction_memory = interaction_memory
         self.kwargs = generation_kwargs
     
-    async def generate_answer(self, question: str) -> GenerationResult:
+    async def generate_answer(self, question: str, should_explore: bool = True) -> GenerationResult:
         """Generate an answer for a given question using retrieval and LLM.
         
         This is the core answer generation pipeline used by multiple node types.
@@ -70,39 +70,47 @@ class NodeGenerator:
         in_memory_relations = list[WikidataProperty](set(self.working_memory.property_dict.values()))
         
         # Explore external resources
-        retrieved_documents, retrieved_triples, entity_dict, property_dict, exploration_log = await explore(
-            llm_agent=self.llm_agent,
-            retriever_agent=self.retriever_agent,
-            question=question,
-            entities=in_memory_entities,
-            relations=in_memory_relations,
-            top_k_websearch=self.kwargs.get('top_k_websearch', 5),
-            top_k_entities=self.kwargs.get('top_k_entities', 1),
-            top_k_properties=self.kwargs.get('top_k_properties', 1),
-            n_hops=self.kwargs.get('n_hops', 1),
-            use_question_for_graph_retrieval=self.kwargs.get('use_question_for_graph_retrieval', True),
-            interaction_memory=self.interaction_memory
-        )
+        if should_explore:
+            retrieved_documents, retrieved_triples, entity_dict, property_dict, exploration_log = await explore(
+                llm_agent=self.llm_agent,
+                retriever_agent=self.retriever_agent,
+                question=question,
+                entities=in_memory_entities,
+                relations=in_memory_relations,
+                top_k_websearch=self.kwargs.get('top_k_websearch', 5),
+                top_k_entities=self.kwargs.get('top_k_entities', 1),
+                top_k_properties=self.kwargs.get('top_k_properties', 1),
+                n_hops=self.kwargs.get('n_hops', 1),
+                use_question_for_graph_retrieval=self.kwargs.get('use_question_for_graph_retrieval', True),
+                interaction_memory=self.interaction_memory
+            )
 
-        # Extract information from web search results
-        extractor_inputs = [
-            roles.extractor.ExtractionInput(question=question, raw_data=data) 
-            for data in retrieved_documents
-        ]
-        extracted_results, extractor_log = await execute_role(
-            llm_agent=self.llm_agent,
-            role=roles.extractor.Extractor(),
-            input_data=extractor_inputs,
-            interaction_memory=self.interaction_memory,
-            n=1
-        )
-        
-        # Flatten and filter relevant information
-        all_extractions: List[roles.extractor.ExtractionOutput] = sum(extracted_results, [])
-        info_from_websearch = []
-        for item in all_extractions:
-            if item.relevant_information:
-                info_from_websearch.extend(item.relevant_information)
+            # Extract information from web search results
+            extractor_inputs = [
+                roles.extractor.ExtractionInput(question=question, raw_data=data) 
+                for data in retrieved_documents
+            ]
+            extracted_results, extractor_log = await execute_role(
+                llm_agent=self.llm_agent,
+                role=roles.extractor.Extractor(),
+                input_data=extractor_inputs,
+                interaction_memory=self.interaction_memory,
+                n=1
+            )
+            
+            # Flatten and filter relevant information
+            all_extractions: List[roles.extractor.ExtractionOutput] = sum(extracted_results, [])
+            info_from_websearch = []
+            for item in all_extractions:
+                if item.relevant_information:
+                    info_from_websearch.extend(item.relevant_information)
+        else:
+            info_from_websearch = []
+            retrieved_triples = []
+            entity_dict = {}
+            property_dict = {}
+            exploration_log = {}
+            extractor_log = {}
 
         # Build context
         info_from_kb = [str(t) for t in retrieved_triples]
@@ -226,11 +234,10 @@ class NodeGenerator:
             n=1
         )
         
-        all_extractions = sum(extracted_results, [])
+        all_extractions: List[roles.extractor.ExtractionOutput] = sum(extracted_results, [])
         info_from_websearch = []
         for item in all_extractions:
-            if item.decision == "relevant":
-                info_from_websearch.extend(item.information)
+            info_from_websearch.extend(item.relevant_information)
         
         # Build context and correct
         info_from_kb = [str(t) for t in retrieved_triples]
@@ -261,12 +268,9 @@ class NodeGenerator:
             log_data=log_data
         )
     
-    async def generate_synthesis(self, user_question: str) -> Tuple[List, Dict]:
-        """Generate synthesized reasoning from current context.
+    async def generate_synthesis(self, user_question: str) -> GenerationResult:
+        """Generate synthesized reasoning from current context."""
         
-        Returns:
-            Tuple of (synthesis_outputs, log_data)
-        """
         memory = self.working_memory.format_textual_memory()
         context = format_context(memory=memory)
         
@@ -281,8 +285,13 @@ class NodeGenerator:
             interaction_memory=self.interaction_memory,
             n=self.kwargs.get('n', 1)
         )
+
+        result = GenerationResult(
+            answers=outputs,
+            log_data=reasoning_log
+        )
         
-        return outputs, reasoning_log
+        return result
     
     def update_working_memory(self, result: GenerationResult) -> None:
         """Update working memory with generation results."""

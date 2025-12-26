@@ -37,7 +37,7 @@ def load_config(
     
     Example:
         >>> cfg = load_config(overrides=["llm.generation.temperature=0.5", "search.strategy=mcts"])
-        >>> print(OmegaConf.get(cfg, "llm.generation.temperature"))
+        >>> print(OmegaConf.select(cfg, "llm.generation.temperature"))
         0.5
     """
     if config_path is None:
@@ -51,11 +51,10 @@ def load_config(
     # Load base configuration
     cfg = OmegaConf.load(config_path)
     
-    # Apply overrides
+    # Apply overrides 
     if overrides:
-        for override in overrides:
-            key, value = override.split("=", 1)
-            OmegaConf.set(cfg, key, _parse_value(value))
+        override_cfg = OmegaConf.from_dotlist(overrides)
+        cfg = OmegaConf.merge(cfg, override_cfg)
     
     # Resolve environment variables
     cfg = _resolve_env_vars(cfg)
@@ -63,59 +62,32 @@ def load_config(
     return cfg
 
 
-def _parse_value(value: str) -> Any:
-    """Parse a string value to its appropriate type."""
-    # Handle null/None
-    if value.lower() in ("null", "none", "~"):
-        return None
-    
-    # Handle booleans
-    if value.lower() == "true":
-        return True
-    if value.lower() == "false":
-        return False
-    
-    # Handle integers
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    
-    # Handle floats
-    try:
-        return float(value)
-    except ValueError:
-        pass
-    
-    # Return as string
-    return value
-
-
 def _resolve_env_vars(cfg: DictConfig) -> DictConfig:
-    """Resolve environment variables in the configuration.
-    
-    Automatically fills in API keys from environment variables if not set.
-    Uses OmegaConf.get() with defaults for flexible access.
-    """
+    """Resolve environment variables in the configuration."""
     # LLM API key
-    llm_api_key = OmegaConf.get(cfg, "llm.api_key", None)
+    llm_api_key = OmegaConf.select(cfg, "llm.api_key")
     if llm_api_key is None:
-        OmegaConf.set(cfg, "llm.api_key", os.environ.get("OPENAI_API_KEY"))
+        cfg.llm.api_key = os.environ.get("API_KEY")
     
     # Web search API key
-    web_search_api_key = OmegaConf.get(cfg, "retriever.web_search.api_key", None)
+    web_search_api_key = OmegaConf.select(cfg, "retriever.web_search.api_key")
     if web_search_api_key is None:
-        OmegaConf.set(cfg, "retriever.web_search.api_key", os.environ.get("SERPER_API_KEY"))
+        cfg.retriever.web_search.api_key = os.environ.get("SERPER_API_KEY")
     
     # Embedder API key
-    embedder_api_key = OmegaConf.get(cfg, "retriever.corpus.embedder.api_key", None)
+    embedder_api_key = OmegaConf.select(cfg, "retriever.corpus.embedder.api_key")
     if embedder_api_key is None:
-        OmegaConf.set(cfg, "retriever.corpus.embedder.api_key", os.environ.get("OPENAI_API_KEY"))
+        cfg.retriever.corpus.embedder.api_key = os.environ.get("API_KEY")
+    
+    # Interaction memory embedding API key
+    interaction_memory_embedding_api_key = OmegaConf.select(cfg, "memory.interaction_memory.embedding_api_key")
+    if interaction_memory_embedding_api_key is None:
+        cfg.memory.interaction_memory.embedding_api_key = os.environ.get("API_KEY")
     
     # Cache password
-    cache_password = OmegaConf.get(cfg, "cache.password", None)
+    cache_password = OmegaConf.select(cfg, "cache.password")
     if cache_password is None:
-        OmegaConf.set(cfg, "cache.password", os.environ.get("REDIS_PASSWORD"))
+        cfg.cache.password = os.environ.get("REDIS_PASSWORD")
     
     return cfg
 
@@ -148,18 +120,6 @@ def create_config_from_dict(config_dict: Dict[str, Any]) -> DictConfig:
     return merged_cfg
 
 
-def to_dict(cfg: DictConfig) -> Dict[str, Any]:
-    """Convert configuration to a plain dictionary.
-    
-    Args:
-        cfg: OmegaConf DictConfig object.
-    
-    Returns:
-        Plain dictionary representation.
-    """
-    return OmegaConf.to_container(cfg, resolve=True)
-
-
 def validate_config(cfg: DictConfig) -> bool:
     """Validate the configuration.
     
@@ -172,42 +132,35 @@ def validate_config(cfg: DictConfig) -> bool:
     Raises:
         ValueError: If configuration is invalid.
     """
-    # Check required fields using OmegaConf.get() with defaults
-    llm_api_key = OmegaConf.get(cfg, "llm.api_key", None)
+    # Check required fields using OmegaConf.select()
+    llm_api_key = OmegaConf.select(cfg, "llm.api_key")
     if llm_api_key is None:
         raise ValueError(
-            "LLM API key is required. Set it in config or via OPENAI_API_KEY environment variable."
+            "LLM API key is required. Set it in config or via API_KEY environment variable."
         )
     
     # Validate search strategy
-    search_strategy = OmegaConf.get(cfg, "search.strategy", "cot")
+    search_strategy = OmegaConf.select(cfg, "search.strategy") or "cot"
     if search_strategy not in ("mcts", "cot"):
         raise ValueError(f"Invalid search strategy: {search_strategy}. Must be 'mcts' or 'cot'.")
     
     # Validate retriever type
-    retriever_type = OmegaConf.get(cfg, "retriever.type", "web_search")
-    if retriever_type not in ("web_search", "corpus", "hybrid"):
+    retriever_type = OmegaConf.select(cfg, "retriever.type") or "web_search"
+    if retriever_type not in ("web_search", "corpus"):
         raise ValueError(
-            f"Invalid retriever type: {retriever_type}. Must be 'web_search', 'corpus', or 'hybrid'."
+            f"Invalid retriever type: {retriever_type}. Must be 'web_search' or 'corpus'."
         )
     
     # Validate corpus retriever settings
-    if retriever_type in ("corpus", "hybrid"):
-        corpus_path = OmegaConf.get(cfg, "retriever.corpus.corpus_path", None)
+    if retriever_type == "corpus":
+        corpus_path = OmegaConf.select(cfg, "retriever.corpus.corpus_path")
         if corpus_path is None:
-            raise ValueError("Corpus path is required for corpus/hybrid retriever.")
+            raise ValueError("Corpus path is required for corpus retriever.")
+        index_path = OmegaConf.select(cfg, "retriever.corpus.index_path")
+        if index_path is None:
+            raise ValueError("Index path is required for corpus retriever.")
     
     return True
-
-
-def print_config(cfg: DictConfig) -> None:
-    """Print the configuration in a readable format.
-    
-    Args:
-        cfg: Configuration to print.
-    """
-    print(OmegaConf.to_yaml(cfg))
-
 
 # =====================================================================
 # Helper Functions for Building Components
@@ -216,7 +169,7 @@ def print_config(cfg: DictConfig) -> None:
 def get_cache_config(cfg: DictConfig) -> Optional[Dict[str, Any]]:
     """Extract cache configuration for BaseLLMAgent.
     
-    Uses OmegaConf.get() with defaults for flexible access. New cache
+    Uses OmegaConf.select() with defaults for flexible access. New cache
     parameters can be added to config.yaml without code changes.
     
     Args:
@@ -225,25 +178,27 @@ def get_cache_config(cfg: DictConfig) -> Optional[Dict[str, Any]]:
     Returns:
         Cache configuration dictionary or None if disabled.
     """
-    enabled = OmegaConf.get(cfg, "cache.enabled", True)
+    enabled = OmegaConf.select(cfg, "cache.enabled")
+    if enabled is None:
+        enabled = True
     if not enabled:
         return None
     
     return {
         "enabled": True,
-        "host": OmegaConf.get(cfg, "cache.host", "localhost"),
-        "port": OmegaConf.get(cfg, "cache.port", 6379),
-        "db": OmegaConf.get(cfg, "cache.db", 0),
-        "password": OmegaConf.get(cfg, "cache.password", None),
-        "prefix": OmegaConf.get(cfg, "cache.prefix", "wemg"),
-        "ttl": OmegaConf.get(cfg, "cache.ttl", 86400),
+        "host": OmegaConf.select(cfg, "cache.host") or "localhost",
+        "port": OmegaConf.select(cfg, "cache.port") or 6379,
+        "db": OmegaConf.select(cfg, "cache.db") or 0,
+        "password": OmegaConf.select(cfg, "cache.password"),
+        "prefix": OmegaConf.select(cfg, "cache.prefix") or "wemg",
+        "ttl": OmegaConf.select(cfg, "cache.ttl") or 86400,
     }
 
 
 def get_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
     """Extract generation kwargs for LLM agent.
     
-    Uses OmegaConf.get() with defaults for flexible access. New generation
+    Uses OmegaConf.select() with defaults for flexible access. New generation
     parameters can be added to config.yaml without code changes.
     
     Args:
@@ -252,23 +207,27 @@ def get_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
     Returns:
         Generation kwargs dictionary.
     """
+    enable_thinking = OmegaConf.select(cfg, "llm.generation.enable_thinking")
+    if enable_thinking is None:
+        enable_thinking = True
+    
     return {
-        "timeout": OmegaConf.get(cfg, "llm.generation.timeout", 60),
-        "temperature": OmegaConf.get(cfg, "llm.generation.temperature", 0.7),
-        "n": OmegaConf.get(cfg, "llm.generation.n", 1),
-        "top_p": OmegaConf.get(cfg, "llm.generation.top_p", 0.8),
-        "max_tokens": OmegaConf.get(cfg, "llm.generation.max_tokens", 8192),
-        "max_input_tokens": OmegaConf.get(cfg, "llm.generation.max_input_tokens", 32768),
-        "top_k": OmegaConf.get(cfg, "llm.generation.top_k", 20),
-        "enable_thinking": OmegaConf.get(cfg, "llm.generation.enable_thinking", True),
-        "random_seed": OmegaConf.get(cfg, "llm.generation.random_seed", None),
+        "timeout": OmegaConf.select(cfg, "llm.generation.timeout") or 300,
+        "temperature": OmegaConf.select(cfg, "llm.generation.temperature") or 0.7,
+        "n": OmegaConf.select(cfg, "llm.generation.n") or 1,
+        "top_p": OmegaConf.select(cfg, "llm.generation.top_p") or 0.8,
+        "max_tokens": OmegaConf.select(cfg, "llm.generation.max_tokens") or 65536,
+        "max_input_tokens": OmegaConf.select(cfg, "llm.generation.max_input_tokens") or 65536,
+        "top_k": OmegaConf.select(cfg, "llm.generation.top_k") or 20,
+        "enable_thinking": enable_thinking,
+        "random_seed": OmegaConf.select(cfg, "llm.generation.random_seed"),
     }
 
 
 def get_node_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
     """Extract node generation kwargs for search algorithms.
     
-    Uses OmegaConf.get() with defaults for flexible access. New node generation
+    Uses OmegaConf.select() with defaults for flexible access. New node generation
     parameters can be added to config.yaml without code changes.
     
     Args:
@@ -277,11 +236,15 @@ def get_node_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
     Returns:
         Node generation kwargs dictionary.
     """
+    use_question_for_graph_retrieval = OmegaConf.select(cfg, "node_generation.use_question_for_graph_retrieval")
+    if use_question_for_graph_retrieval is None:
+        use_question_for_graph_retrieval = True
+    
     return {
-        "n": OmegaConf.get(cfg, "node_generation.n", 1),
-        "top_k_websearch": OmegaConf.get(cfg, "node_generation.top_k_websearch", 5),
-        "top_k_entities": OmegaConf.get(cfg, "node_generation.top_k_entities", 1),
-        "top_k_properties": OmegaConf.get(cfg, "node_generation.top_k_properties", 1),
-        "n_hops": OmegaConf.get(cfg, "node_generation.n_hops", 1),
-        "use_question_for_graph_retrieval": OmegaConf.get(cfg, "node_generation.use_question_for_graph_retrieval", True),
+        "n": OmegaConf.select(cfg, "node_generation.n") or 1,
+        "top_k_websearch": OmegaConf.select(cfg, "node_generation.top_k_websearch") or 5,
+        "top_k_entities": OmegaConf.select(cfg, "node_generation.top_k_entities") or 1,
+        "top_k_properties": OmegaConf.select(cfg, "node_generation.top_k_properties") or 1,
+        "n_hops": OmegaConf.select(cfg, "node_generation.n_hops") or 1,
+        "use_question_for_graph_retrieval": use_question_for_graph_retrieval,
     }

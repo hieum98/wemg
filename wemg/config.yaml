@@ -10,9 +10,9 @@ defaults:
 # =====================================================================
 llm:
   # Model settings
-  model_name: "gpt-4o-mini"  # Options: gpt-4o, gpt-4o-mini, claude-3-5-sonnet-20241022, etc.
-  url: "https://api.openai.com/v1"  # API endpoint URL
-  api_key: null  # Set via environment variable OPENAI_API_KEY or directly here
+  model_name: "Qwen3-Next-80B-A3B-Thinking-FP8"  # Options: gpt-4o, gpt-4o-mini, claude-3-5-sonnet-20241022, etc.
+  url: "http://n0999:4000/v1"  # API endpoint URL
+  api_key: null  # Set via environment variable API_KEY or directly here
   client_type: "openai"  # Client type: openai, anthropic, etc.
   
   # Concurrency and retry settings
@@ -21,11 +21,11 @@ llm:
   
   # Generation parameters
   generation:
-    timeout: 60
+    timeout: 300
     temperature: 0.7
     n: 1  # Number of samples to generate
     top_p: 0.8
-    max_tokens: 8192
+    max_tokens: 32768
     max_input_tokens: 65536
     top_k: 20
     enable_thinking: true  # Enable chain-of-thought reasoning
@@ -47,8 +47,8 @@ cache:
 # Retriever Configuration
 # =====================================================================
 retriever:
-  # Retriever type: "web_search", "corpus", or "hybrid"
-  type: "web_search"
+  # Retriever type: "web_search" or "corpus"
+  type: "corpus"
   
   # Web search settings
   web_search:
@@ -56,22 +56,22 @@ retriever:
     top_k: 5  # Number of web results to retrieve
     crawl_full_text: true  # Whether to crawl full text of web pages
   
-  # Corpus-based retriever settings (when type is "corpus" or "hybrid")
+  # Corpus-based retriever settings (when type is "corpus")
   corpus:
     embedder:
-      model_name: "text-embedding-3-small"
-      url: "https://api.openai.com/v1"
-      api_key: null  # Set via OPENAI_API_KEY
+      model_name: "Qwen3-Embedding-4B"
+      url: "http://n0999:4000/v1"
+      api_key: null  # Set via API_KEY
       embedder_type: "openai"
-    corpus_path: null  # Path to corpus dataset
-    index_path: null  # Path to FAISS index
+    corpus_path: Hieuman/wiki23-processed  # Path to corpus dataset
+    index_path: /home/hieum/uonlp/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss  # Path to FAISS index
 
 # =====================================================================
 # Search Strategy Configuration
 # =====================================================================
 search:
   # Strategy: "mcts" (Monte Carlo Tree Search) or "cot" (Chain-of-Thought)
-  strategy: "cot"
+  strategy: "mcts"
   
   # MCTS-specific settings
   mcts:
@@ -80,6 +80,15 @@ search:
     max_simulation_depth: 5  # Maximum depth for simulation rollouts
     exploration_weight: 1.0  # UCT exploration parameter
     is_cot_simulation: true  # Use CoT for simulation phase
+    use_golden_answer_for_reward: true  # Use golden answer for reward function
+    
+    # Early termination settings
+    early_termination:
+      enabled: true  # Enable early termination
+      min_iterations: 3  # Minimum iterations before termination
+      high_confidence_threshold: 0.9  # Reward threshold for immediate termination
+      convergence_patience: 3  # Iterations without improvement before termination
+      semantic_sufficiency_count: 4  # Number of "sufficient info" signals before termination
   
   # CoT-specific settings
   cot:
@@ -91,10 +100,10 @@ search:
 node_generation:
   n: 1  # Number of candidates to generate per node
   top_k_websearch: 5  # Top-k web search results
-  top_k_entities: 1  # Top-k entities from knowledge graph
-  top_k_properties: 1  # Top-k properties from knowledge graph
-  n_hops: 1  # Number of hops for graph exploration
-  use_question_for_graph_retrieval: true  # Use question for graph retrieval
+  top_k_entities: 3  # Top-k entities from knowledge graph
+  top_k_properties: 3  # Top-k properties from knowledge graph
+  n_hops: 3  # Number of hops for graph exploration
+  use_question_for_graph_retrieval: true  # Use question to generate graph retrieval queries
 
 # =====================================================================
 # Memory Configuration
@@ -102,13 +111,32 @@ node_generation:
 memory:
   # Working memory settings
   working_memory:
-    max_textual_memory_tokens: 8192  # Maximum tokens in textual memory
+    max_textual_memory_tokens: 16384  # Maximum tokens in textual memory
   
   # Interaction memory settings (logging)
   interaction_memory:
     enabled: false
     log_dir: "./logs"  # Directory for interaction logs
     save_to_file: false
+    
+    # Database settings
+    db_path: null  # Path to persistent ChromaDB database (null = in-memory)
+    collection_name: "interaction_memory"  # ChromaDB collection name, will be reset to a unique name for each question
+    
+    # Token budget and batching
+    token_budget: 8192  # Maximum tokens per log entry (prevents OOM)
+    batch_size: 32  # Batch size for logging entries (prevents OOM)
+    batch_size_async: 100  # Batch size for async logging
+    
+    # Embedding settings
+    is_local_embedding_api: false  # Use local embedding API instead of SentenceTransformer
+    embedding_model_name: "Qwen3-Embedding-4B"  # Embedding model name
+    embedding_base_url: "http://n0999:4000/v1"  # Embedding API base URL
+    embedding_api_key: null  # Embedding API key
+    
+    # Cache settings
+    enable_embedding_cache: true  # Enable embedding cache to avoid recomputation
+    cache_max_size: 10000  # Maximum size of embedding cache
 
 # =====================================================================
 # Logging Configuration
@@ -123,7 +151,13 @@ logging:
 output:
   include_reasoning: true  # Include reasoning trace in output
   include_concise_answer: true  # Include concise answer
+  show_search_tree: True  # Show search tree in output
   verbose: false  # Verbose output mode
+
+# =====================================================================
+# Runtime Parameters
+# =====================================================================
+question: null  # Question to answer (set via command line: question="Your question here")
 
 # =====================================================================
 # Hydra Configuration

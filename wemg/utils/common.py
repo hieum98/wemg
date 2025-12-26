@@ -28,13 +28,16 @@ def merge_logs(*logs: Dict[str, List[Tuple[str, str]]]) -> Dict[str, List[Tuple[
 
 def log_to_interaction_memory(
     interaction_memory: Any,
-    log_data: Dict[str, List[Tuple[str, str]]]
+    log_data: Dict[str, List[Tuple[str, str]]],
+    batch_size: int = 32
 ) -> None:
     """Log data to interaction memory if available.
     
     Args:
         interaction_memory: The interaction memory instance (or None).
         log_data: Dictionary of role -> list of (input, output) tuples.
+        batch_size: Number of entries to process per batch to avoid OOM (default: 100).
+                   Large batches are automatically split by log_turn.
     """
     if not interaction_memory or not log_data:
         return
@@ -45,6 +48,7 @@ def log_to_interaction_memory(
             interaction_memory.log_turn(
                 role=role,
                 user_input=list(inputs),
-                assistant_output=list(outputs)
+                assistant_output=list(outputs),
+                batch_size=batch_size
             )
 

@@ -6,3 +6,7 @@ draft.py
 memory_db
 tmp
 retriever_corpora
+outputs/
+TEST_MARKERS_GUIDE.md
+MCTS_PROFILING_ANALYSIS.md
+.env

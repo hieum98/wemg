@@ -11,7 +11,7 @@ from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.retriever_agent import RetrieverAgent
 from wemg.agents.tools import web_search
 from wemg.runners.base_reasoning_node import BaseReasoningNode, NodeType, NodeState
-from wemg.runners.procedures.node_generator import NodeGenerator
+from wemg.runners.procedures.node_generator import NodeGenerator, GenerationResult
 from wemg.runners.working_memory import WorkingMemory
 from wemg.runners.interaction_memory import InteractionMemory
 from wemg.utils.common import merge_logs, log_to_interaction_memory
@@ -28,11 +28,11 @@ class CoTReasoningNode(BaseReasoningNode):
         self,
         node_state: NodeState,
         parent: Optional['CoTReasoningNode'] = None,
-        children: Optional[List['CoTReasoningNode']] = None,
+        children: Optional[Tuple['CoTReasoningNode']] = None,
         max_depth: int = 10,
     ):
         super().__init__(node_state=node_state, parent=parent, children=children, max_depth=max_depth)
-        self.children: List["CoTReasoningNode"]
+        self.children: Tuple["CoTReasoningNode"]
         self.parent: Optional["CoTReasoningNode"]
 
     def generate_children(self) -> List["CoTReasoningNode"]:
@@ -61,20 +61,40 @@ class CoTReasoningNode(BaseReasoningNode):
         )
         
         if self.depth > self.max_depth:
-            return asyncio.run(self._generate_final_answer(generator))
+            node, result = asyncio.run(self._generate_final_answer(generator))
+            if node:
+                # Update working memory after generation
+                generator.update_working_memory(result)
+                node.parent = self
+                self._add_child_to_memory(node, working_memory)
+                log_to_interaction_memory(interaction_memory, result.log_data)
+            return node
         
-        return asyncio.run(self._generate_subqa(generator))
+        node, result = asyncio.run(self._generate_subqa(generator))
+        if node:
+            # Update working memory after generation
+            generator.update_working_memory(result)
+            node.parent = self
+            self._add_child_to_memory(node, working_memory)
+            log_to_interaction_memory(interaction_memory, result.log_data)
+        return node
     
     async def _generate_final_answer(
         self, 
         generator: NodeGenerator
-    ) -> Optional["CoTReasoningNode"]:
+    ) -> Tuple[Optional["CoTReasoningNode"], GenerationResult]:
         """Generate final answer node."""
-        result = await generator.generate_answer(self.user_question)
-        generator.update_working_memory(result)
+        if self.depth < 2:
+            # Explore external resources for the first two levels
+            should_explore = True
+        else:
+            # Use only what's saved in working memory
+            should_explore = False
+        
+        result: GenerationResult = await generator.generate_answer(self.user_question, should_explore=should_explore)
         
         if not result.answers:
-            return None
+            return None, result
         
         answer = result.answers[0]
         state = NodeState(
@@ -88,33 +108,35 @@ class CoTReasoningNode(BaseReasoningNode):
         )
         
         node = CoTReasoningNode(node_state=state, max_depth=self.max_depth)
-        node.parent = self
-        
-        log_to_interaction_memory(generator.interaction_memory, result.log_data)
-        return node
+        return node, result
 
     async def _generate_subqa(
         self, 
         generator: NodeGenerator
-    ) -> Optional["CoTReasoningNode"]:
-        """Generate sub-question/answer node."""
+    ) -> Tuple[Optional["CoTReasoningNode"], GenerationResult]:
+        """Generate sub-question/answer node.
+        
+        Returns:
+            Tuple of (node, GenerationResult). Node is None if no answer generated.
+        """
         # Generate subquestion
         subquestion, should_direct_answer, subq_log = await generator.generate_subquestion(
             self.user_question
         )
         
-        log_to_interaction_memory(generator.interaction_memory, subq_log)
-        
         # Check if we should generate final answer instead
         if should_direct_answer or not subquestion:
-            return await self._generate_final_answer(generator)
+            node, result = await self._generate_final_answer(generator)
+            # Merge subquestion log with answer log
+            merged_log = merge_logs(subq_log, result.log_data)
+            result.log_data = merged_log
+            return node, result
         
         # Generate answer for subquestion
-        result = await generator.generate_answer(subquestion)
-        generator.update_working_memory(result)
+        result: GenerationResult = await generator.generate_answer(subquestion, should_explore=True)
         
         if not result.answers:
-            return None
+            return None, result
         
         answer = result.answers[0]
         # Create subqa node
@@ -124,20 +146,31 @@ class CoTReasoningNode(BaseReasoningNode):
                 'user_question': self.user_question,
                 'sub_question': subquestion,
                 'sub_answer': answer.answer,
+                'reasoning': answer.reasoning,
             }
         )
         
         node = CoTReasoningNode(node_state=state, max_depth=self.max_depth)
-        node.parent = self
         
-        # Add to textual memory
-        generator.working_memory.add_textual_memory(
-            f"Q: {subquestion}; A: {answer.answer}",
-            source=roles.extractor.SourceType.SYSTEM_PREDICTION
-        )
+        # Merge subquestion log with answer log
+        merged_log = merge_logs(subq_log, result.log_data)
+        result.log_data = merged_log
         
-        log_to_interaction_memory(generator.interaction_memory, result.log_data)
-        return node
+        return node, result
+    
+    def _add_child_to_memory(self, child: "CoTReasoningNode", working_memory: WorkingMemory) -> None:
+        """Add child node content to working memory."""
+        content = child.node_state.content
+        source = roles.extractor.SourceType.SYSTEM_PREDICTION
+        
+        if child.node_type == NodeType.SUB_QA_NODE:
+            sub_q, sub_a = content.get('sub_question', ''), content.get('sub_answer', '')
+            if sub_q and sub_a:
+                working_memory.add_textual_memory(f"Q: {sub_q}; A: {sub_a}", source=source)
+        elif child.node_type == NodeType.SYNTHESIS_NODE:
+            synthesis = content.get('synthesized_reasoning', '')
+            if synthesis:
+                working_memory.add_textual_memory(synthesis, source=source)
 
 
 def cot_search(
@@ -149,22 +182,7 @@ def cot_search(
     max_depth: int = 10,
     **kwargs
 ) -> Tuple[Optional[Dict], List[CoTReasoningNode]]:
-    """Perform Chain-of-Thought reasoning.
-    
-    Sequentially generates subqa nodes until reaching a final answer.
-    
-    Args:
-        question: The user's question
-        llm_agent: Language model agent
-        retriever_agent: Retriever for external knowledge
-        working_memory: Working memory (updated in place)
-        interaction_memory: Optional logging memory
-        max_depth: Maximum reasoning depth
-        **kwargs: Additional generation arguments
-        
-    Returns:
-        Tuple of (terminal node content, reasoning path)
-    """
+    """Perform Chain-of-Thought reasoning."""
     # Create root node
     root_state = NodeState(
         node_type=NodeType.USER_QUESTION, 
@@ -201,15 +219,7 @@ def cot_get_answer(
     terminal_content: Optional[Dict],
     reasoning_path: List[CoTReasoningNode]
 ) -> Tuple[str, str]:
-    """Extract the final answer from CoT reasoning result.
-    
-    Args:
-        terminal_content: Terminal node content from cot_search
-        reasoning_path: Reasoning path from cot_search
-        
-    Returns:
-        Tuple of (full_answer, concise_answer)
-    """
+    """Extract the final answer from CoT reasoning result."""
     if terminal_content is None:
         # Build answer from reasoning path
         steps = []
@@ -227,4 +237,5 @@ def cot_get_answer(
     
     full_answer = terminal_content.get('final_answer', 'No answer')
     concise_answer = terminal_content.get('concise_answer', full_answer)
-    return full_answer, concise_answer
+    reasoning = terminal_content.get('reasoning', '')
+    return f"Final Answer: {full_answer}\nReasoning: {reasoning}", concise_answer

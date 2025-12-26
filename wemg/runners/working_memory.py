@@ -34,7 +34,7 @@ class WorkingMemory:
         textual_memory: Optional[List[str]] = None,
         graph_memory: Optional[nx.DiGraph] = None,
         parsed_graph_memory: Optional[nx.DiGraph] = None,
-        max_textual_memory_tokens: int = 8192,
+        max_textual_memory_tokens: int = 16384,
     ):
         self.textual_memory: List[str] = textual_memory or []
         self.graph_memory: nx.DiGraph = graph_memory or nx.DiGraph()
@@ -321,9 +321,9 @@ class WorkingMemory:
         to_verify_triples: List[wikidata.WikiTriple] = []
         to_connect_triples: List[wikidata.WikiTriple] = []
         for triple in triples:
-            subject = self.entity_dict[triple.subject]
-            relation = self.property_dict[triple.relation]
-            object = self.entity_dict[triple.object]
+            subject = self.entity_dict.get(triple.subject, None)
+            relation = self.property_dict.get(triple.relation, None)
+            object = self.entity_dict.get(triple.object, None)
             if subject and object and isinstance(subject, wikidata.WikidataEntity) and isinstance(object, wikidata.WikidataEntity):
                 if relation:
                     wiki_triple = wikidata.WikiTriple(
@@ -335,7 +335,7 @@ class WorkingMemory:
                 else:
                     wiki_triple = wikidata.WikiTriple(
                         subject=subject,
-                        relation=None,
+                        relation=wikidata.WikidataProperty(pid="", label=None, description=None),
                         object=object
                     )
                     to_connect_triples.append(wiki_triple)
@@ -495,7 +495,8 @@ class WorkingMemory:
         interaction_memory: Optional[InteractionMemory] = None
     ) -> None:
         """Synchronize graph and textual memory bidirectionally."""
-        # Consolidate graph memory
+        # Consolidate memory
+        self.consolidate_textual_memory(llm_agent, question, interaction_memory)
         self.consolidate_graph_memory(llm_agent, question, interaction_memory)
 
         # Sync textual → graph
@@ -511,5 +512,5 @@ class WorkingMemory:
                 for triple in triples:
                     self.add_textual_memory(triple, source=roles.extractor.SourceType.RETRIEVAL)
         
-        # Consolidate textual memory
+        # Consolidate textual memory after synchronization
         self.consolidate_textual_memory(llm_agent, question, interaction_memory)

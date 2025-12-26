@@ -6,7 +6,9 @@ exploring multiple reasoning paths to find the best answer.
 import asyncio
 import math
 import random
-from typing import Dict, List, Optional, Tuple, Union
+import logging
+import os
+from typing import Dict, List, Optional, Set, Tuple, Union
 from typing_extensions import TypedDict
 
 from wemg.agents import roles
@@ -20,6 +22,9 @@ from wemg.runners.working_memory import WorkingMemory
 from wemg.runners.interaction_memory import InteractionMemory
 from wemg.utils.common import merge_logs, log_to_interaction_memory
 
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
+
 
 class MCTSReasoningNode(BaseReasoningNode):
     """Reasoning node with MCTS-specific functionality (UCT, backpropagation)."""
@@ -28,11 +33,11 @@ class MCTSReasoningNode(BaseReasoningNode):
         self,
         node_state: NodeState,
         parent: Optional['MCTSReasoningNode'] = None,
-        children: Optional[List['MCTSReasoningNode']] = None,
+        children: Optional[Tuple['MCTSReasoningNode']] = None,
         max_depth: int = 10,
     ):
         super().__init__(node_state=node_state, parent=parent, children=children, max_depth=max_depth)
-        self.children: List["MCTSReasoningNode"]
+        self.children: Tuple["MCTSReasoningNode"]
         self.parent: Optional["MCTSReasoningNode"]
         self.value: float = 0.0
         self.visits: int = 0
@@ -42,7 +47,7 @@ class MCTSReasoningNode(BaseReasoningNode):
         if self.parent is None:
             raise ValueError("Cannot obtain UCT from root node")
         if self.visits == 0:
-            return self.value
+            return float('inf') # unvisited nodes should be prioritized
         
         average_reward = self.value / self.visits
         exploration_term = math.sqrt(math.log(self.parent.visits) / self.visits)
@@ -64,7 +69,7 @@ class MCTSReasoningNode(BaseReasoningNode):
         interaction_memory: Optional[InteractionMemory] = None,
         is_cot_simulation: bool = False,
         **kwargs
-    ) -> List["MCTSReasoningNode"]:
+    ) -> Tuple[List["MCTSReasoningNode"], bool]:
         """Generate children nodes and update working memory."""
         generator = NodeGenerator(
             llm_agent=llm_agent,
@@ -76,16 +81,30 @@ class MCTSReasoningNode(BaseReasoningNode):
         
         # Determine which generation methods to run based on node type and state
         if self.depth > self.max_depth:
-            return asyncio.run(self._generate_final_answer_nodes(generator))
+            nodes, result, _ = asyncio.run(self._generate_final_answer_nodes(generator))
+            generator.update_working_memory(result)
+            # Link children and update memory
+            for child in nodes:
+                child.parent = self
+                self._add_child_to_memory(child, working_memory)
+            log_to_interaction_memory(interaction_memory, result.log_data)
+            return nodes, False  # Depth limit, not semantic sufficiency
         
         if is_cot_simulation:
-            return asyncio.run(self._generate_subqa_nodes(generator))
+            nodes, result, has_signal = asyncio.run(self._generate_subqa_nodes(generator))
+            generator.update_working_memory(result)
+            # Link children and update memory
+            for child in nodes:
+                child.parent = self
+                self._add_child_to_memory(child, working_memory)
+            log_to_interaction_memory(interaction_memory, result.log_data)
+            return nodes, has_signal
         
         # Map node types to generation strategies
         strategies = {
             NodeType.USER_QUESTION: [self._generate_final_answer_nodes, self._generate_subqa_nodes],
-            NodeType.SUB_QA_NODE: [self._rephrase_nodes, self._generate_subqa_nodes, 
-                                   self._self_correct_nodes, self._strengthen_nodes],
+            NodeType.SUB_QA_NODE: [self._generate_subqa_nodes, self._self_correct_nodes, 
+                                   self._rephrase_nodes, self._strengthen_nodes],
             NodeType.REPHRASED_QUESTION_NODE: [self._generate_subqa_nodes],
             NodeType.SELF_CORRECTED_NODE: [self._generate_subqa_nodes, self._strengthen_nodes],
             NodeType.SYNTHESIS_NODE: [self._generate_subqa_nodes],
@@ -94,15 +113,22 @@ class MCTSReasoningNode(BaseReasoningNode):
         generators = strategies.get(self.node_type, [])
         if not generators:
             raise ValueError(f"Unsupported node type: {self.node_type}")
-        
-        # Run all applicable generators concurrently
         results = asyncio.run(asyncio.gather(*[gen(generator) for gen in generators]))
         
         all_nodes = []
-        all_logs = {}
-        for nodes, log in results:
+        generation_results = []
+        all_logs = []
+        has_semantic_signal = False
+        for nodes, result, has_signal in results:
             all_nodes.extend(nodes)
-            all_logs = merge_logs(all_logs, log)
+            generation_results.append(result)
+            all_logs.append(result.log_data)
+            if has_signal:
+                has_semantic_signal = True
+        # merge_logs accepts *args, so unpack the list
+        all_logs = merge_logs(*all_logs) if all_logs else {}
+        for result in generation_results:
+            generator.update_working_memory(result)
         
         # Link children and update memory
         for child in all_nodes:
@@ -110,24 +136,20 @@ class MCTSReasoningNode(BaseReasoningNode):
             self._add_child_to_memory(child, working_memory)
         
         log_to_interaction_memory(interaction_memory, all_logs)
-        return all_nodes
-
-    async def _generate_answer_with_result(
-        self, 
-        generator: NodeGenerator, 
-        question: str
-    ) -> Tuple[GenerationResult, Dict]:
-        """Generate answer and update working memory."""
-        result = await generator.generate_answer(question)
-        generator.update_working_memory(result)
-        return result
+        return all_nodes, has_semantic_signal
 
     async def _generate_final_answer_nodes(
         self, 
         generator: NodeGenerator
-    ) -> Tuple[List["MCTSReasoningNode"], Dict]:
+    ) -> Tuple[List["MCTSReasoningNode"], GenerationResult, bool]:
         """Generate final answer node(s)."""
-        result = await self._generate_answer_with_result(generator, self.user_question)
+        if self.depth < 2:
+            # Explore the external resources for the first two levels (very first level of the tree)
+            should_explore = True 
+        else:
+            # Do not explore the external resources, only use which saved in the working memory
+            should_explore = False
+        result: GenerationResult = await generator.generate_answer(self.user_question, should_explore=should_explore)
         
         nodes = []
         for answer in result.answers:
@@ -142,27 +164,31 @@ class MCTSReasoningNode(BaseReasoningNode):
             )
             nodes.append(MCTSReasoningNode(node_state=state, max_depth=self.max_depth))
         
-        return nodes, result.log_data
+        return nodes, result, False  # Not a semantic sufficiency signal
 
     async def _generate_subqa_nodes(
         self, 
         generator: NodeGenerator
-    ) -> Tuple[List["MCTSReasoningNode"], Dict]:
+    ) -> Tuple[List["MCTSReasoningNode"], GenerationResult, bool]:
         """Generate sub-question/answer nodes."""
         # Get question (may be rephrased)
         if self.node_type == NodeType.REPHRASED_QUESTION_NODE:
             subquestion = self.node_state.content['sub_question']
             subq_log = {}
+            should_direct_answer = False
         else:
             subquestion, should_direct_answer, subq_log = await generator.generate_subquestion(
                 self.user_question
             )
             if should_direct_answer or not subquestion:
-                nodes, answer_log = await self._generate_final_answer_nodes(generator)
-                return nodes, merge_logs(subq_log, answer_log)
+                nodes, result, _ = await self._generate_final_answer_nodes(generator)
+                # Merge subquestion log with answer log
+                merged_log = merge_logs(subq_log, result.log_data)
+                result.log_data = merged_log
+                return nodes, result, True
         
         # Generate answer for subquestion
-        result = await self._generate_answer_with_result(generator, subquestion)
+        result = await generator.generate_answer(subquestion, should_explore=True)
         
         nodes = []
         for answer in result.answers:
@@ -172,16 +198,20 @@ class MCTSReasoningNode(BaseReasoningNode):
                     'user_question': self.user_question,
                     'sub_question': subquestion,
                     'sub_answer': answer.answer,
+                    'reasoning': answer.reasoning,
                 }
             )
             nodes.append(MCTSReasoningNode(node_state=state, max_depth=self.max_depth))
         
-        return nodes, merge_logs(subq_log, result.log_data)
+        log = merge_logs(subq_log, result.log_data)
+        result.log_data = log
+        
+        return nodes, result, False  # No semantic sufficiency signal when generating sub-QA
 
     async def _rephrase_nodes(
         self, 
         generator: NodeGenerator
-    ) -> Tuple[List["MCTSReasoningNode"], Dict]:
+    ) -> Tuple[List["MCTSReasoningNode"], GenerationResult, bool]:
         """Generate rephrased question nodes."""
         question = (self.node_state.content['sub_question'] 
                    if self.node_type == NodeType.SUB_QA_NODE 
@@ -197,21 +227,22 @@ class MCTSReasoningNode(BaseReasoningNode):
             )
             nodes.append(MCTSReasoningNode(node_state=state, max_depth=self.max_depth))
         
-        return nodes, log
+        result = GenerationResult(log_data=log)
+        return nodes, result, False  # Not a semantic sufficiency signal
 
     async def _self_correct_nodes(
         self, 
         generator: NodeGenerator
-    ) -> Tuple[List["MCTSReasoningNode"], Dict]:
+    ) -> Tuple[List["MCTSReasoningNode"], GenerationResult, bool]:
         """Generate self-corrected answer nodes."""
         sub_q = self.node_state.content.get('sub_question')
         sub_a = self.node_state.content.get('sub_answer')
         
         if not sub_q or not sub_a:
-            return [], {}
+            logger.warning("No sub-question or sub-answer found for self-correction(sub_q, sub_a)")
+            return [], GenerationResult(), False
         
         result = await generator.generate_self_correction(sub_q, sub_a)
-        generator.update_working_memory(result)
         
         nodes = []
         for correction in result.answers:
@@ -225,17 +256,18 @@ class MCTSReasoningNode(BaseReasoningNode):
             )
             nodes.append(MCTSReasoningNode(node_state=state, max_depth=self.max_depth))
         
-        return nodes, result.log_data
+        return nodes, result, False  # Not a semantic sufficiency signal
 
     async def _strengthen_nodes(
         self, 
         generator: NodeGenerator
-    ) -> Tuple[List["MCTSReasoningNode"], Dict]:
+    ) -> Tuple[List["MCTSReasoningNode"], GenerationResult, bool]:
         """Generate reasoning synthesis nodes."""
-        outputs, log = await generator.generate_synthesis(self.user_question)
+        result = await generator.generate_synthesis(self.user_question)
         
         nodes = []
-        for output in outputs:
+        has_semantic_signal = False
+        for output in result.answers:
             if output.is_answerable:
                 state = NodeState(
                     node_type=NodeType.FINAL_ANSWER,
@@ -244,6 +276,7 @@ class MCTSReasoningNode(BaseReasoningNode):
                         "final_answer": output.step_conclusion,
                     }
                 )
+                has_semantic_signal = True  # is_answerable=True indicates semantic sufficiency
             else:
                 state = NodeState(
                     node_type=NodeType.SYNTHESIS_NODE,
@@ -254,7 +287,7 @@ class MCTSReasoningNode(BaseReasoningNode):
                 )
             nodes.append(MCTSReasoningNode(node_state=state, max_depth=self.max_depth))
         
-        return nodes, log
+        return nodes, result, has_semantic_signal
 
     def _add_child_to_memory(self, child: "MCTSReasoningNode", working_memory: WorkingMemory) -> None:
         """Add child node content to working memory."""
@@ -281,11 +314,14 @@ class MCTSReasoningNode(BaseReasoningNode):
 
 class MCTSSearchTree(TypedDict):
     root: MCTSReasoningNode
-    explored_nodes: set
 
 
 def select(tree: MCTSSearchTree, exploration_weight: float = 1.0) -> List[MCTSReasoningNode]:
-    """Select a path from root to leaf using UCT algorithm."""
+    """Select a path from root to leaf using UCT algorithm.
+    
+    Pure UCT implementation: unvisited nodes automatically get infinity UCT,
+    so they are always prioritized. No need for explicit unexplored tracking.
+    """
     path = []
     node = tree['root']
     
@@ -294,16 +330,9 @@ def select(tree: MCTSSearchTree, exploration_weight: float = 1.0) -> List[MCTSRe
             path.append(node)
             return path
         
-        # Check for unexplored children
-        unexplored = [c for c in node.children if c not in tree['explored_nodes']]
-        if unexplored:
-            path.append(random.choice(unexplored))
-            return path
-        
-        # All children explored - select by UCT
+        path.append(node)
         uct_scores = [c.upper_confidence_bound(exploration_weight) for c in node.children]
         node = node.children[uct_scores.index(max(uct_scores))]
-        path.append(node)
 
 
 def expand(
@@ -315,13 +344,12 @@ def expand(
     interaction_memory: Optional[InteractionMemory] = None,
     is_cot_simulation: bool = False,
     **kwargs
-) -> List[MCTSReasoningNode]:
+) -> Tuple[List[MCTSReasoningNode], bool]:
     """Expand tree by generating children for selected node."""
     if selected_node.is_terminal():
-        tree['explored_nodes'].add(selected_node)
-        return []
+        return [], False
     
-    children = selected_node.generate_children(
+    children, has_semantic_signal = selected_node.generate_children(
         llm_agent=llm_agent,
         retriever_agent=retriever_agent,
         working_memory=working_memory,
@@ -330,8 +358,7 @@ def expand(
         **kwargs
     )
     
-    tree['explored_nodes'].add(selected_node)
-    return children
+    return children, has_semantic_signal
 
 
 def simulate(
@@ -343,7 +370,7 @@ def simulate(
     is_cot_simulation: bool = True,
     max_simulation_depth: int = 5,
     **kwargs
-) -> MCTSReasoningNode:
+) -> Tuple[MCTSReasoningNode, bool]:
     """Simulate a rollout from node to terminal state."""
     current = node
     
@@ -351,7 +378,7 @@ def simulate(
         if current.is_terminal():
             break
         
-        children = current.generate_children(
+        children, has_semantic_signal = current.generate_children(
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
             working_memory=working_memory,
@@ -365,7 +392,7 @@ def simulate(
         
         current = random.choice(children)
     
-    return current
+    return current, has_semantic_signal
 
 
 async def evaluate(
@@ -376,7 +403,7 @@ async def evaluate(
 ) -> float:
     """Evaluate terminal node and return reward score (0-1)."""
     if node.node_type != NodeType.FINAL_ANSWER:
-        return 0.1
+        return 0.1 # not a final answer node, return a low reward
     
     eval_input = roles.evaluator.AnswerEvaluationInput(
         user_question=node.user_question,
@@ -394,7 +421,7 @@ async def evaluate(
     
     if eval_results:
         return eval_results[0].rating / 10.0
-    return 0.5
+    return 0.5 # neutral reward for non-final answer nodes
 
 
 def mcts_search(
@@ -409,56 +436,106 @@ def mcts_search(
     max_tree_depth: int = 10,
     max_simulation_depth: int = 5,
     golden_answer: Optional[str] = None,
+    early_termination_enabled: bool = True,
+    min_iterations: int = 3,
+    high_confidence_threshold: float = 0.9,
+    convergence_patience: int = 3,
+    semantic_sufficiency_count: int = 2,
     **kwargs
 ) -> Tuple[Dict, MCTSSearchTree]:
-    """Run MCTS to find the best reasoning path.
-    
-    Returns:
-        Tuple of (best terminal node content, search tree)
-    """
+    """Run MCTS to find the best reasoning path."""
     # Initialize tree
     root_state = NodeState(node_type=NodeType.USER_QUESTION, content={'user_question': question})
     root = MCTSReasoningNode(node_state=root_state, max_depth=max_tree_depth)
-    tree: MCTSSearchTree = {'root': root, 'explored_nodes': set()}
+    tree: MCTSSearchTree = {'root': root}
     
     best_node: Optional[MCTSReasoningNode] = None
     best_reward = -float('inf')
     
-    for _ in range(num_iterations):
+    # Early termination tracking
+    semantic_sufficiency_signals = 0  # Count of semantic sufficiency signals
+    no_improvement_count = 0  # Consecutive iterations without improvement
+    termination_reason = None
+    
+    for iteration in range(num_iterations):
         # Selection
         path = select(tree, exploration_weight)
         selected = path[-1]
         
         # Expansion
+        children = []
+        has_semantic_signal = False
         if not selected.is_terminal():
-            children = expand(
+            children, has_semantic_signal = expand(
                 tree, selected, llm_agent, retriever_agent, working_memory,
                 interaction_memory, is_cot_simulation=False, **kwargs
             )
             if children:
-                selected = random.choice(children)
+                selected = children[0] # More deterministic to select the first child
+                
+                # Track semantic sufficiency signals: when should_direct_answer=True or is_answerable=True
+                if has_semantic_signal:
+                    semantic_sufficiency_signals += 1
+                    logger.debug(f"Iteration {iteration + 1}: Semantic sufficiency signal detected "
+                               f"(should_direct_answer=True or is_answerable=True). Count: {semantic_sufficiency_signals}")
         
         # Simulation
         if not selected.is_terminal():
-            terminal = simulate(
+            terminal, has_semantic_signal = simulate(
                 selected, llm_agent, retriever_agent, working_memory,
                 interaction_memory, is_cot_simulation, max_simulation_depth, **kwargs
             )
+            if has_semantic_signal:
+                semantic_sufficiency_signals += 1
+                logger.debug(f"Iteration {iteration + 1}: Semantic sufficiency signal detected "
+                           f"(should_direct_answer=True or is_answerable=True). Count: {semantic_sufficiency_signals}")
         else:
             terminal = selected
         
         # Evaluation and backpropagation
         reward = asyncio.run(evaluate(terminal, llm_agent, interaction_memory, golden_answer))
-        for node in path:
-            node.backpropagate(reward)
+        terminal.backpropagate(reward)
         
         # Sync working memory
         working_memory.synchronize_memory(llm_agent, question, interaction_memory)
         
-        # Track best
-        if terminal.is_terminal() and reward > best_reward:
-            best_reward = reward
-            best_node = terminal
+        # Track best and convergence
+        if terminal.is_terminal():
+            if reward > best_reward:
+                best_reward = reward
+                best_node = terminal
+                no_improvement_count = 0  # Reset counter when we find a better answer
+            else:
+                no_improvement_count += 1  # Only count iterations where we evaluated terminal nodes
+        # Note: We don't increment no_improvement_count for non-terminal nodes
+        # since we can't meaningfully compare their rewards
+        
+        # Early termination checks (only after minimum iterations)
+        if early_termination_enabled and iteration + 1 >= min_iterations:
+            # Check high confidence threshold
+            if reward >= high_confidence_threshold and terminal.is_terminal():
+                termination_reason = f"High confidence answer found (reward={reward:.3f} >= {high_confidence_threshold})"
+                logger.info(f"MCTS early termination at iteration {iteration + 1}: {termination_reason}")
+                break
+            
+            # Check semantic sufficiency
+            if semantic_sufficiency_signals >= semantic_sufficiency_count:
+                termination_reason = (f"Semantic sufficiency signals reached threshold "
+                                   f"({semantic_sufficiency_signals} >= {semantic_sufficiency_count})")
+                logger.info(f"MCTS early termination at iteration {iteration + 1}: {termination_reason}")
+                break
+            
+            # Check convergence
+            if no_improvement_count >= convergence_patience:
+                termination_reason = (f"No improvement for {no_improvement_count} consecutive iterations "
+                                    f"(patience={convergence_patience})")
+                logger.info(f"MCTS early termination at iteration {iteration + 1}: {termination_reason}")
+                break
+    
+    if termination_reason:
+        logger.info(f"MCTS completed in {iteration + 1} iterations (out of {num_iterations}): {termination_reason}")
+    else:
+        logger.debug(f"MCTS completed all {num_iterations} iterations")
     
     return (best_node.node_state.content if best_node else {}), tree
 
@@ -484,7 +561,11 @@ def get_answer(
         return "No final answer found.", "No answer"
     
     # Gather all answers
-    answers = [n.node_state.content.get('final_answer', '') for n in terminals if n.node_state.content.get('final_answer')]
+    answers: List[str] = []
+    concise_answers: List[str] = []
+    for node in terminals:
+        answers.append(str(node.node_state))
+        concise_answers.append(node.node_state.content.get('final_answer', ''))
     
     if not answers:
         return "No final answer found.", "No answer"
@@ -503,10 +584,11 @@ def get_answer(
             n=1
         ))
         if results:
+            result: roles.evaluator.FinalAnswerSynthesisOutput = results[0]
             log_to_interaction_memory(interaction_memory, log)
-            return results[0].final_answer, results[0].concise_answer
-    except Exception:
-        pass
+            return f"Final Answer: {result.final_answer}\nReasoning: {result.reasoning}", result.concise_answer
+    except Exception as e:
+        logger.warning(f"Failed to synthesize final answer: {e}")
     
     # Fallback: majority vote
     vote_input = roles.evaluator.MajorityVoteInput(
@@ -523,6 +605,7 @@ def get_answer(
     
     if results:
         log_to_interaction_memory(interaction_memory, log)
-        return results[0].final_answer, results[0].concise_answer
+        result: roles.evaluator.MajorityVoteOutput = results[0]
+        return f"Final Answer: {result.final_answer}\nReasoning: {result.reasoning}", result.concise_answer
     
     return "Unable to determine final answer.", "Unable to determine"

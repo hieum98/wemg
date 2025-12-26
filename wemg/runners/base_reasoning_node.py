@@ -5,9 +5,26 @@ used in both MCTS and CoT reasoning strategies.
 """
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import pydantic
-from anytree import NodeMixin
+from anytree import NodeMixin, RenderTree
+
+try:
+    from colorama import Fore, Style, init
+    init(autoreset=True)
+    COLORAMA_AVAILABLE = True
+except ImportError:
+    # Fallback if colorama is not available
+    class Fore:
+        GREEN = ""
+        YELLOW = ""
+        BLUE = ""
+        MAGENTA = ""
+        CYAN = ""
+        RED = ""
+    class Style:
+        RESET_ALL = ""
+    COLORAMA_AVAILABLE = False
 
 
 class NodeType(Enum):
@@ -57,7 +74,8 @@ class NodeState(pydantic.BaseModel):
             NodeType.SUB_QA_NODE: lambda: f"Sub Question: {c['sub_question']}\nSub Answer: {c['sub_answer']}" +
                 (f"\nReasoning: {c['reasoning']}" if 'reasoning' in c else ""),
             NodeType.REPHRASED_QUESTION_NODE: lambda: f"Rephrased Question: {c['sub_question']}",
-            NodeType.SELF_CORRECTED_NODE: lambda: f"Sub Question: {c['sub_question']}\nSub Answer: {c['sub_answer']}",
+            NodeType.SELF_CORRECTED_NODE: lambda: f"Sub Question: {c['sub_question']}\nSub Answer: {c['sub_answer']}" +
+                (f"\nReasoning: {c['reasoning']}" if 'reasoning' in c else ""),
             NodeType.SYNTHESIS_NODE: lambda: c['synthesized_reasoning'],
             NodeType.USER_QUESTION: lambda: f"User Question: {c['user_question']}",
         }
@@ -85,14 +103,14 @@ class BaseReasoningNode(ABC, NodeMixin):
         self, 
         node_state: NodeState,
         parent: Optional['BaseReasoningNode'] = None,
-        children: Optional[List['BaseReasoningNode']] = None,
+        children: Optional[Tuple['BaseReasoningNode']] = None,
         max_depth: int = 10,
     ):
         self.node_state = node_state
         self.node_type = node_state.node_type
         self.parent: Optional['BaseReasoningNode'] = parent
         if children:
-            self.children: List['BaseReasoningNode'] = children
+            self.children: Tuple['BaseReasoningNode'] = children
         
         content = node_state.content
         self.user_question = content['user_question']
@@ -145,6 +163,65 @@ class BaseReasoningNode(ABC, NodeMixin):
     def is_root(self) -> bool:
         """Check if this is the root node."""
         return self.parent is None
+    
+    def print_tree(self) -> None:
+        """Print a visual representation of the tree starting from this node.
+        
+        This method visualizes the reasoning tree structure with color-coded
+        node types and formatted content. Works with anytree's RenderTree
+        to display the hierarchical structure.
+        """
+        for pre, _, node in RenderTree(self):
+            node: BaseReasoningNode
+            node_data = node.node_state.content
+            node_id = f"{id(node)}-{node.node_type.value}"
+            
+            if node.node_type is NodeType.USER_QUESTION:
+                gt = node_data.get('golden_answer', 'N/A')
+                user_question = node_data['user_question'].replace('\n', ' ').replace('\r', ' ')
+                node_details = f"User: {user_question} - Ground truth: {gt}"
+                node_details = f"{Fore.GREEN}{node_id}{Style.RESET_ALL} {node_details}"
+            elif node.node_type is NodeType.REPHRASED_QUESTION_NODE:
+                rephased_question = node_data.get('sub_question', '').replace('\n', ' ').replace('\r', ' ')
+                node_details = f"Rephase: {rephased_question}"
+                node_details = f"{Fore.YELLOW}{node_id}{Style.RESET_ALL} {node_details}"
+            elif node.node_type is NodeType.FINAL_ANSWER:
+                final_answer = node_data.get('final_answer', '').replace('\n', ' ').replace('\r', ' ')
+                reasoning = node_data.get('reasoning', '')
+                if reasoning:
+                    reasoning = reasoning.replace('\n', ' ').replace('\r', ' ')
+                    node_details = f"Final: {final_answer} - Reasoning: {reasoning}"
+                else:
+                    node_details = f"Final: {final_answer}"
+                node_details = f"{Fore.BLUE}{node_id}{Style.RESET_ALL} {node_details}"
+            elif node.node_type is NodeType.SELF_CORRECTED_NODE:
+                corrected_answer = node_data.get('sub_answer', '').replace('\n', ' ').replace('\r', ' ')
+                reasoning = node_data.get('reasoning', '')
+                if reasoning:
+                    reasoning = reasoning.replace('\n', ' ').replace('\r', ' ')
+                    node_details = f"Self_corrected: {corrected_answer} - Reasoning: {reasoning}"
+                else:
+                    node_details = f"Self_corrected: {corrected_answer}"
+                node_details = f"{Fore.MAGENTA}{node_id}{Style.RESET_ALL} {node_details}"
+            elif node.node_type is NodeType.SUB_QA_NODE:
+                sub_question = node_data.get('sub_question', '').replace('\n', ' ').replace('\r', ' ')
+                sub_answer = node_data.get('sub_answer', '').replace('\n', ' ').replace('\r', ' ')
+                reasoning = node_data.get('reasoning', '')
+                if reasoning:
+                    reasoning = reasoning.replace('\n', ' ').replace('\r', ' ')
+                    node_details = f"Sub_Q: {sub_question} - Sub_A: {sub_answer} - Reasoning: {reasoning}"
+                else:
+                    node_details = f"Sub_Q: {sub_question} - Sub_A: {sub_answer}"
+                node_details = f"{Fore.CYAN}{node_id}{Style.RESET_ALL} {node_details}"
+            elif node.node_type is NodeType.SYNTHESIS_NODE:
+                synthesis_reasoning = node_data.get('synthesized_reasoning', '').replace('\n', ' ').replace('\r', ' ')
+                node_details = f"Synthesis: {synthesis_reasoning}"
+                node_details = f"{Fore.RED}{node_id}{Style.RESET_ALL} {node_details}"
+            else:
+                node_details = f"{node_id} - {node.node_type.value}"
+            
+            tree_str = f"{pre}{node_details}"
+            print(tree_str)
     
     @abstractmethod
     def generate_children(self) -> List['BaseReasoningNode']:

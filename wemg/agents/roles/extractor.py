@@ -50,12 +50,12 @@ Instructions:
 MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 
 ## Instructions
-1. Question Analysis: Identify primary subject and key entities
+1. Question Analysis: Identify primary subject, key entities, and specific information sought.
 2. Duplicate & Redundancy Removal: Remove duplicates and redundant information. Make sure the consolidated memory not contain any duplicate or redundant information.
 3. Relevance Evaluation: Assess each item against criteria (directly answering, contextual, supporting evidence, etc.). The information considers relevant or useful if it contains ANY information that could clue the answer to the question or related with any concept in the question. Remove information that is not relevant or useful.
 4. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
 5. Final evaluation: 
-    - Each item MUST be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items. If it is not, rewrite it to make it self-contained.
+    - Each item MUST be self-contained and clear (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items and no pronouns or other references to the original memory, question, or other items). If it is not self-contained, rewrite it to MAKE SURE it is self-contained.
 """
 
 
