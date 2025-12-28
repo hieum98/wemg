@@ -180,9 +180,29 @@ def cot_search(
     working_memory: WorkingMemory,
     interaction_memory: Optional[InteractionMemory] = None,
     max_depth: int = 10,
+    correct_answers: Optional[Union[str, List[str]]] = None,
     **kwargs
-) -> Tuple[Optional[Dict], List[CoTReasoningNode]]:
+) -> Tuple[Optional[Dict], List[CoTReasoningNode], Optional[int]]:
     """Perform Chain-of-Thought reasoning."""
+    # Helper function to check if answer is correct
+    def check_answer_correctness(predicted_answer: str, correct_answers: Union[str, List[str]]) -> bool:
+        """Check if predicted answer contains any correct answer (case-insensitive substring match)."""
+        if not predicted_answer or not correct_answers:
+            return False
+        if isinstance(correct_answers, str):
+            correct_answers = [correct_answers]
+        predicted_lower = predicted_answer.lower()
+        for correct in correct_answers:
+            if correct and correct.lower() in predicted_lower:
+                return True
+        return False
+    
+    def extract_answer_from_node(node: CoTReasoningNode) -> Optional[str]:
+        """Extract concise answer from a terminal node."""
+        if node.node_type == NodeType.FINAL_ANSWER:
+            return node.node_state.content.get('concise_answer') or node.node_state.content.get('final_answer', '')
+        return None
+    
     # Create root node
     root_state = NodeState(
         node_type=NodeType.USER_QUESTION, 
@@ -192,6 +212,7 @@ def cot_search(
     
     current = root
     reasoning_path: List[CoTReasoningNode] = [root]
+    pass_at_k: Optional[int] = None
     
     while not current.is_terminal():
         next_node = current.generate_next_step(
@@ -210,9 +231,15 @@ def cot_search(
         
         current = next_node
         reasoning_path.append(current)
+        
+        # Check for pass_at_k if correct_answers provided
+        if pass_at_k is None and correct_answers and current.is_terminal():
+            answer = extract_answer_from_node(current)
+            if answer and check_answer_correctness(answer, correct_answers):
+                pass_at_k = len(reasoning_path) - 1  # Step number (excluding root)
     
     terminal_content = current.node_state.content if current.is_terminal() else None
-    return terminal_content, reasoning_path
+    return terminal_content, reasoning_path, pass_at_k
 
 
 def cot_get_answer(

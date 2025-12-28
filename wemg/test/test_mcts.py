@@ -979,7 +979,7 @@ class TestMCTSIntegration:
     # @pytest.mark.integration
     def test_mcts_search_basic(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test basic MCTS search functionality with real LLM."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1005,7 +1005,7 @@ class TestMCTSIntegration:
     # @pytest.mark.integration
     def test_mcts_search_complex_question(self, llm_agent, retriever_agent, working_memory, interaction_memory, complex_question_1):
         """Test MCTS search with complex multi-hop question."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=complex_question_1,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1031,7 +1031,7 @@ class TestMCTSIntegration:
     # @pytest.mark.integration
     def test_mcts_search_comparison_question(self, llm_agent, retriever_agent, working_memory, interaction_memory, complex_question_2):
         """Test MCTS search with comparison question requiring multiple paths."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=complex_question_2,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1124,7 +1124,7 @@ class TestMCTSIntegration:
     @pytest.mark.integration
     def test_mcts_early_termination_disabled(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test that early termination can be disabled."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1148,7 +1148,7 @@ class TestMCTSIntegration:
     @pytest.mark.integration
     def test_mcts_early_termination_min_iterations(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test that minimum iterations are enforced before early termination."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1172,7 +1172,7 @@ class TestMCTSIntegration:
     @pytest.mark.integration
     def test_mcts_early_termination_high_confidence(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test early termination when high confidence answer is found."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1196,7 +1196,7 @@ class TestMCTSIntegration:
     @pytest.mark.integration
     def test_mcts_early_termination_semantic_sufficiency(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test early termination when semantic sufficiency signals are detected."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1220,7 +1220,7 @@ class TestMCTSIntegration:
     @pytest.mark.integration
     def test_mcts_early_termination_convergence(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test early termination when no improvement is detected (convergence)."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1244,7 +1244,7 @@ class TestMCTSIntegration:
     @pytest.mark.integration
     def test_mcts_early_termination_all_conditions(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test early termination with all conditions configured."""
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1269,7 +1269,7 @@ class TestMCTSIntegration:
     def test_mcts_early_termination_default_parameters(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test that default early termination parameters work correctly."""
         # Test with default parameters (should use defaults from function signature)
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=sample_question,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,
@@ -1396,7 +1396,7 @@ class TestMCTSIntegration:
     def test_full_mcts_workflow_complex_question(self, llm_agent, retriever_agent, working_memory, interaction_memory, complex_question_2):
         """Test full MCTS workflow with complex question."""
         # Run MCTS search
-        result, tree = mcts_search(
+        result, tree, _ = mcts_search(
             question=complex_question_2,
             llm_agent=llm_agent,
             retriever_agent=retriever_agent,

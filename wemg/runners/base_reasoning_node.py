@@ -133,6 +133,12 @@ class BaseReasoningNode(ABC, NodeMixin):
     def __repr__(self) -> str:
         return self.node_state.model_dump_json(indent=2)
     
+    def __eq__(self, other):
+        """Compare nodes by node state only."""
+        if not isinstance(other, BaseReasoningNode):
+            return False
+        return self.node_state == other.node_state
+    
     def get_trajectory(self) -> List[NodeState]:
         """Get the trajectory of node states from root to this node."""
         return [node.node_state for node in self.path if node]

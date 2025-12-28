@@ -106,7 +106,7 @@ def profile_mcts_search(
     if profiler:
         profiler.enable()
     
-    result, tree = mcts_search(
+    result, tree, _ = mcts_search(
         question=question,
         llm_agent=llm_agent,
         retriever_agent=retriever_agent,

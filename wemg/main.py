@@ -57,7 +57,7 @@ class AnswerResult:
     answer: str
     concise_answer: str
     reasoning: Optional[str] = None
-    search_tree: Optional[Dict, BaseReasoningNode] = None
+    search_tree: Optional[Union[Dict, BaseReasoningNode]] = None
     metadata: Optional[Dict[str, Any]] = None
     working_memory: Optional[WorkingMemory] = None
 
@@ -289,13 +289,14 @@ class WEMGSystem:
         max_depth = OmegaConf.select(self.cfg, "search.cot.max_depth") or 10
         
         # Run CoT search
-        terminal_content, reasoning_path = cot_search(
+        terminal_content, reasoning_path, pass_at_k = cot_search(
             question=question,
             llm_agent=self.llm_agent,
             retriever_agent=self.retriever_agent,
             working_memory=working_memory,
             interaction_memory=interaction_memory,
             max_depth=max_depth,
+            correct_answers=golden_answer,
             **node_gen_kwargs,
         )
         
@@ -326,6 +327,7 @@ class WEMGSystem:
                 "strategy": "cot",
                 "max_depth": max_depth,
                 "num_reasoning_steps": len(reasoning_path),
+                "pass_at_k": pass_at_k,
             },
             working_memory=working_memory,
         )
@@ -375,7 +377,7 @@ class WEMGSystem:
             else 4
         )
         
-        best_terminal_content, search_tree = mcts_search(
+        best_terminal_content, search_tree, pass_at_k = mcts_search(
             question=question,
             llm_agent=self.llm_agent,
             retriever_agent=self.retriever_agent,
@@ -389,6 +391,7 @@ class WEMGSystem:
             if OmegaConf.select(self.cfg, "search.mcts.is_cot_simulation") is not None
             else True,
             golden_answer=golden_answer if use_golden_answer_for_reward else None,
+            correct_answers=golden_answer,
             early_termination_enabled=early_termination_enabled,
             min_iterations=min_iterations,
             high_confidence_threshold=high_confidence_threshold,
@@ -428,6 +431,7 @@ class WEMGSystem:
                 "num_iterations": OmegaConf.select(self.cfg, "search.mcts.num_iterations") or 10,
                 "max_tree_depth": OmegaConf.select(self.cfg, "search.mcts.max_tree_depth") or 10,
                 "exploration_weight": OmegaConf.select(self.cfg, "search.mcts.exploration_weight") or 1.0,
+                "pass_at_k": pass_at_k,
             },
             working_memory=working_memory,
         )

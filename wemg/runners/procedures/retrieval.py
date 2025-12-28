@@ -128,7 +128,8 @@ async def retrieve_triples(
                 "is_qids": True,
                 "k": n_hops,
                 "bidirectional": False,
-                "update_with_details": False,
+                "enrich": True,
+                "get_details": False,
             }
         )
         # Flatten the list of lists
@@ -150,6 +151,7 @@ async def retrieve_from_kb(
         n_hops: int = 1,
         use_question_for_graph_retrieval: bool = False,
         interaction_memory: Optional[InteractionMemory] = None,
+        max_triples: int = 5000,
         ):
     # Retrieve Wikidata entities and props
     wikidata_entity_retriever = wikidata.WikidataEntityRetrievalTool()
@@ -178,6 +180,9 @@ async def retrieve_from_kb(
         entities=entities,
         n_hops=n_hops
     )
+    if len(retrieved_triples) > max_triples:
+        retrieved_triples = retrieved_triples[:max_triples]
+        logger.warning(f"Retrieved {len(retrieved_triples)} triples, but max_triples is {max_triples}. Truncating to {max_triples} triples.")
     return retrieved_triples, entities, entity_dict, property_dict, graph_query_log
 
 

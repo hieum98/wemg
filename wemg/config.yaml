@@ -102,7 +102,7 @@ node_generation:
   top_k_websearch: 5  # Top-k web search results
   top_k_entities: 3  # Top-k entities from knowledge graph
   top_k_properties: 3  # Top-k properties from knowledge graph
-  n_hops: 3  # Number of hops for graph exploration
+  n_hops: 2  # Number of hops for graph exploration
   use_question_for_graph_retrieval: true  # Use question to generate graph retrieval queries
 
 # =====================================================================

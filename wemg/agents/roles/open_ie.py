@@ -54,6 +54,12 @@ class Entity(pydantic.BaseModel):
 
     def __hash__(self):
         return hash(self.name)
+    
+    def __eq__(self, other):
+        """Compare entities by name only."""
+        if not isinstance(other, Entity):
+            return False
+        return self.name == other.name
 
     def __str__(self):
         return f"{self.name} - {self.description}" if self.description else self.name
@@ -78,6 +84,14 @@ class Relation(pydantic.BaseModel):
     
     def __hash__(self):
         return hash((self.subject, self.relation, self.object))
+    
+    def __eq__(self, other):
+        """Compare relations by (subject, relation, object) tuple."""
+        if not isinstance(other, Relation):
+            return False
+        return (self.subject == other.subject and 
+                self.relation == other.relation and 
+                self.object == other.object)
     
     def __str__(self):
         text = f"Subject: {self.subject}\nRelation: {self.relation}\nObject: {self.object}"

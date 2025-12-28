@@ -441,8 +441,9 @@ def mcts_search(
     high_confidence_threshold: float = 0.9,
     convergence_patience: int = 3,
     semantic_sufficiency_count: int = 2,
+    correct_answers: Optional[Union[str, List[str]]] = None,
     **kwargs
-) -> Tuple[Dict, MCTSSearchTree]:
+) -> Tuple[Dict, MCTSSearchTree, Optional[int]]:
     """Run MCTS to find the best reasoning path."""
     # Initialize tree
     root_state = NodeState(node_type=NodeType.USER_QUESTION, content={'user_question': question})
@@ -456,6 +457,28 @@ def mcts_search(
     semantic_sufficiency_signals = 0  # Count of semantic sufficiency signals
     no_improvement_count = 0  # Consecutive iterations without improvement
     termination_reason = None
+    
+    # Pass-at-k tracking
+    pass_at_k: Optional[int] = None
+    
+    # Helper function to check if answer is correct
+    def check_answer_correctness(predicted_answer: str, correct_answers: Union[str, List[str]]) -> bool:
+        """Check if predicted answer contains any correct answer (case-insensitive substring match)."""
+        if not predicted_answer or not correct_answers:
+            return False
+        if isinstance(correct_answers, str):
+            correct_answers = [correct_answers]
+        predicted_lower = predicted_answer.lower()
+        for correct in correct_answers:
+            if correct and correct.lower() in predicted_lower:
+                return True
+        return False
+    
+    def extract_answer_from_node(node: MCTSReasoningNode) -> Optional[str]:
+        """Extract concise answer from a terminal node."""
+        if node.node_type == NodeType.FINAL_ANSWER:
+            return node.node_state.content.get('concise_answer') or node.node_state.content.get('final_answer', '')
+        return None
     
     for iteration in range(num_iterations):
         # Selection
@@ -499,8 +522,14 @@ def mcts_search(
         # Sync working memory
         working_memory.synchronize_memory(llm_agent, question, interaction_memory)
         
-        # Track best and convergence
+        # Track best and convergence, and check for pass_at_k
         if terminal.is_terminal():
+            # Check for pass_at_k if correct_answers provided
+            if pass_at_k is None and correct_answers:
+                answer = extract_answer_from_node(terminal)
+                if answer and check_answer_correctness(answer, correct_answers):
+                    pass_at_k = iteration + 1
+            
             if reward > best_reward:
                 best_reward = reward
                 best_node = terminal
@@ -537,7 +566,25 @@ def mcts_search(
     else:
         logger.debug(f"MCTS completed all {num_iterations} iterations")
     
-    return (best_node.node_state.content if best_node else {}), tree
+    # If pass_at_k not found yet, check all terminal nodes in final tree
+    if pass_at_k is None and correct_answers:
+        def collect_terminal_nodes(node: MCTSReasoningNode) -> List[MCTSReasoningNode]:
+            terminals = []
+            if node.is_terminal():
+                terminals.append(node)
+            for child in node.children:
+                terminals.extend(collect_terminal_nodes(child))
+            return terminals
+        
+        all_terminals = collect_terminal_nodes(tree['root'])
+        for terminal in all_terminals:
+            answer = extract_answer_from_node(terminal)
+            if answer and check_answer_correctness(answer, correct_answers):
+                # Found correct answer but don't know exact iteration, use num_iterations as conservative estimate
+                pass_at_k = num_iterations
+                break
+    
+    return (best_node.node_state.content if best_node else {}), tree, pass_at_k
 
 
 def get_answer(

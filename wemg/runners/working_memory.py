@@ -358,6 +358,8 @@ class WorkingMemory:
                 "query": qids,
                 "is_qids": True,
                 'k': 1,
+                "enrich": True,
+                "get_details": False,
             })
             retrieved_triples: List[wikidata.WikiTriple] = sum(results, [])
             id_with_triple: Dict[str, wikidata.WikiTriple] = {}
