@@ -26,6 +26,24 @@ Criteria:
 - The score should be based on both correctness and helpfulness & relevance.
 """
 
+JUDGE_ANSWER_PROMPT_V2 = """You are an expert evaluator. Your task is to rate the system_answer on a scale from 0.0 to 10.0 based on how effectively it addresses the user_question.
+
+Evaluation Criteria:
+1. Correctness (60%): Is the information factually accurate?
+   - If correct_answer is provided and system_answer matches correct_answer, award 10.0
+   - If no correct_answer is provided, verify accuracy using internet search or your knowledge
+2. Helpfulness & Relevance (40%): Does it address the user's core need with appropriate detail?
+
+Scoring Guidelines:
+- 9.0-10.0: Correct and comprehensive (10.0 if matches correct_answer)
+- 7.0-8.9: Mostly correct with minor issues
+- 5.0-6.9: Partially addresses question or has accuracy concerns
+- 3.0-4.9: Significant correctness or relevance issues
+- 0.0-2.9: Incorrect or completely off-topic
+
+IMPORTANT NOTE: Conduct your own internet searches/ knowledge investigation as needed to verify factual claims when correct_answer is not provided. Do not assume the system_answer is correct. You must independently verify all claims
+"""
+
 MAJORITY_VOTE_PROMPT = """You are an expert at evaluating answers. Given a question and answers, determine the final answer based on majority voting.
 
 Instructions:
@@ -48,6 +66,21 @@ Phase III - Synthesis:
 - Build new superior reasoning path
 - State final answer
 - Self-critique and refine
+"""
+
+CONSENSUS_EVALUATION_PROMPT = """You are an expert evaluator. Given two candidate answers with their reasoning, evaluate the consensus between the two answers. Rate from 0.0 to 10.0 how well the two answers are consistent with each other.
+
+Criteria:
+- Answer Alignment (40%): Do the final answers reach the same or compatible conclusions?
+- Reasoning Consistency (35%): Are the logical steps, assumptions, and intermediate conclusions similar?
+- Information Agreement (25%): Do both answers rely on consistent facts and evidence?
+
+Scoring Guidelines:
+- 9.0-10.0: Nearly perfect consensus - answers and reasoning are essentially identical or fully compatible
+- 7.0-8.9: Strong consensus - minor differences in phrasing or emphasis, but core conclusions align
+- 5.0-6.9: Moderate consensus - answers agree on main points but differ in details or approach
+- 3.0-4.9: Weak consensus - some overlap but significant disagreements or contradictions
+- 0.0-2.9: No consensus - answers contradict each other or address different aspects entirely
 """
 
 
@@ -101,6 +134,19 @@ class FinalAnswerSynthesisOutput(pydantic.BaseModel):
     confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
 
 
+class ConsensusEvaluationInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question to be answered.")
+    candidate_answers: List[str] = pydantic.Field(..., description="Candidate answers.")
+
+    def __str__(self):
+        candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
+        return f"question:\n{self.question}\n\ncandidate_answers:\n{candidates_str}"
+
+class ConsensusEvaluationOutput(pydantic.BaseModel):
+    rating: float = pydantic.Field(..., ge=0.0, le=10.0, description="Rating from 0.0 to 10.0.")
+    reasoning: str = pydantic.Field(..., description="Reasoning behind the rating.")
+
+
 # =============================================================================
 # Role Classes
 # =============================================================================
@@ -127,4 +173,12 @@ FinalAnswerSynthesizer = _create_role(
     FinalAnswerSynthesisInput,
     FinalAnswerSynthesisOutput,
     "Final answer synthesis role for multi-hop question answering."
+)
+
+ConsensusEvaluator = _create_role(
+    "consensus_evaluator",
+    CONSENSUS_EVALUATION_PROMPT,
+    ConsensusEvaluationInput,
+    ConsensusEvaluationOutput,
+    "Consensus evaluation role for multi-hop question answering."
 )

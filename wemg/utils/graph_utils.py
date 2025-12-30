@@ -5,6 +5,8 @@ from typing import Any, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 
+from wemg.agents.tools import wikidata
+
 
 def get_densest_node(
     component: Set, 
@@ -58,6 +60,20 @@ def textualize_graph(
         f"{i}. {triple}" for i, triple in enumerate(all_triples, 1)
     )
     return all_triples, f"Cluster Information:\n{cluster_text}"
+
+
+def _format_node_description(
+    node: str,
+    graph_memory: Union[nx.DiGraph, nx.Graph]
+) -> str:
+    """Format a single node into a natural language description."""
+    node_data = graph_memory.nodes[node].get('data')
+    if not node_data:
+        return str(node)
+    if isinstance(node_data, wikidata.WikidataEntity):
+        return node_data.to_context(include_wiki_page=False)
+    else:
+        return str(node_data)
 
 
 def _format_triple(
@@ -140,6 +156,12 @@ def _dfs_textualize(
             if next_node not in visited:
                 stack.append((next_node, source, target))
     
+    # If no triples were generated (graph has only 1 node with no edges), add node description
+    if not all_triples and start_node:
+        node_description = _format_node_description(start_node, graph_memory)
+        if node_description:
+            all_triples.append(node_description)
+    
     return all_triples
 
 
@@ -169,6 +191,12 @@ def _bfs_textualize(
             next_node = target if source == current else source
             if next_node not in visited:
                 queue.append((next_node, source, target))
+    
+    # If no triples were generated (graph has only 1 node with no edges), add node description
+    if not all_triples and start_node:
+        node_description = _format_node_description(start_node, graph_memory)
+        if node_description:
+            all_triples.append(node_description)
     
     return all_triples
 

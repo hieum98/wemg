@@ -122,7 +122,7 @@ def main(cfg: DictConfig) -> None:
     """Main entry point with Hydra configuration.
     
     Run with:
-        python -m wemg.evaluation.evaluate +dataset_name_or_path=path/to/dataset
+        python -m wemg.evaluation.evaluate +dataset_name_or_path=path/to/dataset +output_path=path/to/output
         python -m wemg.evaluation.evaluate +dataset_name_or_path=path/to/dataset llm.model_name=gpt-4o
         python -m wemg.evaluation.evaluate +dataset_name_or_path=path/to/dataset search.strategy=mcts
     """

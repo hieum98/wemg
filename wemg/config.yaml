@@ -78,7 +78,7 @@ search:
     num_iterations: 10  # Number of MCTS iterations
     max_tree_depth: 10  # Maximum depth of the search tree
     max_simulation_depth: 5  # Maximum depth for simulation rollouts
-    exploration_weight: 1.0  # UCT exploration parameter
+    exploration_weight: 2.0  # UCT exploration parameter
     is_cot_simulation: true  # Use CoT for simulation phase
     use_golden_answer_for_reward: False  # Use golden answer for reward function
     

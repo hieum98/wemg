@@ -7,7 +7,7 @@ WIKIDATA_MAX_QUERY_LENGTH = 500
 MAX_CONCURRENT_REQUESTS = 4  # Maximum concurrent requests to Wikidata
 REQUEST_DELAY = 0.1  # Base delay between requests in seconds
 MAX_RETRIES = 3  # Maximum number of retries for failed requests
-RETRY_BASE_DELAY = 1.0  # Base delay for exponential backoff
+RETRY_BASE_DELAY = 10  # Base delay for exponential backoff
 USER_AGENT = "WEMG-Bot/1.0 (https://github.com/uonlp/wemg; contact@example.com) Python/3.x"
 
 # Batch processing sizes

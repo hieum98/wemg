@@ -147,6 +147,25 @@ class WorkingMemory:
         else:
             self.graph_memory.edges[subject_id, object_id]['relation'].add(wiki_triple.relation)
     
+    def format_graph_memory(self) -> str:
+        """Format graph memory as a single string."""
+        self.update_graph_memory() # Update nodes with full WikidataEntity details before processing
+        components = list(nx.weakly_connected_components(self.graph_memory))
+        
+        # Process components concurrently
+        cluster_texts = []
+        for comp in components:
+            triples, _ = textualize_graph(comp, self.graph_memory, method='dfs')
+            formatted = [
+                self.format_memory_item(t, roles.extractor.SourceType.RETRIEVAL) 
+                for t in triples
+            ]
+            cluster_texts.append("\n".join(f"- {t}" for t in formatted))
+        cluster_text = "[Retrieval]\n".join( # Graph memory is retrieved from wikidata, so we need to format it as a retrieval information
+            [f"{i}. {text}" for i, text in enumerate(cluster_texts, 1)]
+        )
+        return cluster_text
+    
     def parse_graph_memory_from_textual_memory(
         self, 
         llm_agent: BaseLLMAgent, 

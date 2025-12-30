@@ -21,6 +21,7 @@ from wemg.runners.procedures.node_generator import NodeGenerator, GenerationResu
 from wemg.runners.working_memory import WorkingMemory
 from wemg.runners.interaction_memory import InteractionMemory
 from wemg.utils.common import merge_logs, log_to_interaction_memory
+from wemg.utils.preprocessing import format_context
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
@@ -42,7 +43,7 @@ class MCTSReasoningNode(BaseReasoningNode):
         self.value: float = 0.0
         self.visits: int = 0
 
-    def upper_confidence_bound(self, exploration_weight: float = 1.0) -> float:
+    def upper_confidence_bound(self, exploration_weight: float = 2.0) -> float:
         """Calculate UCT score for balancing exploration vs exploitation."""
         if self.parent is None:
             raise ValueError("Cannot obtain UCT from root node")
@@ -316,7 +317,7 @@ class MCTSSearchTree(TypedDict):
     root: MCTSReasoningNode
 
 
-def select(tree: MCTSSearchTree, exploration_weight: float = 1.0) -> List[MCTSReasoningNode]:
+def select(tree: MCTSSearchTree, exploration_weight: float = 2.0) -> List[MCTSReasoningNode]:
     """Select a path from root to leaf using UCT algorithm.
     
     Pure UCT implementation: unvisited nodes automatically get infinity UCT,
@@ -395,33 +396,74 @@ def simulate(
     return current, has_semantic_signal
 
 
-async def evaluate(
+def evaluate(
     node: MCTSReasoningNode,
     llm_agent: BaseLLMAgent,
-    interaction_memory: Optional[InteractionMemory] = None,
+    working_memory: WorkingMemory,
     golden_answer: Optional[str] = None
 ) -> float:
     """Evaluate terminal node and return reward score (0-1)."""
+    question = node.user_question
     if node.node_type != NodeType.FINAL_ANSWER:
-        return 0.1 # not a final answer node, return a low reward
+        return -1.0 # not a final answer node
+    
+    # Get the final answer from the working memory
+    textual_memory = working_memory.format_textual_memory()
+    graph_memory = working_memory.format_graph_memory()
+
+    # Answer the question based on the working memory (graph/text separately)
+    textual_qa_input = roles.generator.AnswerGenerationInput(
+        question=question, 
+        context=format_context(memory=textual_memory)
+        )
+    graph_qa_input = roles.generator.AnswerGenerationInput(
+        question=question, 
+        context=format_context(memory=graph_memory)
+        )
+    try:
+        answers, _ = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.generator.AnswerGenerator(),
+            input_data=[textual_qa_input, graph_qa_input],
+            n=1
+        ))
+        textual_answer: roles.generator.AnswerGenerationOutput = answers[0][0]
+        graph_answer: roles.generator.AnswerGenerationOutput = answers[1][0]
+        textual_answer = f"Answer: {textual_answer.answer}\nReasoning: {textual_answer.reasoning}"
+        graph_answer = f"Answer: {graph_answer.answer}\nReasoning: {graph_answer.reasoning}"
+
+        consensus_input = roles.evaluator.ConsensusEvaluationInput(
+            question=question,
+            candidate_answers=[textual_answer, graph_answer]
+        )
+        consensus_results, _ = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.evaluator.ConsensusEvaluator(),
+            input_data=consensus_input,
+            n=1
+        ))
+        consensus_reward = (consensus_results[0].rating - 5) / 5.0 # normalize to -1 to 1
+    except Exception as e:
+        consensus_reward = 0.0 # default reward for textual and graph answer generation failure
     
     eval_input = roles.evaluator.AnswerEvaluationInput(
         user_question=node.user_question,
         system_answer=node.node_state.content.get('final_answer', ''),
         correct_answer=golden_answer or node.golden_answer or "Not available"
     )
+    try:
+        eval_results, _ = asyncio.run(execute_role(
+            llm_agent=llm_agent,
+            role=roles.evaluator.Evaluator(),
+            input_data=eval_input,
+            n=1
+        ))
+        answer_reward = (eval_results[0].rating - 5) / 5.0 # normalize to -1 to 1
+    except Exception as e:
+        answer_reward = 0.0 # default reward for answer evaluation failure
     
-    eval_results, _ = await execute_role(
-        llm_agent=llm_agent,
-        role=roles.evaluator.Evaluator(),
-        input_data=eval_input,
-        interaction_memory=interaction_memory,
-        n=1
-    )
-    
-    if eval_results:
-        return eval_results[0].rating / 10.0
-    return 0.5 # neutral reward for non-final answer nodes
+    reward = (answer_reward + consensus_reward) / 2.0 # normalize to -1 to 1
+    return reward
 
 
 def mcts_search(
@@ -431,7 +473,7 @@ def mcts_search(
     working_memory: WorkingMemory,
     interaction_memory: Optional[InteractionMemory] = None,
     num_iterations: int = 10,
-    exploration_weight: float = 1.0,
+    exploration_weight: float = 2.0,
     is_cot_simulation: bool = True,
     max_tree_depth: int = 10,
     max_simulation_depth: int = 5,
@@ -516,7 +558,7 @@ def mcts_search(
             terminal = selected
         
         # Evaluation and backpropagation
-        reward = asyncio.run(evaluate(terminal, llm_agent, interaction_memory, golden_answer))
+        reward =  evaluate(terminal, llm_agent, working_memory, golden_answer)
         terminal.backpropagate(reward)
         
         # Sync working memory
