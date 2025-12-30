@@ -282,15 +282,13 @@ class TestRetrieveEntitiesFromKB:
         return InteractionMemory()
     
     @pytest.mark.slow
-    def test_retrieve_entities_from_kb_with_query(self, llm_agent, entity_retriever, property_retriever, interaction_memory):
+    def test_retrieve_entities_from_kb_with_query(self, llm_agent, interaction_memory):
         """Test retrieve_entities_from_kb with query only."""
         query = "What is the capital of France?"
         
         entities, entity_dict, properties, property_dict, graph_query_log = asyncio.run(
             retrieve_entities_from_kb(
                 llm_agent=llm_agent,
-                wikidata_entity_retriever=entity_retriever,
-                wikidata_property_retriever=property_retriever,
                 query=query,
                 entities=[],
                 relations=[],
@@ -327,7 +325,7 @@ class TestRetrieveEntitiesFromKB:
             print(f"    Entity {i+1}: {entity.qid} - {entity.label}")
     
     @pytest.mark.slow
-    def test_retrieve_entities_from_kb_with_existing_entities(self, llm_agent, entity_retriever, property_retriever, interaction_memory):
+    def test_retrieve_entities_from_kb_with_existing_entities(self, llm_agent, interaction_memory):
         """Test retrieve_entities_from_kb with pre-existing entities."""
         # Create open_ie entities
         existing_entities = [
@@ -338,8 +336,6 @@ class TestRetrieveEntitiesFromKB:
         entities, entity_dict, properties, property_dict, graph_query_log = asyncio.run(
             retrieve_entities_from_kb(
                 llm_agent=llm_agent,
-                wikidata_entity_retriever=entity_retriever,
-                wikidata_property_retriever=property_retriever,
                 query=None,
                 entities=existing_entities,
                 relations=[],
@@ -358,7 +354,7 @@ class TestRetrieveEntitiesFromKB:
         print(f"  Entity mappings: {len(entity_dict)}")
     
     @pytest.mark.slow
-    def test_retrieve_entities_from_kb_with_existing_wikidata_entities(self, llm_agent, entity_retriever, property_retriever, interaction_memory):
+    def test_retrieve_entities_from_kb_with_existing_wikidata_entities(self, llm_agent, entity_retriever, interaction_memory):
         """Test retrieve_entities_from_kb with pre-existing WikidataEntity objects."""
         # First retrieve some entities
         entity_results = asyncio.run(
@@ -372,8 +368,6 @@ class TestRetrieveEntitiesFromKB:
         entities, entity_dict, properties, property_dict, graph_query_log = asyncio.run(
             retrieve_entities_from_kb(
                 llm_agent=llm_agent,
-                wikidata_entity_retriever=entity_retriever,
-                wikidata_property_retriever=property_retriever,
                 query=None,
                 entities=existing_wikidata_entities,
                 relations=[],
@@ -391,7 +385,7 @@ class TestRetrieveEntitiesFromKB:
         print(f"  Total entities: {len(entities)}")
     
     @pytest.mark.slow
-    def test_retrieve_entities_from_kb_with_relations(self, llm_agent, entity_retriever, property_retriever, interaction_memory):
+    def test_retrieve_entities_from_kb_with_relations(self, llm_agent, interaction_memory):
         """Test retrieve_entities_from_kb with relations."""
         entities = [roles.open_ie.Entity(name="France")]
         relations = ["capital", "population"]
@@ -399,8 +393,6 @@ class TestRetrieveEntitiesFromKB:
         entities, entity_dict, properties, property_dict, graph_query_log = asyncio.run(
             retrieve_entities_from_kb(
                 llm_agent=llm_agent,
-                wikidata_entity_retriever=entity_retriever,
-                wikidata_property_retriever=property_retriever,
                 query=None,
                 entities=entities,
                 relations=relations,
@@ -421,7 +413,7 @@ class TestRetrieveEntitiesFromKB:
             print(f"    {rel} -> {prop.pid} ({prop.label})")
     
     @pytest.mark.slow
-    def test_retrieve_entities_from_kb_with_wikidata_properties(self, llm_agent, entity_retriever, property_retriever, interaction_memory):
+    def test_retrieve_entities_from_kb_with_wikidata_properties(self, llm_agent, property_retriever, interaction_memory):
         """Test retrieve_entities_from_kb with pre-existing WikidataProperty objects."""
         # First retrieve some properties
         property_results = asyncio.run(
@@ -437,8 +429,6 @@ class TestRetrieveEntitiesFromKB:
         entities, entity_dict, properties, property_dict, graph_query_log = asyncio.run(
             retrieve_entities_from_kb(
                 llm_agent=llm_agent,
-                wikidata_entity_retriever=entity_retriever,
-                wikidata_property_retriever=property_retriever,
                 query=None,
                 entities=entities,
                 relations=existing_properties,
@@ -456,7 +446,7 @@ class TestRetrieveEntitiesFromKB:
         print(f"  Total properties: {len(properties)}")
     
     @pytest.mark.slow
-    def test_retrieve_entities_from_kb_with_query_and_entities(self, llm_agent, entity_retriever, property_retriever, interaction_memory):
+    def test_retrieve_entities_from_kb_with_query_and_entities(self, llm_agent, interaction_memory):
         """Test retrieve_entities_from_kb with both query and existing entities."""
         query = "What is the population?"
         existing_entities = [roles.open_ie.Entity(name="France")]
@@ -464,8 +454,6 @@ class TestRetrieveEntitiesFromKB:
         entities, entity_dict, properties, property_dict, graph_query_log = asyncio.run(
             retrieve_entities_from_kb(
                 llm_agent=llm_agent,
-                wikidata_entity_retriever=entity_retriever,
-                wikidata_property_retriever=property_retriever,
                 query=query,
                 entities=existing_entities,
                 relations=[],
@@ -481,22 +469,24 @@ class TestRetrieveEntitiesFromKB:
         print(f"  Existing entities: {len(existing_entities)}")
         print(f"  Total entities: {len(entities)}")
     
-    def test_retrieve_entities_from_kb_without_query_or_entities(self, llm_agent, entity_retriever, property_retriever, interaction_memory):
+    def test_retrieve_entities_from_kb_without_query_or_entities(self, llm_agent, interaction_memory):
         """Test retrieve_entities_from_kb raises error when neither query nor entities provided."""
-        with pytest.raises(AssertionError, match="Either query or entities must be provided"):
-            asyncio.run(
-                retrieve_entities_from_kb(
-                    llm_agent=llm_agent,
-                    wikidata_entity_retriever=entity_retriever,
-                    wikidata_property_retriever=property_retriever,
-                    query=None,
-                    entities=[],
-                    relations=[],
-                    top_k_entities=1,
-                    top_k_properties=1,
-                    interaction_memory=interaction_memory
-                )
+        entities, entity_dict, properties, property_dict, graph_query_log = asyncio.run(
+            retrieve_entities_from_kb(
+                llm_agent=llm_agent,
+                query=None,
+                entities=[],
+                relations=[],
+                top_k_entities=1,
+                top_k_properties=1,
+                interaction_memory=interaction_memory
             )
+        )
+        assert len(entities) == 0
+        assert len(entity_dict) == 0
+        assert len(properties) == 0
+        assert len(property_dict) == 0
+        assert len(graph_query_log) == 0
 
 
 class TestRetrieveTriples:

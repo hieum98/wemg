@@ -15,6 +15,7 @@ from wemg.agents import roles
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.agents.tools import wikidata
 from wemg.agents.tools.web_search import WebSearchTool
+from wemg.agents.tools.wikidata.enrichment import EnrichmentCollector
 from wemg.runners.interaction_memory import InteractionMemory
 from wemg.runners.procedures.base_role_execution import execute_role
 from wemg.runners.procedures.openie import parse_graph_from_text
@@ -201,7 +202,7 @@ class WorkingMemory:
         wikidata_props = wikidata.DEFAULT_PROPERTIES + [item.pid for item in self.property_dict.values()]
         wikidata_props = list(set(wikidata_props))
         wikidata_props_with_labels = {item.pid: {'label': item.label, 'description': item.description} for item in self.property_dict.values()}
-        wikidata_props_with_labels = {**wikidata.PROPERTY_LABELS, **wikidata_props_with_labels}
+        wikidata_props_with_labels.update(wikidata.PROPERTY_LABELS)
         wikidata_wrapper = wikidata.CustomWikidataAPIWrapper(
             wikidata_props=wikidata_props,
             wikidata_props_with_labels=wikidata_props_with_labels
@@ -217,6 +218,7 @@ class WorkingMemory:
             "source_qid": source_qid,
             "target_qid": target_qid,
             "max_hops": max_hops,
+            "enrich": True,
         })
         
         if path_result and path_result.path:
@@ -227,57 +229,35 @@ class WorkingMemory:
 
     def update_graph_memory(self) -> None:
         """Update nodes with full WikidataEntity details."""
-        ids_to_fetch: Set[str] = set()
-        
-        for node_id in self.graph_memory.nodes:
-            node_data = self.graph_memory.nodes[node_id].get('data')
-            if isinstance(node_data, wikidata.WikidataEntity):
-                if not node_data.description or not node_data.wikipedia_url:
-                    if node_data.qid in self.id_dict:
-                        self.graph_memory.nodes[node_id]['data'] = self.id_dict[node_data.qid]
-                    else:
-                        ids_to_fetch.add(node_data.qid)
-        
-        if ids_to_fetch:
-            self._fetch_and_update_entities(list(ids_to_fetch))
-
-    def _fetch_and_update_entities(self, qids: List[str]) -> None:
-        """Fetch entity details and update graph memory."""
-        to_fetch_entities: Set[str] = set()
-        for qid in qids:
-            if qid in self.id_dict:
-                self.graph_memory.nodes[get_node_id(self.id_dict[qid])]['data'] = self.id_dict[qid]
-            else:
-                to_fetch_entities.add(qid)
-        if to_fetch_entities:
-            logger.info(f"Fetching details for {len(to_fetch_entities)} Wikidata entities")
-            entity_retriever = wikidata.WikidataEntityRetrievalTool()
-            results = entity_retriever.invoke({
-                "query": list(to_fetch_entities),
-                "num_entities": 1,
-                "get_details": True,
-            })
-            
-            for entity in sum(results, []):
-                self.id_dict[entity.qid] = entity
-                node_id = get_node_id(entity)
-                if self.graph_memory.has_node(node_id):
-                    self.graph_memory.nodes[node_id]['data'] = entity
-                    logger.info(f"Updated node {node_id}")
-        
-        # Update self.id_dict with wikipedia content
-        to_fetch_wikipedia: Set[str] = set()
-        for qid in self.id_dict:
-            # wikipedia content is not available, but wikipedia url is available (fetched from last step)
-            if not self.id_dict[qid].wikipedia_content and self.id_dict[qid].wikipedia_url:
-                to_fetch_wikipedia.add(qid)
-        if to_fetch_wikipedia:
-            logger.info(f"Fetching {len(to_fetch_wikipedia)} Wikipedia content")
-            urls = [self.id_dict[qid].wikipedia_url for qid in to_fetch_wikipedia]
-            contents = WebSearchTool.crawl_web_pages(urls)
-            for qid, content in zip(to_fetch_wikipedia, contents):
-                self.id_dict[qid].wikipedia_content = content
-                logger.info(f"Updated Wikipedia content for {qid}")
+        wikidata_wrapper = wikidata.CustomWikidataAPIWrapper()
+        enrichment_collector = EnrichmentCollector(wikidata_wrapper)
+        # For all edges in graph memory, collect entities and properties
+        for s_id, o_id, edge_data in self.graph_memory.edges(data=True):
+            s_entity = self.graph_memory.nodes[s_id].get('data')
+            o_entity = self.graph_memory.nodes[o_id].get('data')
+            if isinstance(s_entity, wikidata.WikidataEntity):
+                enrichment_collector.add_entity(s_entity)
+            if isinstance(o_entity, wikidata.WikidataEntity):
+                enrichment_collector.add_entity(o_entity)
+            all_relations = edge_data.get('relation', [])
+            for relation in all_relations:
+                if isinstance(relation, wikidata.WikidataProperty):
+                    enrichment_collector.add_property(relation)
+                
+        enrichment_collector.enrich_all(get_details=False) # Not getting the wikipedia content here
+        for s_id, o_id, edge_data in self.graph_memory.edges(data=True):
+            all_relations = edge_data.get('relation', [])
+            new_relations: Set[wikidata.WikidataProperty] = set()
+            for relation in all_relations:
+                if isinstance(relation, wikidata.WikidataProperty):
+                    new_relations.add(enrichment_collector.get_enriched_property(relation.pid))
+            edge_data['relation'] = new_relations
+            s_entity = self.graph_memory.nodes[s_id].get('data')
+            if isinstance(s_entity, wikidata.WikidataEntity):
+                self.graph_memory.nodes[s_id]['data'] = enrichment_collector.get_enriched_entity(s_entity.qid)
+            o_entity = self.graph_memory.nodes[o_id].get('data')
+            if isinstance(o_entity, wikidata.WikidataEntity):
+                self.graph_memory.nodes[o_id]['data'] = enrichment_collector.get_enriched_entity(o_entity.qid)
 
     @staticmethod
     def extract_triples_from_graph(graph: nx.DiGraph) -> List[roles.open_ie.Relation]:
@@ -288,16 +268,13 @@ class WorkingMemory:
             o_entity = str(graph.nodes[o_id].get('data'))
             if s_entity and o_entity:
                 for rel in edge_data.get('relation', []):
-                    triples.append(roles.open_ie.Relation(subject=s_entity, relation=rel, object=o_entity))
+                    triples.append(roles.open_ie.Relation(subject=s_entity, relation=str(rel), object=o_entity))
         return triples
 
     def merge_graph_memory(self, other_graph: nx.DiGraph) -> None:
         """Merge another graph into graph memory, syncing with Wikidata."""
         # Collect triples
         triples = WorkingMemory.extract_triples_from_graph(other_graph)
-        
-        # Fetch missing entities and properties
-        self._fetch_missing_entities_and_properties(triples)
         
         # Batch convert and add triples (optimized for performance)
         wiki_triples = self._batch_convert_and_add_triples(triples)
@@ -310,13 +287,11 @@ class WorkingMemory:
     def _batch_convert_and_add_triples(
         self, 
         triples: List[roles.open_ie.Relation], 
-        fetch_missing: bool = True,
     ) -> List[wikidata.WikiTriple]:
         """Batch convert triples to WikiTriples.
         """
         all_triples: List[wikidata.WikiTriple] = []
-        if fetch_missing:
-            self._fetch_missing_entities_and_properties(triples)
+        self._fetch_missing_entities_and_properties(triples)
         
         to_verify_triples: List[wikidata.WikiTriple] = []
         to_connect_triples: List[wikidata.WikiTriple] = []
@@ -362,6 +337,7 @@ class WorkingMemory:
                 "get_details": False,
             })
             retrieved_triples: List[wikidata.WikiTriple] = sum(results, [])
+            all_verified_ids = [(get_node_id(triple.subject), get_node_id(triple.object)) for triple in to_verify_triples]
             id_with_triple: Dict[str, wikidata.WikiTriple] = {}
             for triple in retrieved_triples:
                 id = (get_node_id(triple.subject), get_node_id(triple.object))
@@ -408,7 +384,7 @@ class WorkingMemory:
             retriever = wikidata.WikidataEntityRetrievalTool()
             results = retriever.invoke({
                 "query": list(to_fetch_entities),
-                "num_entities": 1,
+                "num_entities": 1, # Only need to fetch one entity for each missing entity due to want to convert 1-1 
                 "get_details": False,
             })
             for item, result in zip(to_fetch_entities, results):

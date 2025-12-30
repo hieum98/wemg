@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Union, Any
 import datasets
 import asyncio
 import threading
+from tqdm import tqdm
 
 from wemg.main import WEMGSystem
 from wemg.agents.roles.evaluator import Evaluator, AnswerEvaluationInput
@@ -175,13 +176,16 @@ def compute_acc_batch(
             for idx, task in enumerate(acc_tasks)
         }
         
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                logger.error(f"Error computing Acc for task {idx}: {e}")
-                results[idx] = 0.0
+        # Progress bar compatible with parallel processing
+        with tqdm(total=len(acc_tasks), desc="Computing Acc scores", unit="question") as pbar:
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    logger.error(f"Error computing Acc for task {idx}: {e}")
+                    results[idx] = 0.0
+                pbar.update(1)
     
     return results
 
@@ -391,6 +395,150 @@ class DatasetEvaluator:
             self._save_results(result_dataset, output_path)
         
         return result_dataset
+
+    def score_dataset_from_predictions(
+        self,
+        dataset: datasets.Dataset,
+        output_path: Optional[Union[str, Path]] = None,
+        resume: bool = True,
+        question_column: str = "question",
+        answer_column: str = "answer",
+        predicted_answer_column: str = "predicted_answer",
+        concise_answer_column: Optional[str] = "concise_answer",
+        pass_at_k_column: str = "pass_at_k",
+        batch_size: int = 8,
+        max_workers: Optional[int] = None,
+        compute_acc_scores: bool = True,
+        overwrite_existing_scores: bool = False,
+    ) -> datasets.Dataset:
+        """Compute metrics for a dataset that already contains model predictions.
+
+        This does NOT call `self.system.answer()`. It only reads an existing
+        prediction column (default: `predicted_answer`) and computes:
+        - `sub_em` (using `concise_answer` if present else `predicted_answer`)
+        - `acc_score` (optional; uses Evaluator role via LLM)
+        - keeps `pass_at_k` if present in input
+
+        The output dataset always contains the canonical columns used by
+        `compute_aggregate_metrics`: `predicted_answer`, `concise_answer`,
+        `sub_em`, `acc_score`, `pass_at_k`, `error`, `metadata`.
+        """
+        # Validate required columns exist
+        for col in (question_column, answer_column, predicted_answer_column):
+            if col not in dataset.column_names:
+                raise ValueError(
+                    f"Column '{col}' not found in dataset. Available columns: {dataset.column_names}"
+                )
+
+        output_path = Path(output_path) if output_path else None
+        log_path = None
+        logged_results: Dict[int, Dict[str, Any]] = {}
+        if output_path:
+            log_path = output_path / "scoring_log.jsonl"
+            if resume and log_path.exists():
+                logged_results = self._load_logged_results(log_path)
+                if logged_results:
+                    logger.info(f"Resuming scoring: {len(logged_results)} questions already logged")
+
+        results: List[Optional[Dict[str, Any]]] = [None] * len(dataset)
+
+        # Seed results from scoring log if resuming
+        if logged_results:
+            for idx, r in logged_results.items():
+                if 0 <= idx < len(results):
+                    results[idx] = r
+
+        # Build tasks for per-item metric computation (Sub-EM, etc.)
+        tasks: List[tuple] = []
+        for idx, example in enumerate(dataset):
+            # If resuming and we already have what we need, skip
+            if resume and results[idx] is not None and not overwrite_existing_scores:
+                already_has_sub_em = results[idx].get("sub_em") is not None
+                already_has_acc = results[idx].get("acc_score") is not None
+                if already_has_sub_em and ((not compute_acc_scores) or already_has_acc):
+                    continue
+
+            tasks.append((idx, example))
+
+        # First pass: compute Sub-EM synchronously and collect Acc tasks
+        acc_tasks: List[Dict[str, Any]] = []
+        for idx, example in tqdm(tasks, desc="Scoring (Sub-EM)", unit="question"):
+            merged = dict(example)
+            result = self._create_empty_result()
+
+            try:
+                correct_answers = self._normalize_answer_field(example.get(answer_column, None))
+                if not correct_answers:
+                    raise ValueError("No correct answers provided")
+
+                predicted_answer = example.get(predicted_answer_column, None)
+                if predicted_answer is None or str(predicted_answer).strip() == "":
+                    raise ValueError(f"No predicted answer in column '{predicted_answer_column}'")
+
+                concise_answer = None
+                if concise_answer_column and concise_answer_column in example:
+                    concise_answer = example.get(concise_answer_column, None)
+
+                # Canonical output fields
+                result["predicted_answer"] = str(predicted_answer)
+                result["concise_answer"] = str(concise_answer) if concise_answer is not None else None
+                result["pass_at_k"] = example.get(pass_at_k_column, None) if pass_at_k_column in example else None
+
+                # Sub-EM: prefer concise answer if available, else predicted answer
+                sub_em_text = result["concise_answer"] or result["predicted_answer"]
+                result["sub_em"] = compute_sub_em(sub_em_text, correct_answers)
+
+                # Acc: compute later in batch unless already present
+                existing_acc = example.get("acc_score", None)
+                if overwrite_existing_scores:
+                    existing_acc = None
+                if compute_acc_scores and existing_acc is None:
+                    acc_tasks.append(
+                        {
+                            "idx": idx,
+                            "question": example.get(question_column, ""),
+                            "predicted_answer": result["predicted_answer"],
+                            "correct_answers": correct_answers,
+                        }
+                    )
+                else:
+                    result["acc_score"] = existing_acc
+
+            except Exception as e:
+                result["error"] = str(e)
+
+            merged = {**merged, **result}
+            results[idx] = merged
+            if log_path:
+                self._log_result(idx, merged, log_path)
+
+        # Second pass: compute Acc in parallel (optional)
+        if compute_acc_scores and acc_tasks:
+            logger.info(f"Computing Acc scores for {len(acc_tasks)} questions in parallel...")
+            acc_scores = compute_acc_batch(
+                [
+                    {
+                        "question": t["question"],
+                        "predicted_answer": t["predicted_answer"],
+                        "correct_answers": t["correct_answers"],
+                    }
+                    for t in acc_tasks
+                ],
+                self.system.llm_agent,
+                max_workers=max_workers or min(batch_size, 8),
+            )
+
+            for task, score in zip(acc_tasks, acc_scores):
+                idx = task["idx"]
+                if results[idx] is not None:
+                    results[idx]["acc_score"] = score
+                    if log_path:
+                        self._log_result(idx, results[idx], log_path)
+
+        result_dataset = datasets.Dataset.from_list(results)
+        if output_path:
+            self._save_results(result_dataset, output_path)
+        return result_dataset
     
     def _process_parallel(
         self,
@@ -436,34 +584,39 @@ class DatasetEvaluator:
             
             acc_tasks = []
             
-            for future in as_completed(future_to_idx):
-                try:
-                    idx, merged_result = future.result()
-                    results[idx] = merged_result
+            # Progress bar compatible with parallel processing
+            with tqdm(total=len(tasks), desc="Evaluating", unit="question") as pbar:
+                for future in as_completed(future_to_idx):
+                    try:
+                        idx, merged_result = future.result()
+                        results[idx] = merged_result
+                        
+                        if log_path:
+                            self._log_result(idx, merged_result, log_path)
+                        
+                        if merged_result.get('predicted_answer') and not merged_result.get('error'):
+                            original_task = next((t for t in tasks if t[0] == idx), None)
+                            if original_task:
+                                acc_tasks.append({
+                                    'idx': idx,
+                                    'question': original_task[2],
+                                    'predicted_answer': merged_result['predicted_answer'],
+                                    'correct_answers': self._normalize_answer_field(original_task[3])
+                                })
+                    except Exception as e:
+                        idx = future_to_idx[future]
+                        logger.error(f"Error getting result for question {idx}: {e}")
+                        error_result = {
+                            **next((t[1] for t in tasks if t[0] == idx), {}),
+                            **self._create_empty_result(),
+                            'error': str(e)
+                        }
+                        results[idx] = error_result
+                        if log_path:
+                            self._log_result(idx, error_result, log_path)
                     
-                    if log_path:
-                        self._log_result(idx, merged_result, log_path)
-                    
-                    if merged_result.get('predicted_answer') and not merged_result.get('error'):
-                        original_task = next((t for t in tasks if t[0] == idx), None)
-                        if original_task:
-                            acc_tasks.append({
-                                'idx': idx,
-                                'question': original_task[2],
-                                'predicted_answer': merged_result['predicted_answer'],
-                                'correct_answers': self._normalize_answer_field(original_task[3])
-                            })
-                except Exception as e:
-                    idx = future_to_idx[future]
-                    logger.error(f"Error getting result for question {idx}: {e}")
-                    error_result = {
-                        **next((t[1] for t in tasks if t[0] == idx), {}),
-                        **self._create_empty_result(),
-                        'error': str(e)
-                    }
-                    results[idx] = error_result
-                    if log_path:
-                        self._log_result(idx, error_result, log_path)
+                    # Update progress bar after each task completes
+                    pbar.update(1)
         
         self._compute_and_update_acc_scores(acc_tasks, results, log_path, max_workers)
     

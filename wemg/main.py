@@ -128,7 +128,8 @@ class WEMGSystem:
         if self._initialized:
             return
         
-        logger.info("Initializing WEMG system...")
+        print("Initializing WEMG system...")
+        print(f"Configuration:\n{OmegaConf.to_yaml(self.cfg)}")
         
         # Initialize LLM agent
         self.llm_agent = self._create_llm_agent()
@@ -137,7 +138,7 @@ class WEMGSystem:
         self.retriever_agent = self._create_retriever_agent()
         
         self._initialized = True
-        logger.info("WEMG system initialized successfully.")
+        print("WEMG system initialized successfully.")
     
     def _create_llm_agent(self) -> BaseLLMAgent:
         """Create the LLM agent based on configuration."""

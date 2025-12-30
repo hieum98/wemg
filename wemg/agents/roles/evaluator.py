@@ -22,7 +22,8 @@ JUDGE_ANSWER_PROMPT = """You are an expert evaluator. Rate from 0.0 to 10.0 how 
 
 Criteria:
 - Helpfulness & Relevance: How does the answer address the user's core need?
-- Correctness: Is information accurate (using correct_answer as reference if available else use your own knowledge or your own internet search)? If correct_answer matches system_answer, give 10.0.
+- Correctness: Is information accurate? If correct_answer is provided and system_answer matches correct_answer, give 10.0. If correct_answer is not provided, use your own knowledge or your own internet search to determine whether the answer is correct. 
+- The score should be based on both correctness and helpfulness & relevance.
 """
 
 MAJORITY_VOTE_PROMPT = """You are an expert at evaluating answers. Given a question and answers, determine the final answer based on majority voting.

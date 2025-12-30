@@ -84,7 +84,7 @@ class NodeGenerator:
                 use_question_for_graph_retrieval=self.kwargs.get('use_question_for_graph_retrieval', True),
                 interaction_memory=self.interaction_memory
             )
-
+            retrieved_documents = list(set(retrieved_documents))
             # Extract information from web search results
             extractor_inputs = [
                 roles.extractor.ExtractionInput(question=question, raw_data=data) 

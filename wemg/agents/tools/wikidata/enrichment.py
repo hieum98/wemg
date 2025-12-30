@@ -1,7 +1,7 @@
 """Centralized enrichment logic for Wikidata entities and properties."""
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from wemg.agents.tools.wikidata.models import (
     WikidataEntity,

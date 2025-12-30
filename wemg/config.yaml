@@ -80,7 +80,7 @@ search:
     max_simulation_depth: 5  # Maximum depth for simulation rollouts
     exploration_weight: 1.0  # UCT exploration parameter
     is_cot_simulation: true  # Use CoT for simulation phase
-    use_golden_answer_for_reward: true  # Use golden answer for reward function
+    use_golden_answer_for_reward: False  # Use golden answer for reward function
     
     # Early termination settings
     early_termination:
