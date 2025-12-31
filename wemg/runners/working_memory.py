@@ -136,6 +136,7 @@ class WorkingMemory:
         subject_id = get_node_id(wiki_triple.subject)
         object_id = get_node_id(wiki_triple.object)
         
+        logger.info(f"Adding edge to graph memory: {str(wiki_triple)}")
         # Add nodes if missing
         for node_id, data in [(subject_id, wiki_triple.subject), (object_id, wiki_triple.object)]:
             if not self.graph_memory.has_node(node_id):

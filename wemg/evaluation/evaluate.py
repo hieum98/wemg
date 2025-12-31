@@ -30,7 +30,7 @@ def preprocess_dataset(dataset_name_or_path: str, max_examples: Optional[int] = 
                 'question': example['question'],
                 'answer': list(set(all_answers))
             }
-        data = data.map(preprocess_example, batched=True, batch_size=1000, num_proc=os.cpu_count(), remove_columns=['answers'])
+        data = data.map(preprocess_example, num_proc=os.cpu_count(), remove_columns=['answers'])
     elif dataset_name_or_path == 'webqsp':
         data = datasets.load_dataset('ml1996/webqsp', split='test')
         to_remove_columns = set(data.column_names) - set(['question', 'answer'])

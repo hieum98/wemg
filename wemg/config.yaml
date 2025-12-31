@@ -22,7 +22,7 @@ llm:
   # Generation parameters
   generation:
     timeout: 300
-    temperature: 0.7
+    temperature: 0.8  # Increased for more diverse outputs
     n: 1  # Number of samples to generate
     top_p: 0.8
     max_tokens: 32768
@@ -75,20 +75,20 @@ search:
   
   # MCTS-specific settings
   mcts:
-    num_iterations: 10  # Number of MCTS iterations
+    num_iterations: 30  # Number of MCTS iterations (increased for more exploration)
     max_tree_depth: 10  # Maximum depth of the search tree
     max_simulation_depth: 5  # Maximum depth for simulation rollouts
-    exploration_weight: 2.0  # UCT exploration parameter
+    exploration_weight: 2.5  # UCT exploration parameter (increased for more exploration)
     is_cot_simulation: true  # Use CoT for simulation phase
     use_golden_answer_for_reward: False  # Use golden answer for reward function
     
     # Early termination settings
     early_termination:
       enabled: true  # Enable early termination
-      min_iterations: 3  # Minimum iterations before termination
+      min_iterations: 5  # Minimum iterations before termination (increased)
       high_confidence_threshold: 0.9  # Reward threshold for immediate termination
-      convergence_patience: 3  # Iterations without improvement before termination
-      semantic_sufficiency_count: 4  # Number of "sufficient info" signals before termination
+      convergence_patience: 5  # Iterations without improvement before termination (increased)
+      semantic_sufficiency_count: 3  # Number of "sufficient info" signals before termination (increased)
   
   # CoT-specific settings
   cot:
@@ -98,7 +98,8 @@ search:
 # Node Generation Parameters
 # =====================================================================
 node_generation:
-  n: 1  # Number of candidates to generate per node
+  n: 1  # Number of candidates to generate per node (for deterministic operations)
+  n_subquestions: 3  # Number of diverse subquestions to generate (for tree branching)
   top_k_websearch: 5  # Top-k web search results
   top_k_entities: 3  # Top-k entities from knowledge graph
   top_k_properties: 3  # Top-k properties from knowledge graph
@@ -115,7 +116,7 @@ memory:
   
   # Interaction memory settings (logging)
   interaction_memory:
-    enabled: false
+    enabled: True
     log_dir: "./logs"  # Directory for interaction logs
     save_to_file: false
     
@@ -129,7 +130,7 @@ memory:
     batch_size_async: 100  # Batch size for async logging
     
     # Embedding settings
-    is_local_embedding_api: false  # Use local embedding API instead of SentenceTransformer
+    is_local_embedding_api: True  # Use local embedding API instead of SentenceTransformer
     embedding_model_name: "Qwen3-Embedding-4B"  # Embedding model name
     embedding_base_url: "http://n0150:4000/v1"  # Embedding API base URL
     embedding_api_key: null  # Embedding API key

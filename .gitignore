@@ -11,3 +11,5 @@ TEST_MARKERS_GUIDE.md
 MCTS_PROFILING_ANALYSIS.md
 .env
 results/
+logs/
+results-v0/*

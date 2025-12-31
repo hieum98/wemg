@@ -47,12 +47,12 @@ def profile_mcts_search(
     """
     # Setup - use environment variables or defaults
     llm_agent = BaseLLMAgent(
-        model_name=os.getenv("TEST_LLM_MODEL", "Qwen3-Next-80B-A3B-Thinking-FP8"),
-        url=os.getenv("TEST_LLM_API_BASE", "http://n0999:4000/v1"),
+        model_name=os.getenv("TEST_LLM_MODEL", "Qwen3-8B"),
+        url=os.getenv("TEST_LLM_API_BASE", "http://n0150:4000/v1"),
         api_key=os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here"),
         temperature=0.7,
         max_tokens=65536,
-        concurrency=2,
+        concurrency=64,
         max_retries=3
     )
     
@@ -64,7 +64,7 @@ def profile_mcts_search(
         # Create embedder config for RetrieverAgent
         embedder_config = {
             'model_name': os.getenv("TEST_EMBEDDING_MODEL", "Qwen3-Embedding-4B"),
-            'url': os.getenv("TEST_EMBEDDING_API_BASE", "http://n0999:4000/v1"),
+            'url': os.getenv("TEST_EMBEDDING_API_BASE", "http://n0150:4000/v1"),
             'api_key': os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here"),
             'is_embedding': True,
             'timeout': 60,
@@ -81,7 +81,14 @@ def profile_mcts_search(
         retriever_agent = WebSearchTool(serper_api_key=serper_api_key)
     
     working_memory = WorkingMemory()
-    interaction_memory = InteractionMemory()
+    
+    # Use remote embedding API for InteractionMemory to avoid local SentenceTransformer overhead
+    interaction_memory = InteractionMemory(
+        is_local_embedding_api=True,
+        embedding_model_name=os.getenv("TEST_EMBEDDING_MODEL", "Qwen3-Embedding-4B"),
+        embedding_base_url=os.getenv("TEST_EMBEDDING_API_BASE", "http://n0150:4000/v1"),
+        embedding_api_key=os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here"),
+    )
     
     if question is None:
         question = "Which magazine was started first Arthur's Magazine or First for Women?"
@@ -95,6 +102,7 @@ def profile_mcts_search(
     print(f"  max_tree_depth: {max_tree_depth}")
     print(f"  max_simulation_depth: {max_simulation_depth}")
     print(f"  retriever_agent: {type(retriever_agent).__name__}")
+    print(f"  interaction_memory: remote embedding API")
     print()
     
     # Create profiler
@@ -203,12 +211,12 @@ def profile_mcts_components(
     
     # Setup
     llm_agent = BaseLLMAgent(
-        model_name=os.getenv("TEST_LLM_MODEL", "Qwen3-Next-80B-A3B-Thinking-FP8"),
-        url=os.getenv("TEST_LLM_API_BASE", "http://n0999:4000/v1"),
+        model_name=os.getenv("TEST_LLM_MODEL", "Qwen3-8B"),
+        url=os.getenv("TEST_LLM_API_BASE", "http://n0150:4000/v1"),
         api_key=os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here"),
         temperature=0.7,
         max_tokens=65536,
-        concurrency=2,
+        concurrency=64,
         max_retries=3
     )
     
@@ -217,7 +225,7 @@ def profile_mcts_components(
         # Create embedder config for RetrieverAgent
         embedder_config = {
             'model_name': os.getenv("TEST_EMBEDDING_MODEL", "Qwen3-Embedding-4B"),
-            'url': os.getenv("TEST_EMBEDDING_API_BASE", "http://n0999:4000/v1"),
+            'url': os.getenv("TEST_EMBEDDING_API_BASE", "http://n0150:4000/v1"),
             'api_key': os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here"),
             'is_embedding': True,
             'timeout': 60,
@@ -234,7 +242,14 @@ def profile_mcts_components(
         retriever_agent = WebSearchTool(serper_api_key=serper_api_key)
     
     working_memory = WorkingMemory()
-    interaction_memory = InteractionMemory()
+    
+    # Use remote embedding API for InteractionMemory to avoid local SentenceTransformer overhead
+    interaction_memory = InteractionMemory(
+        is_local_embedding_api=True,
+        embedding_model_name=os.getenv("TEST_EMBEDDING_MODEL", "Qwen3-Embedding-4B"),
+        embedding_base_url=os.getenv("TEST_EMBEDDING_API_BASE", "http://n0150:4000/v1"),
+        embedding_api_key=os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here"),
+    )
     
     if question is None:
         question = "Which magazine was started first Arthur's Magazine or First for Women?"
@@ -273,13 +288,13 @@ def profile_mcts_components(
         # Expansion
         if not selected.is_terminal():
             start = time.time()
-            children = expand(
+            children, has_semantic_signal = expand(
                 tree, selected, llm_agent, retriever_agent, working_memory,
                 interaction_memory, is_cot_simulation=False,
                 top_k_websearch=5, top_k_entities=1, top_k_properties=1, n_hops=1, n=1
             )
             expansion_times.append(time.time() - start)
-            print(f"  Expansion: {expansion_times[-1]:.4f}s")
+            print(f"  Expansion: {expansion_times[-1]:.4f}s (semantic_signal={has_semantic_signal})")
             if children:
                 selected = children[0]
         else:
@@ -288,14 +303,14 @@ def profile_mcts_components(
         # Simulation
         if not selected.is_terminal():
             start = time.time()
-            terminal = simulate(
+            terminal, has_semantic_signal = simulate(
                 selected, llm_agent, retriever_agent, working_memory,
                 interaction_memory, is_cot_simulation=True, 
                 max_simulation_depth=max_simulation_depth,
                 top_k_websearch=5, top_k_entities=1, top_k_properties=1, n_hops=1, n=1
             )
             simulation_times.append(time.time() - start)
-            print(f"  Simulation: {simulation_times[-1]:.4f}s")
+            print(f"  Simulation: {simulation_times[-1]:.4f}s (semantic_signal={has_semantic_signal})")
         else:
             terminal = selected
             simulation_times.append(0.0)

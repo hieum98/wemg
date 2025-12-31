@@ -4,6 +4,7 @@ import gc
 from typing import Dict, List, Optional, Union
 import logging
 import os
+import time
 import uuid
 import chromadb
 from chromadb.utils import embedding_functions
@@ -164,7 +165,20 @@ class InteractionMemory:
             self.db_client = chromadb.PersistentClient(path=db_path)
         else:
             logger.info("Using in-memory database")
-            self.db_client = chromadb.EphemeralClient()
+            # Retry logic for ChromaDB EphemeralClient - handles race conditions in multi-process environments
+            # where Rust bindings may not be fully initialized
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    self.db_client = chromadb.EphemeralClient()
+                    break
+                except (ValueError, AttributeError) as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"ChromaDB EphemeralClient initialization failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying...")
+                        time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                    else:
+                        logger.error(f"ChromaDB EphemeralClient initialization failed after {max_retries} attempts")
+                        raise
         self.collection = self.db_client.get_or_create_collection(
             name=collection_name,
             embedding_function=self.embedding_function,
@@ -178,6 +192,30 @@ class InteractionMemory:
         # Embedding cache to avoid recomputing same query embeddings
         self._embedding_cache = {} if enable_embedding_cache else None
         self._cache_max_size = 10000  # Limit cache size to prevent memory issues
+        
+        # Role-level count cache to skip embedding for roles with no examples
+        # This avoids expensive embedding computation when a role has zero documents
+        self._role_count_cache: Dict[str, int] = {}
+        self._init_role_count_cache()
+    
+    def _init_role_count_cache(self):
+        """Initialize role count cache from existing collection data."""
+        self._role_count_cache = {}
+        count = self.collection.count()
+        if count > 0:
+            results = self.collection.get()
+            for metadata in results.get('metadatas', []):
+                role = metadata.get('role')
+                if role:
+                    self._role_count_cache[role] = self._role_count_cache.get(role, 0) + 1
+    
+    def _get_role_count(self, role: str) -> int:
+        """Get cached count for a role. Returns 0 if role not in cache."""
+        return self._role_count_cache.get(role, 0)
+    
+    def _increment_role_count(self, role: str, count: int = 1):
+        """Increment the cached count for a role."""
+        self._role_count_cache[role] = self._role_count_cache.get(role, 0) + count
     
     def get_info(self):
         count = self.collection.count()
@@ -281,6 +319,9 @@ class InteractionMemory:
                 ids=turn_ids
             )
             
+            # Update role count cache
+            self._increment_role_count(role, len(batch_inputs))
+            
             # Clear references to help with memory management
             del turn_ids, metadatas, documents
             if batch_end < total_entries:
@@ -305,6 +346,10 @@ class InteractionMemory:
         """
         # Early exit if collection is empty
         if self.collection.count() == 0:
+            return []
+        
+        # Early exit if role has no examples (avoids expensive embedding computation)
+        if self._get_role_count(role) == 0:
             return []
 
         query_token_count = approximate_token_count(query)

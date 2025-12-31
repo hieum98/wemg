@@ -171,43 +171,57 @@ class MCTSReasoningNode(BaseReasoningNode):
         self, 
         generator: NodeGenerator
     ) -> Tuple[List["MCTSReasoningNode"], GenerationResult, bool]:
-        """Generate sub-question/answer nodes."""
-        # Get question (may be rephrased)
+        """Generate sub-question/answer nodes for ALL diverse subquestions."""
+        # Get subquestions (may be from rephrased node or freshly generated)
         if self.node_type == NodeType.REPHRASED_QUESTION_NODE:
-            subquestion = self.node_state.content['sub_question']
+            # For rephrased questions, use the single rephrased question
+            subquestions = [self.node_state.content['sub_question']]
             subq_log = {}
             should_direct_answer = False
         else:
-            subquestion, should_direct_answer, subq_log = await generator.generate_subquestion(
+            # Generate multiple diverse subquestions for tree branching
+            subquestions, should_direct_answer, subq_log = await generator.generate_subquestion(
                 self.user_question
             )
-            if should_direct_answer or not subquestion:
+            if should_direct_answer or not subquestions:
                 nodes, result, _ = await self._generate_final_answer_nodes(generator)
                 # Merge subquestion log with answer log
                 merged_log = merge_logs(subq_log, result.log_data)
                 result.log_data = merged_log
                 return nodes, result, True
         
-        # Generate answer for subquestion
-        result = await generator.generate_answer(subquestion, should_explore=True)
+        # Generate answer nodes for ALL subquestions concurrently (creates multiple branches)
+        results = await asyncio.gather(*[
+            generator.generate_answer(subq, should_explore=True) for subq in subquestions
+        ])
         
+        # Process results and create nodes
         nodes = []
-        for answer in result.answers:
-            state = NodeState(
-                node_type=NodeType.SUB_QA_NODE,
-                content={
-                    'user_question': self.user_question,
-                    'sub_question': subquestion,
-                    'sub_answer': answer.answer,
-                    'reasoning': answer.reasoning,
-                }
-            )
-            nodes.append(MCTSReasoningNode(node_state=state, max_depth=self.max_depth))
+        all_logs = [subq_log]
+        last_result = None
         
-        log = merge_logs(subq_log, result.log_data)
-        result.log_data = log
+        for subquestion, result in zip(subquestions, results):
+            last_result = result
+            all_logs.append(result.log_data)
+            
+            for answer in result.answers:
+                state = NodeState(
+                    node_type=NodeType.SUB_QA_NODE,
+                    content={
+                        'user_question': self.user_question,
+                        'sub_question': subquestion,
+                        'sub_answer': answer.answer,
+                        'reasoning': answer.reasoning,
+                    }
+                )
+                nodes.append(MCTSReasoningNode(node_state=state, max_depth=self.max_depth))
         
-        return nodes, result, False  # No semantic sufficiency signal when generating sub-QA
+        # Use last_result as the return result, with merged logs
+        if last_result is None:
+            last_result = GenerationResult(log_data={})
+        last_result.log_data = merge_logs(*all_logs)
+        
+        return nodes, last_result, False  # No semantic sufficiency signal when generating sub-QA
 
     async def _rephrase_nodes(
         self, 
@@ -541,7 +555,7 @@ def mcts_search(
                 interaction_memory, is_cot_simulation=False, **kwargs
             )
             if children:
-                selected = children[0] # More deterministic to select the first child
+                selected = random.choice(children)  # Random selection for diversity
                 
                 # Track semantic sufficiency signals: when should_direct_answer=True or is_answerable=True
                 if has_semantic_signal:

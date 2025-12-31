@@ -370,16 +370,17 @@ class TestGenerateSubquestion:
             source=roles.extractor.SourceType.RETRIEVAL
         )
         
-        subquestion, should_direct_answer, log_data = asyncio.run(
+        subquestions, should_direct_answer, log_data = asyncio.run(
             node_generator_with_websearch.generate_subquestion(question)
         )
         
-        # Should be answerable with context
-        assert should_direct_answer is True or subquestion is None
+        # Should be answerable with context (returns list of subquestions)
+        assert isinstance(subquestions, list)
+        assert should_direct_answer is True or len(subquestions) == 0
         
         print(f"✓ generate_subquestion (answerable case)")
         print(f"  Should direct answer: {should_direct_answer}")
-        print(f"  Subquestion: {subquestion}")
+        print(f"  Subquestions: {subquestions}")
     
     @pytest.mark.slow
     def test_generate_subquestion_not_answerable(self, node_generator_with_websearch):
@@ -392,34 +393,38 @@ class TestGenerateSubquestion:
             source=roles.extractor.SourceType.RETRIEVAL
         )
         
-        subquestion, should_direct_answer, log_data = asyncio.run(
+        subquestions, should_direct_answer, log_data = asyncio.run(
             node_generator_with_websearch.generate_subquestion(question)
         )
         
-        # Should generate a subquestion since context is insufficient
+        # Should generate subquestions since context is insufficient (returns list)
+        assert isinstance(subquestions, list)
         if not should_direct_answer:
-            assert subquestion is not None
-            assert len(subquestion) > 0
+            assert len(subquestions) > 0
+            for sq in subquestions:
+                assert isinstance(sq, str)
+                assert len(sq) > 0
         
         print(f"✓ generate_subquestion (not answerable case)")
         print(f"  Should direct answer: {should_direct_answer}")
-        print(f"  Subquestion: {subquestion}")
+        print(f"  Subquestions: {subquestions}")
     
     @pytest.mark.slow
     def test_generate_subquestion_empty_memory(self, node_generator_with_websearch):
         """Test subquestion generation with empty working memory."""
         question = "What is the capital of France?"
         
-        subquestion, should_direct_answer, log_data = asyncio.run(
+        subquestions, should_direct_answer, log_data = asyncio.run(
             node_generator_with_websearch.generate_subquestion(question)
         )
         
-        # Without context, should generate subquestion or indicate not answerable
+        # Without context, should generate subquestions or indicate not answerable (returns list)
+        assert isinstance(subquestions, list)
         assert isinstance(should_direct_answer, bool)
         
         print(f"✓ generate_subquestion (empty memory)")
         print(f"  Should direct answer: {should_direct_answer}")
-        print(f"  Subquestion: {subquestion}")
+        print(f"  Subquestions: {subquestions}")
 
 
 # ============================================================================
@@ -705,20 +710,21 @@ class TestNodeGeneratorIntegration:
         """Test workflow: generate subquestion, then answer it."""
         main_question = "Who was the president of France when the Eiffel Tower was built?"
         
-        # Generate subquestion
-        subquestion, should_direct, _ = asyncio.run(
+        # Generate subquestions (returns list for MCTS diversity)
+        subquestions, should_direct, _ = asyncio.run(
             node_generator_with_websearch.generate_subquestion(main_question)
         )
         
         print(f"✓ Subquestion workflow")
         print(f"  Main question: {main_question}")
         print(f"  Should direct answer: {should_direct}")
-        print(f"  Subquestion: {subquestion}")
+        print(f"  Subquestions: {subquestions}")
         
-        # If a subquestion was generated, we could answer it
-        if subquestion:
+        # If subquestions were generated, we could answer them
+        if subquestions:
             # This would be done in a real workflow
-            print(f"  Would answer subquestion: {subquestion}")
+            for sq in subquestions:
+                print(f"  Would answer subquestion: {sq}")
     
     @pytest.mark.slow
     def test_rephrase_to_answer_workflow(self, node_generator_with_websearch):

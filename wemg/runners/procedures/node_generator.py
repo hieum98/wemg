@@ -138,11 +138,14 @@ class NodeGenerator:
             log_data=log_data
         )
     
-    async def generate_subquestion(self, user_question: str) -> Tuple[Optional[str], bool, Dict]:
-        """Generate a subquestion to advance reasoning.
+    async def generate_subquestion(self, user_question: str) -> Tuple[List[str], bool, Dict]:
+        """Generate subquestions to advance reasoning.
         
         Returns:
-            Tuple of (subquestion, should_direct_answer, log_data)
+            Tuple of (subquestions_list, should_direct_answer, log_data)
+            - subquestions_list: List of all unanswerable subquestions for tree branching
+            - should_direct_answer: True if most generated subquestions are already answerable
+            - log_data: Logging data from the generation
         """
         memory = self.working_memory.format_textual_memory()
         context = format_context(memory=memory)
@@ -151,23 +154,25 @@ class NodeGenerator:
             question=user_question, 
             context=context
         )
+        # Use n_subquestions for diverse subquestion generation
+        n_subq = self.kwargs.get('n_subquestions', 3)
         subquestions, subq_log = await execute_role(
             llm_agent=self.llm_agent,
             role=roles.generator.SubquestionGenerator(),
             input_data=subq_input,
             interaction_memory=self.interaction_memory,
-            n=self.kwargs.get('n', 1)
+            n=n_subq
         )
         
-        # Select an unanswerable subquestion
-        unanswerable = [sq for sq in subquestions if not sq.is_answerable]
-        subquestion = random.choice(unanswerable).subquestion if unanswerable else None
+        # Return ALL unanswerable subquestions for tree branching diversity
+        unanswerable_subquestions = [sq.subquestion for sq in subquestions if not sq.is_answerable]
+        unanswerable_subquestions = list(set(unanswerable_subquestions)) if unanswerable_subquestions else []
         
-        # Calculate if we should directly answer
+        # Calculate if we should directly answer (majority are answerable)
         answerable_count = sum(1 for sq in subquestions if sq and sq.is_answerable)
         should_direct_answer = (answerable_count / len(subquestions)) > 0.5 if subquestions else False
         
-        return subquestion, should_direct_answer, subq_log
+        return unanswerable_subquestions, should_direct_answer, subq_log
     
     async def generate_rephrase(self, question: str) -> Tuple[List[str], Dict]:
         """Generate rephrased versions of a question.

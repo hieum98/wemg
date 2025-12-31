@@ -119,18 +119,22 @@ class CoTReasoningNode(BaseReasoningNode):
         Returns:
             Tuple of (node, GenerationResult). Node is None if no answer generated.
         """
-        # Generate subquestion
-        subquestion, should_direct_answer, subq_log = await generator.generate_subquestion(
+        # Generate subquestions (returns a list for MCTS diversity, but CoT uses only one)
+        subquestions, should_direct_answer, subq_log = await generator.generate_subquestion(
             self.user_question
         )
         
         # Check if we should generate final answer instead
-        if should_direct_answer or not subquestion:
+        # CoT picks the first subquestion from the list (linear chain, not tree)
+        if should_direct_answer or not subquestions:
             node, result = await self._generate_final_answer(generator)
             # Merge subquestion log with answer log
             merged_log = merge_logs(subq_log, result.log_data)
             result.log_data = merged_log
             return node, result
+        
+        # Pick first subquestion for CoT's linear chain
+        subquestion = subquestions[0]
         
         # Generate answer for subquestion
         result: GenerationResult = await generator.generate_answer(subquestion, should_explore=True)

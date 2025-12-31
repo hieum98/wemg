@@ -153,7 +153,7 @@ class ConsensusEvaluationOutput(pydantic.BaseModel):
 
 Evaluator = _create_role(
     "evaluator",
-    JUDGE_ANSWER_PROMPT,
+    JUDGE_ANSWER_PROMPT_V2,
     AnswerEvaluationInput,
     AnswerEvaluationOutput,
     "Evaluation role for multi-hop question answering."
