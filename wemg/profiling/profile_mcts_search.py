@@ -302,7 +302,7 @@ def profile_mcts_components(
         
         # Evaluation
         start = time.time()
-        reward = asyncio.run(evaluate(terminal, llm_agent, interaction_memory))
+        reward = evaluate(terminal, llm_agent, working_memory)
         evaluation_times.append(time.time() - start)
         print(f"  Evaluation: {evaluation_times[-1]:.4f}s")
         

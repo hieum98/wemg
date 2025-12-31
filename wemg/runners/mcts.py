@@ -402,7 +402,12 @@ def evaluate(
     working_memory: WorkingMemory,
     golden_answer: Optional[str] = None
 ) -> float:
-    """Evaluate terminal node and return reward score (0-1)."""
+    """Evaluate terminal node and return reward score in [-1, 1] range.
+    
+    The reward is computed as the average of:
+    - Answer evaluation reward: How well the final answer matches the expected answer
+    - Consensus reward: Agreement between textual and graph-based reasoning
+    """
     question = node.user_question
     if node.node_type != NodeType.FINAL_ANSWER:
         return -1.0 # not a final answer node

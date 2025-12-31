@@ -45,11 +45,11 @@ from wemg.agents.retriever_agent import RetrieverAgent
 # Test Configuration
 # ============================================================================
 
-TEST_LLM_API_BASE = os.getenv("TEST_LLM_API_BASE", "http://n0999:4000/v1")
+TEST_LLM_API_BASE = os.getenv("TEST_LLM_API_BASE", "http://n0142:4000/v1")
 TEST_LLM_API_KEY = os.getenv("TEST_LLM_API_KEY", "sk-your-very-secure-master-key-here")
 TEST_LLM_MODEL = os.getenv("TEST_LLM_MODEL", "Qwen3-Next-80B-A3B-Thinking-FP8")
 
-TEST_EMBEDDING_API_BASE = os.getenv("TEST_EMBEDDING_API_BASE", "http://n0999:4000/v1")
+TEST_EMBEDDING_API_BASE = os.getenv("TEST_EMBEDDING_API_BASE", "http://n0142:4000/v1")
 TEST_EMBEDDING_MODEL = os.getenv("TEST_EMBEDDING_MODEL", "Qwen3-Embedding-4B")
 
 # Wiki corpus configuration for RetrieverAgent tests
@@ -454,28 +454,225 @@ class TestEvaluation:
     
     @pytest.mark.slow
     @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_evaluate_non_final_answer(self, llm_agent, interaction_memory, subqa_node):
+    def test_evaluate_non_final_answer(self, llm_agent, working_memory, subqa_node):
         """Test evaluation of non-final answer node with real LLM."""
-        reward = await evaluate(subqa_node, llm_agent, interaction_memory)
+        reward = evaluate(subqa_node, llm_agent, working_memory)
         
-        # Non-final answer should return low reward
-        assert reward == 0.1
+        # Non-final answer should return -1.0 (penalty for non-terminal nodes)
+        assert reward == -1.0
         
         print(f"✓ evaluate non-final answer")
         print(f"  Reward: {reward}")
     
     @pytest.mark.slow
     @pytest.mark.integration
-    @pytest.mark.asyncio
-    async def test_evaluate_final_answer(self, llm_agent, interaction_memory, terminal_node):
+    def test_evaluate_final_answer(self, llm_agent, working_memory, terminal_node):
         """Test evaluation of final answer node with real LLM."""
-        reward = await evaluate(terminal_node, llm_agent, interaction_memory)
+        reward = evaluate(terminal_node, llm_agent, working_memory)
         
-        # Should return a reward between 0 and 1
-        assert 0.0 <= reward <= 1.0
+        # Should return a reward between -1 and 1 (normalized reward range)
+        assert -1.0 <= reward <= 1.0
         
         print(f"✓ evaluate final answer")
+        print(f"  Reward: {reward:.2f}")
+    
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_evaluate_with_golden_answer(self, llm_agent, working_memory, terminal_node):
+        """Test evaluation with a provided golden answer."""
+        golden_answer = "Paris"
+        reward = evaluate(terminal_node, llm_agent, working_memory, golden_answer=golden_answer)
+        
+        # Should return a reward between -1 and 1
+        assert -1.0 <= reward <= 1.0
+        
+        print(f"✓ evaluate with golden answer")
+        print(f"  Golden answer: {golden_answer}")
+        print(f"  Reward: {reward:.2f}")
+    
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_evaluate_with_empty_memory(self, llm_agent, sample_question):
+        """Test evaluation with completely empty working memory."""
+        empty_memory = WorkingMemory()
+        
+        terminal_state = NodeState(
+            node_type=NodeType.FINAL_ANSWER,
+            content={
+                'user_question': sample_question,
+                'final_answer': 'Paris is the capital of France.',
+                'concise_answer': 'Paris'
+            }
+        )
+        terminal = MCTSReasoningNode(node_state=terminal_state, max_depth=10)
+        
+        reward = evaluate(terminal, llm_agent, empty_memory, golden_answer="Paris")
+        
+        # Should still return a valid reward even with empty memory
+        assert -1.0 <= reward <= 1.0
+        
+        print(f"✓ evaluate with empty memory")
+        print(f"  Reward: {reward:.2f}")
+    
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_evaluate_with_textual_memory_only(self, llm_agent, sample_question):
+        """Test evaluation with only textual memory populated."""
+        memory = WorkingMemory()
+        memory.add_textual_memory("Paris is the capital of France.")
+        memory.add_textual_memory("France is a country in Western Europe.")
+        memory.add_textual_memory("The Eiffel Tower is located in Paris.")
+        
+        terminal_state = NodeState(
+            node_type=NodeType.FINAL_ANSWER,
+            content={
+                'user_question': sample_question,
+                'final_answer': 'Paris is the capital of France.',
+                'concise_answer': 'Paris'
+            }
+        )
+        terminal = MCTSReasoningNode(node_state=terminal_state, max_depth=10)
+        
+        reward = evaluate(terminal, llm_agent, memory, golden_answer="Paris")
+        
+        assert -1.0 <= reward <= 1.0
+        
+        print(f"✓ evaluate with textual memory only")
+        print(f"  Textual memory items: {len(memory.textual_memory)}")
+        print(f"  Reward: {reward:.2f}")
+    
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_evaluate_with_graph_memory_only(self, llm_agent, sample_question):
+        """Test evaluation with only graph memory populated."""
+        from wemg.agents.tools.wikidata.models import WikidataEntity, WikidataProperty, WikiTriple
+        
+        memory = WorkingMemory()
+        
+        # Add a simple graph: Paris -> capital of -> France
+        paris = WikidataEntity(qid="Q90", label="Paris")
+        france = WikidataEntity(qid="Q142", label="France")
+        capital_of = WikidataProperty(pid="P1376", label="capital of")
+        
+        triple = WikiTriple(subject=paris, relation=capital_of, object=france)
+        memory.add_edge_to_graph_memory(triple)
+        
+        terminal_state = NodeState(
+            node_type=NodeType.FINAL_ANSWER,
+            content={
+                'user_question': sample_question,
+                'final_answer': 'Paris is the capital of France.',
+                'concise_answer': 'Paris'
+            }
+        )
+        terminal = MCTSReasoningNode(node_state=terminal_state, max_depth=10)
+        
+        reward = evaluate(terminal, llm_agent, memory, golden_answer="Paris")
+        
+        assert -1.0 <= reward <= 1.0
+        
+        print(f"✓ evaluate with graph memory only")
+        print(f"  Graph nodes: {memory.graph_memory.number_of_nodes()}")
+        print(f"  Graph edges: {memory.graph_memory.number_of_edges()}")
+        print(f"  Reward: {reward:.2f}")
+    
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_evaluate_with_rich_supporting_context(self, llm_agent):
+        """Test evaluation with rich context that strongly supports the answer."""
+        question = "Who was the president of the United States when the first iPhone was released?"
+        
+        memory = WorkingMemory()
+        memory.add_textual_memory("The first iPhone was released on June 29, 2007.")
+        memory.add_textual_memory("George W. Bush served as the 43rd President of the United States from 2001 to 2009.")
+        memory.add_textual_memory("Steve Jobs announced the iPhone at Macworld 2007 on January 9, 2007.")
+        memory.add_textual_memory("George W. Bush was president during the iPhone's launch in 2007.")
+        
+        terminal_state = NodeState(
+            node_type=NodeType.FINAL_ANSWER,
+            content={
+                'user_question': question,
+                'final_answer': 'George W. Bush was the president when the first iPhone was released in 2007.',
+                'concise_answer': 'George W. Bush'
+            }
+        )
+        terminal = MCTSReasoningNode(node_state=terminal_state, max_depth=10)
+        
+        reward = evaluate(terminal, llm_agent, memory, golden_answer="George W. Bush")
+        
+        assert -1.0 <= reward <= 1.0
+        # With strong supporting context and correct answer, expect positive reward
+        print(f"✓ evaluate with rich supporting context")
+        print(f"  Question: {question}")
+        print(f"  Reward: {reward:.2f} (expected positive with correct answer)")
+    
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_evaluate_with_contradicting_context(self, llm_agent):
+        """Test evaluation with context that contradicts the answer."""
+        question = "What is the capital of France?"
+        
+        memory = WorkingMemory()
+        # Deliberately add misleading information
+        memory.add_textual_memory("Lyon is the largest city in France by population.")
+        memory.add_textual_memory("Marseille is a major port city in southern France.")
+        
+        terminal_state = NodeState(
+            node_type=NodeType.FINAL_ANSWER,
+            content={
+                'user_question': question,
+                'final_answer': 'Lyon is the capital of France.',  # Wrong answer
+                'concise_answer': 'Lyon'
+            }
+        )
+        terminal = MCTSReasoningNode(node_state=terminal_state, max_depth=10)
+        
+        reward = evaluate(terminal, llm_agent, memory, golden_answer="Paris")
+        
+        assert -1.0 <= reward <= 1.0
+        # With wrong answer, expect lower/negative reward
+        print(f"✓ evaluate with contradicting context")
+        print(f"  Wrong answer: Lyon (correct: Paris)")
+        print(f"  Reward: {reward:.2f} (expected lower/negative for wrong answer)")
+    
+    @pytest.mark.slow
+    @pytest.mark.integration
+    def test_evaluate_with_mixed_memory(self, llm_agent, sample_question):
+        """Test evaluation with both textual and graph memory populated."""
+        from wemg.agents.tools.wikidata.models import WikidataEntity, WikidataProperty, WikiTriple
+        
+        memory = WorkingMemory()
+        
+        # Add textual memory
+        memory.add_textual_memory("Paris is the capital and largest city of France.")
+        memory.add_textual_memory("France is located in Western Europe.")
+        
+        # Add graph memory
+        paris = WikidataEntity(qid="Q90", label="Paris")
+        france = WikidataEntity(qid="Q142", label="France")
+        capital_of = WikidataProperty(pid="P1376", label="capital of")
+        
+        triple = WikiTriple(subject=paris, relation=capital_of, object=france)
+        memory.add_edge_to_graph_memory(triple)
+        
+        terminal_state = NodeState(
+            node_type=NodeType.FINAL_ANSWER,
+            content={
+                'user_question': sample_question,
+                'final_answer': 'Paris is the capital of France.',
+                'concise_answer': 'Paris'
+            }
+        )
+        terminal = MCTSReasoningNode(node_state=terminal_state, max_depth=10)
+        
+        reward = evaluate(terminal, llm_agent, memory, golden_answer="Paris")
+        
+        assert -1.0 <= reward <= 1.0
+        
+        print(f"✓ evaluate with mixed memory")
+        print(f"  Textual items: {len(memory.textual_memory)}")
+        print(f"  Graph nodes: {memory.graph_memory.number_of_nodes()}")
+        print(f"  Graph edges: {memory.graph_memory.number_of_edges()}")
         print(f"  Reward: {reward:.2f}")
 
 
@@ -975,8 +1172,8 @@ class TestComplexQuestions:
 class TestMCTSIntegration:
     """Integration tests for full MCTS search with real LLM and RetrieverAgent."""
     
-    # @pytest.mark.slow
-    # @pytest.mark.integration
+    @pytest.mark.slow
+    @pytest.mark.integration
     def test_mcts_search_basic(self, llm_agent, retriever_agent, working_memory, interaction_memory, sample_question):
         """Test basic MCTS search functionality with real LLM."""
         result, tree, _ = mcts_search(
@@ -1001,8 +1198,8 @@ class TestMCTSIntegration:
         if result.get('final_answer'):
             print(f"  Final answer: {result['final_answer'][:200]}")
     
-    # @pytest.mark.slow
-    # @pytest.mark.integration
+    @pytest.mark.slow
+    @pytest.mark.integration
     def test_mcts_search_complex_question(self, llm_agent, retriever_agent, working_memory, interaction_memory, complex_question_1):
         """Test MCTS search with complex multi-hop question."""
         result, tree, _ = mcts_search(
@@ -1027,8 +1224,8 @@ class TestMCTSIntegration:
         if result.get('final_answer'):
             print(f"  Final answer: {result['final_answer'][:200]}")
     
-    # @pytest.mark.slow
-    # @pytest.mark.integration
+    @pytest.mark.slow
+    @pytest.mark.integration
     def test_mcts_search_comparison_question(self, llm_agent, retriever_agent, working_memory, interaction_memory, complex_question_2):
         """Test MCTS search with comparison question requiring multiple paths."""
         result, tree, _ = mcts_search(
@@ -1287,15 +1484,16 @@ class TestMCTSIntegration:
     
     @pytest.mark.slow
     @pytest.mark.integration
-    def test_mcts_evaluate(self, llm_agent, interaction_memory, terminal_node):
+    def test_mcts_evaluate(self, llm_agent, working_memory, terminal_node):
         """Test evaluation with real LLM."""
-        reward = asyncio.run(evaluate(
+        reward = evaluate(
             node=terminal_node,
             llm_agent=llm_agent,
-            interaction_memory=interaction_memory
-        ))
+            working_memory=working_memory
+        )
         
-        assert 0.0 <= reward <= 1.0
+        # Reward should be in [-1, 1] range (normalized from rating scale)
+        assert -1.0 <= reward <= 1.0
         
         print(f"✓ MCTS evaluate")
         print(f"  Reward: {reward:.2f}")

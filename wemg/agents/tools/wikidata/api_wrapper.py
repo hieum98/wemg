@@ -124,7 +124,7 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
                     )
                     time.sleep(delay)
                 else:
-                    logger.error(f"Query failed after {max_retries} attempts: {e}")
+                    raise Exception(f"Query failed after {max_retries} attempts: {e}")
         
         return None
 
@@ -191,7 +191,7 @@ class CustomWikidataAPIWrapper(WikidataAPIWrapper):
                     )
                     await asyncio.sleep(delay)
                 else:
-                    logger.error(f"Query failed after {max_retries} attempts: {e}")
+                    raise Exception(f"Query failed after {max_retries} attempts: {e}")
         
         return None
 
