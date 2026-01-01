@@ -36,7 +36,7 @@ def preprocess_dataset(dataset_name_or_path: str, max_examples: Optional[int] = 
         to_remove_columns = set(data.column_names) - set(['question', 'answer'])
         data = data.remove_columns(list(to_remove_columns))
     elif dataset_name_or_path == 'qald_10':
-        data = datasets.load_dataset('Hieuman/qald_10', split='train')
+        data = datasets.load_dataset('Hieuman/qald_10_en', split='train')
     elif dataset_name_or_path == 'hotpotqa_adv':
         data = datasets.load_dataset('Hieuman/Hotpotqa-adv', split='train')
     elif dataset_name_or_path == 'grail_qa':
