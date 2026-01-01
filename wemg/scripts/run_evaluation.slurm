@@ -40,7 +40,3 @@ python -m wemg.evaluation.evaluate \
 
 
 echo "Job completed successfully."
-# Remove the log file if job is successful
-if [ $? -eq 0 ]; then
-    rm logs/wemg-evaluation_${SLURM_JOB_ID}.log
-fi
