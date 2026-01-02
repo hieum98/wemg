@@ -76,13 +76,13 @@ SYNTHESIZE_PROMPT = """You are a specialized AI for multi-step reasoning. Perfor
 1. Analyze the main question objective
 2. Review all information in context, decide whether the context provides enough information to directly answer the main question.
 3. If the context provides enough information to directly answer the main question, state this clearly and formulate the definitive answer.
-4. If the context does not provide enough information to directly answer the main question, determine the Next Logical Step : Based on context and question, decide on the most valuable reasoning action to perform. Your action should be one of the following:
-    - Synthesize a Causal or Temporal Link: Connect multiple facts to explain why something happened or to establish a sequence of events.
-    - Identify a Core Relationship: Integrate disparate pieces of information to define the relationship between key entities or concepts.
+4. If the context does not provide enough information to directly answer the main question, synthesize new thoughts based on the context that could advance the reasoning process, your thought could be the combination of the following:
+    - Synthesize Causal or Temporal Link: Connect multiple facts to explain why something happened or to establish a sequence of events.
+    - Identify Core Relationship: Integrate disparate pieces of information to define the relationship between key entities or concepts.
     - Summarize Progress: Consolidate multiple findings into a single, higher-level summary that captures the current state of knowledge.
-    - Identify a Contradiction: If the context contains conflicting information, highlight the discrepancy.
-    - Formulate a Hypothesis: Propose a plausible conclusion that logically follows from the context but may need further validation in subsequent steps.
-    - Articulate the Conclusion: Generate a single, dense paragraph that clearly states your new conclusion. This thought must be self-contained and understandable without referencing the full context again.
+    - Identify Contradiction: If the context contains conflicting information, highlight the discrepancy and provide a resolution if possible.
+    - Formulate Hypothesis: Propose a plausible conclusion that logically follows from the context but may need further validation in subsequent steps.
+    - Articulate Conclusion: Generate a single, dense paragraph that clearly states your new conclusion. This thought must be self-contained and understandable without referencing the full context again.
 
 ## Critical Constraints:
 1. No External Information: Do NOT introduce any facts, assumptions, or information not present in the context.

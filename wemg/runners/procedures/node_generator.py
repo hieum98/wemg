@@ -204,7 +204,7 @@ class NodeGenerator:
         Returns result with corrected answers.
         """
         step_objective = (
-            f"Verify and correct the answer for the sub-question: {sub_question}.\n"
+            f"Verify and correct the answer for the question: {sub_question}.\n"
             f"Proposed answer: {sub_answer}"
         )
         
@@ -277,7 +277,45 @@ class NodeGenerator:
         """Generate synthesized reasoning from current context."""
         
         memory = self.working_memory.format_textual_memory()
-        context = format_context(memory=memory)
+        # Explore for verification
+        retrieved_docs, retrieved_triples, entity_dict, property_dict, exploration_log = await explore(
+            llm_agent=self.llm_agent,
+            retriever_agent=self.retriever_agent,
+            question=user_question,
+            entities=[],
+            relations=[],
+            top_k_websearch=self.kwargs.get('top_k_websearch', 5),
+            top_k_entities=self.kwargs.get('top_k_entities', 1),
+            top_k_properties=self.kwargs.get('top_k_properties', 1),
+            n_hops=self.kwargs.get('n_hops', 1),
+            use_question_for_graph_retrieval=self.kwargs.get('use_question_for_graph_retrieval', True),
+            interaction_memory=self.interaction_memory
+        )
+
+        retrieved_documents = list(set(retrieved_docs))
+        # Extract information from web search results
+        extractor_inputs = [
+            roles.extractor.ExtractionInput(question=user_question, raw_data=data) 
+            for data in retrieved_documents
+        ]
+        extracted_results, extractor_log = await execute_role(
+            llm_agent=self.llm_agent,
+            role=roles.extractor.Extractor(),
+            input_data=extractor_inputs,
+            interaction_memory=self.interaction_memory,
+            n=1
+        )
+        
+        # Flatten and filter relevant information
+        all_extractions: List[roles.extractor.ExtractionOutput] = sum(extracted_results, [])
+        info_from_websearch = []
+        for item in all_extractions:
+            if item.relevant_information:
+                info_from_websearch.extend(item.relevant_information)
+
+        info_from_kb = [str(t) for t in retrieved_triples]
+        all_retrieved_info = info_from_websearch + info_from_kb 
+        context = format_context(memory=memory, retrieval_info=all_retrieved_info)
         
         reasoner_input = roles.generator.ReasoningSynthesizeInput(
             question=user_question, 
