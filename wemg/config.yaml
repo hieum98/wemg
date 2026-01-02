@@ -99,7 +99,7 @@ search:
 # =====================================================================
 node_generation:
   n: 1  # Number of candidates to generate per node (for deterministic operations)
-  n_subquestions: 3  # Number of diverse subquestions to generate (for tree branching)
+  n_subquestions: 5 # Number of diverse subquestions to generate (for tree branching)
   top_k_websearch: 5  # Top-k web search results
   top_k_entities: 3  # Top-k entities from knowledge graph
   top_k_properties: 3  # Top-k properties from knowledge graph
