@@ -19,9 +19,9 @@ logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 # Prompts
 # =============================================================================
 
-GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in multi-hop question answering and reasoning decomposition. Your task is to analyze whether a main question can be answered with the provided context, and if not, generate a strategic subquestion that advances the reasoning process.
+GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in multi-hop question answering and reasoning decomposition. Your task is to analyze whether a main question can be answered with the provided context, and if not, generate strategic subquestions that advance the reasoning process.
 
-## Core Principle: The generated subquestion must NOT be answerable using the provided context.
+## Core Principle: The generated subquestion must NOT be answerable using the provided context and must be self-contained, atomic and diverse.
 
 ## Instructions:
 1. Analyze the Main Question: Identify core intent, key entities, and required information.
@@ -29,10 +29,11 @@ GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in mul
 3. Decision Point:
    - If YES (Sufficient): No subquestion needed.
    - If NO (Insufficient): Proceed to generate subquestion.
-4. If Insufficient:
-   a. Identify the Core Knowledge Gap
+4. For Each Subquestion:
+   a. Target a distinct knowledge gap in the reasoning chain
    b. Formulate an atomic, relevant, self-contained subquestion. Make sure each subquestion is fully understandable on its own without needing to refer back to the original question or context.
-   c. VALIDATE: Ensure subquestion CANNOT be answered by context. If it can be answered by context, generate a new subquestion.
+   c. VALIDATE: Ensure subquestion CANNOT be answered by context. If it can be answered by context, generate a new subquestion. The generated subquestions must be diverse and not redundant. 
+   d. VALIDATE Independence: Each subquestion must be answerable WITHOUT requiring answers from other generated subquestions. Eliminate dependent subquestions that require answering another generated subquestion first. ONLY keep subquestions that are independently answerable (even if answering all subquestions doesn't directly solve the main question)
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
@@ -142,7 +143,7 @@ class SubquestionGenerationInput(pydantic.BaseModel):
 
 class SubquestionGenerationOutput(pydantic.BaseModel):
     is_answerable: bool = pydantic.Field(..., description="If the main question can be answered with context.")
-    subquestion: Optional[str] = pydantic.Field(None, description="Generated subquestion if not answerable.")
+    subquestions: Optional[List[str]] = pydantic.Field(None, description="Generated subquestions which are atomic, self-contained and diverse.")
 
 
 class AnswerGenerationInput(pydantic.BaseModel):

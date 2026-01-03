@@ -242,6 +242,7 @@ def get_node_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
     
     return {
         "n": OmegaConf.select(cfg, "node_generation.n") or 1,
+        "n_subquestions": OmegaConf.select(cfg, "node_generation.n_subquestions") or 3,
         "top_k_websearch": OmegaConf.select(cfg, "node_generation.top_k_websearch") or 5,
         "top_k_entities": OmegaConf.select(cfg, "node_generation.top_k_entities") or 1,
         "top_k_properties": OmegaConf.select(cfg, "node_generation.top_k_properties") or 1,

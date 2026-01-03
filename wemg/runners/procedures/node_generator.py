@@ -165,7 +165,10 @@ class NodeGenerator:
         )
         
         # Return ALL unanswerable subquestions for tree branching diversity
-        unanswerable_subquestions = [sq.subquestion for sq in subquestions if not sq.is_answerable]
+        unanswerable_subquestions = []
+        for sq in subquestions:
+            if not sq.is_answerable:
+                unanswerable_subquestions.extend(sq.subquestions)
         unanswerable_subquestions = list(set(unanswerable_subquestions)) if unanswerable_subquestions else []
         
         # Calculate if we should directly answer (majority are answerable)

@@ -13,6 +13,25 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 
+def is_valid_hf_dataset_dir(path: Path) -> bool:
+    """Check if a directory contains a valid HuggingFace dataset saved by save_to_disk().
+    
+    Args:
+        path: Path to check
+        
+    Returns:
+        True if directory contains required HF dataset files
+    """
+    if not path.is_dir():
+        return False
+    # HF datasets.save_to_disk() creates dataset_info.json and state.json
+    # Check for these marker files
+    has_info = (path / "dataset_info.json").exists()
+    has_state = (path / "state.json").exists()
+    has_arrow = any(path.glob("*.arrow")) or any(path.glob("data-*.arrow"))
+    return has_info and (has_state or has_arrow)
+
+
 def preprocess_dataset(dataset_name_or_path: str, max_examples: Optional[int] = 1000) -> datasets.Dataset:
     # ===== Graph-based QA datasets =====
     if dataset_name_or_path == 'cwq':
@@ -173,14 +192,30 @@ def main(cfg: DictConfig) -> None:
     evaluator = DatasetEvaluator(wemg_system)
     
     if resume:
-        # If the user explicitly points to a local predictions file, do not
-        # override it by loading from `output_path` when resuming.
-        if os.path.exists(output_path) and not (Path(dataset_name_or_path).exists() and Path(dataset_name_or_path).is_file()):
-            data = datasets.load_from_disk(output_path)
-            print(f"Loaded {len(data)} questions for resuming evaluation from {output_path}")
-        else:
-            print(f"No existing results found for {dataset_name_or_path}. Starting fresh evaluation.")
-            resume = False
+        # Determine resume source: saved HF dataset or evaluation_log.jsonl
+        output_dir = Path(output_path)
+        log_file = output_dir / ("scoring_log.jsonl" if mode == "score" else "evaluation_log.jsonl")
+        is_local_file_input = Path(dataset_name_or_path).exists() and Path(dataset_name_or_path).is_file()
+        
+        loaded_from_disk = False
+        
+        # Try to load saved HF dataset first (most complete if it exists)
+        if not is_local_file_input and is_valid_hf_dataset_dir(output_dir):
+            try:
+                data = datasets.load_from_disk(output_path)
+                print(f"Loaded {len(data)} questions from saved dataset at {output_path}")
+                loaded_from_disk = True
+            except Exception as e:
+                logger.warning(f"Could not load saved dataset from {output_path}: {e}")
+        
+        # If no saved dataset, check for evaluation log to resume from
+        if not loaded_from_disk:
+            if log_file.exists():
+                print(f"Found {log_file.name} at {output_path}. Will resume from log file.")
+                # Keep resume=True - DatasetEvaluator will handle resuming from log
+            else:
+                print(f"No saved dataset or evaluation log found for {dataset_name_or_path}. Starting fresh evaluation.")
+                resume = False
 
     if mode == "score":
         # Compute metrics from existing predictions (no generation)
