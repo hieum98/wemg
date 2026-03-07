@@ -47,7 +47,7 @@ class RetrieverAgent:
         self.index_path = index_path
         self.indexed_corpus: datasets.Dataset = self.get_index()
     
-    def get_embedder(self) -> Union[BaseLLMAgent, ]:
+    def get_embedder(self) -> BaseLLMAgent:
         if self.type == 'openai':
             return BaseLLMAgent(
                 client_type=self.type,

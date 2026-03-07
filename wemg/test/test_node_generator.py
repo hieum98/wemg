@@ -343,7 +343,6 @@ class TestGenerateAnswer:
         
         question = "What are the main causes of climate change?"
         result = asyncio.run(generator.generate_answer(question))
-        breakpoint()
         assert len(result.answers) == 3
         for i, answer in enumerate(result.answers):
             assert answer.answer is not None

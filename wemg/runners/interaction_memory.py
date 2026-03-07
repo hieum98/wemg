@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 import logging
 import os
 import time
+import threading
 import uuid
 import chromadb
 from chromadb.utils import embedding_functions
@@ -104,6 +105,89 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 
+class ThreadSafeReadWriteLock:
+    """
+    Thread-safe Read-Write Lock using threading primitives.
+    
+    Allows multiple concurrent readers OR a single exclusive writer.
+    Writers have priority to prevent starvation.
+    """
+    def __init__(self):
+        self._read_ready = threading.Condition(threading.RLock())
+        self._readers = 0
+        self._writer = False
+        self._pending_writers = 0
+    
+    def acquire_read(self):
+        """Acquire a read lock. Multiple readers can hold this simultaneously."""
+        with self._read_ready:
+            # Wait while there's an active writer or pending writers (writer priority)
+            while self._writer or self._pending_writers > 0:
+                self._read_ready.wait()
+            self._readers += 1
+    
+    def release_read(self):
+        """Release a read lock."""
+        with self._read_ready:
+            self._readers -= 1
+            if self._readers == 0:
+                self._read_ready.notify_all()
+    
+    def acquire_write(self):
+        """Acquire an exclusive write lock."""
+        with self._read_ready:
+            self._pending_writers += 1
+            try:
+                # Wait until no readers and no active writer
+                while self._readers > 0 or self._writer:
+                    self._read_ready.wait()
+                self._writer = True
+            finally:
+                self._pending_writers -= 1
+    
+    def release_write(self):
+        """Release the write lock."""
+        with self._read_ready:
+            self._writer = False
+            self._read_ready.notify_all()
+    
+    def read_lock(self):
+        """Context manager for read lock."""
+        return _ThreadReadLockContext(self)
+    
+    def write_lock(self):
+        """Context manager for write lock."""
+        return _ThreadWriteLockContext(self)
+
+
+class _ThreadReadLockContext:
+    """Context manager for thread read lock."""
+    def __init__(self, lock: ThreadSafeReadWriteLock):
+        self._lock = lock
+    
+    def __enter__(self):
+        self._lock.acquire_read()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._lock.release_read()
+        return False
+
+
+class _ThreadWriteLockContext:
+    """Context manager for thread write lock."""
+    def __init__(self, lock: ThreadSafeReadWriteLock):
+        self._lock = lock
+    
+    def __enter__(self):
+        self._lock.acquire_write()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._lock.release_write()
+        return False
+
+
 class LocalCompatibleEmbedding(EmbeddingFunction):
     def __init__(self, base_url: str, model_name: str, api_key: str = "EMPTY"):
         self.model_name = model_name
@@ -185,8 +269,13 @@ class InteractionMemory:
             metadata={"hnsw:space": "cosine"},
         )
         
-        # Read-Write lock for concurrent access
+        # Thread-safe Read-Write lock for cross-thread access (e.g., parallel question processing)
         # Allows multiple concurrent reads (get_examples) but exclusive writes (log_turn)
+        # This significantly improves performance with multiple workers since reads are much more frequent
+        self._thread_rw_lock = ThreadSafeReadWriteLock()
+        
+        # Read-Write lock for async concurrent access within a single thread/event loop
+        # Note: Only used when NOT in dataset-level scope (per-question memory)
         self._rw_lock = AsyncReadWriteLock()
         
         # Embedding cache to avoid recomputing same query embeddings
@@ -255,7 +344,9 @@ class InteractionMemory:
         gc.collect()
     
     def log_turn(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]], batch_size: int = 32):
-        """Synchronous version - use log_turn_async for concurrent access.
+        """Synchronous version with thread-safe locking for cross-thread access.
+        
+        Use log_turn_async for async concurrent access within a single event loop.
         """
         if isinstance(user_input, str):
             user_input = [user_input]
@@ -263,7 +354,7 @@ class InteractionMemory:
             assistant_output = [assistant_output]
         assert len(user_input) == len(assistant_output), "user_input and assistant_output must have the same length"
 
-        # Filter out entries that exceed token budget
+        # Filter out entries that exceed token budget (done outside lock for performance)
         filtered_inputs = []
         filtered_outputs = []
         skipped_count = 0
@@ -290,45 +381,53 @@ class InteractionMemory:
             logger.info("No entries to log after filtering by token budget")
             return
 
-        # Process in batches to avoid OOM
-        total_entries = len(filtered_inputs)
-        logger.info(f"Logging {total_entries} entries to interaction memory in batches of {batch_size}")
-        for batch_start in range(0, total_entries, batch_size):
-            batch_end = min(batch_start + batch_size, total_entries)
-            batch_inputs = filtered_inputs[batch_start:batch_end]
-            batch_outputs = filtered_outputs[batch_start:batch_end]
-            
-            turn_ids = []
-            metadatas = []
-            documents = []
-            for u_input, a_output in zip(batch_inputs, batch_outputs):
-                turn_id = str(uuid.uuid4())
-                metadata = {
-                        "role": role,
-                        "assistant_output": a_output,
-                        "timestamp": datetime.now().isoformat()
-                    }
-                turn_ids.append(turn_id)
-                metadatas.append(metadata)
-                documents.append(u_input)
+        # Acquire write lock - exclusive access for writes (blocks readers)
+        with self._thread_rw_lock.write_lock():
+            # Process in batches to avoid OOM
+            total_entries = len(filtered_inputs)
+            logger.info(f"Logging {total_entries} entries to interaction memory in batches of {batch_size}")
+            for batch_start in range(0, total_entries, batch_size):
+                batch_end = min(batch_start + batch_size, total_entries)
+                batch_inputs = filtered_inputs[batch_start:batch_end]
+                batch_outputs = filtered_outputs[batch_start:batch_end]
+                
+                turn_ids = []
+                metadatas = []
+                documents = []
+                for u_input, a_output in zip(batch_inputs, batch_outputs):
+                    turn_id = str(uuid.uuid4())
+                    metadata = {
+                            "role": role,
+                            "assistant_output": a_output,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                    turn_ids.append(turn_id)
+                    metadatas.append(metadata)
+                    documents.append(u_input)
 
-            # Add batch to collection
-            self.collection.add(
-                documents=documents,
-                metadatas=metadatas,
-                ids=turn_ids
-            )
-            
-            # Update role count cache
-            self._increment_role_count(role, len(batch_inputs))
-            
-            # Clear references to help with memory management
-            del turn_ids, metadatas, documents
-            if batch_end < total_entries:
-                gc.collect()  # Suggest garbage collection between batches
+                # Add batch to collection
+                self.collection.add(
+                    documents=documents,
+                    metadatas=metadatas,
+                    ids=turn_ids
+                )
+                
+                # Update role count cache
+                self._increment_role_count(role, len(batch_inputs))
+                
+                # Clear references to help with memory management
+                del turn_ids, metadatas, documents
+                if batch_end < total_entries:
+                    gc.collect()  # Suggest garbage collection between batches
     
     async def log_turn_async(self, role: str, user_input: Union[str, List[str]], assistant_output: Union[str, List[str]], batch_size: int = 100):
-        """Async version with write lock - exclusive access during writes.
+        """Async version - thread-safe via write lock in log_turn().
+        
+        Note: We don't use _rw_lock here because asyncio.Condition is not thread-safe.
+        When InteractionMemory is shared across threads (dataset-level scope), each thread
+        runs its own event loop, and sharing asyncio primitives across event loops is undefined.
+        The _thread_rw_lock.write_lock() in log_turn() provides thread safety with exclusive
+        write access (blocks concurrent reads during writes).
         
         Args:
             role: Role name for the log entries
@@ -336,56 +435,68 @@ class InteractionMemory:
             assistant_output: Output string or list of output strings
             batch_size: Number of entries to process per batch to avoid OOM (default: 100)
         """
-        async with self._rw_lock.write_lock():
-            self.log_turn(role, user_input, assistant_output, batch_size=batch_size)
+        # Delegate to sync version which uses thread-safe write lock
+        self.log_turn(role, user_input, assistant_output, batch_size=batch_size)
     
     def get_examples(self, role: str, query: str, k: int = 3, strategy: str = "mmr"):
         """
-        Synchronous version - use get_examples_async for concurrent access.
+        Synchronous version with thread-safe read lock for cross-thread access.
+        
+        Multiple threads can read concurrently, improving performance with parallel workers.
+        Use get_examples_async for async concurrent access within a single event loop.
         strategy: 'similarity' (standard) or 'mmr' (diverse)
         """
-        # Early exit if collection is empty
-        if self.collection.count() == 0:
-            return []
-        
-        # Early exit if role has no examples (avoids expensive embedding computation)
-        if self._get_role_count(role) == 0:
-            return []
-
-        query_token_count = approximate_token_count(query)
-        if query_token_count > self.token_budget * 2:
-            logger.warning(f"Query token count ({query_token_count}) exceeds token budget ({self.token_budget * 2})")
-            return []
-        
-        if strategy == "similarity":
-            messages = self._fetch_similarity(role, query, k)
-        elif strategy == "mmr":
-            messages = self._fetch_mmr(role, query, k)
-        else:
-            raise ValueError("Unknown strategy. Use 'similarity' or 'mmr'")
-
-        # check for token budget, trim if necessary (optimized: compute once per removal)
-        if messages:
-            # Flatten messages once for token counting
-            all_messages = [msg for pair in messages for msg in pair]
-            total_tokens = approximate_token_count(all_messages)
+        # Acquire read lock - allows multiple concurrent readers
+        with self._thread_rw_lock.read_lock():
+            # Early exit if collection is empty
+            if self.collection.count() == 0:
+                return []
             
-            # Remove oldest examples until within budget
-            while total_tokens > self.token_budget and messages:
-                removed_pair = messages.pop(0)
-                # Subtract tokens for removed pair (more efficient than recounting)
-                removed_tokens = approximate_token_count([msg for msg in removed_pair])
-                total_tokens -= removed_tokens
+            # Early exit if role has no examples (avoids expensive embedding computation)
+            if self._get_role_count(role) == 0:
+                return []
+
+            query_token_count = approximate_token_count(query)
+            if query_token_count > self.token_budget * 2:
+                logger.warning(f"Query token count ({query_token_count}) exceeds token budget ({self.token_budget * 2})")
+                return []
+            
+            if strategy == "similarity":
+                messages = self._fetch_similarity(role, query, k)
+            elif strategy == "mmr":
+                messages = self._fetch_mmr(role, query, k)
+            else:
+                raise ValueError("Unknown strategy. Use 'similarity' or 'mmr'")
+
+            # check for token budget, trim if necessary (optimized: compute once per removal)
+            if messages:
+                # Flatten messages once for token counting
+                all_messages = [msg for pair in messages for msg in pair]
+                total_tokens = approximate_token_count(all_messages)
                 
-        return messages
+                # Remove oldest examples until within budget
+                while total_tokens > self.token_budget and messages:
+                    removed_pair = messages.pop(0)
+                    # Subtract tokens for removed pair (more efficient than recounting)
+                    removed_tokens = approximate_token_count([msg for msg in removed_pair])
+                    total_tokens -= removed_tokens
+                    
+            return messages
     
     async def get_examples_async(self, role: str, query: str, k: int = 3, strategy: str = "mmr"):
         """
-        Async version with read lock - allows multiple concurrent reads.
+        Async version - thread-safe via read lock in get_examples().
+        
+        Note: We don't use _rw_lock here because asyncio.Condition is not thread-safe.
+        When InteractionMemory is shared across threads (dataset-level scope), each thread
+        runs its own event loop, and sharing asyncio primitives across event loops is undefined.
+        The _thread_rw_lock.read_lock() in get_examples() provides thread safety and allows
+        concurrent reads for better performance.
+        
         strategy: 'similarity' (standard) or 'mmr' (diverse)
         """
-        async with self._rw_lock.read_lock():
-            return self.get_examples(role, query, k, strategy)
+        # Delegate to sync version which uses thread-safe read-write lock
+        return self.get_examples(role, query, k, strategy)
 
     def _fetch_similarity(self, role: str, query: str, k: int):
         """Standard KNN search provided by Chroma."""

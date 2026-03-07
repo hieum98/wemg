@@ -18,7 +18,6 @@ from wemg.agents.roles.evaluator import Evaluator, AnswerEvaluationInput
 from wemg.agents.base_llm_agent import BaseLLMAgent
 from wemg.runners.procedures.base_role_execution import execute_role
 from wemg.runners.interaction_memory import InteractionMemory
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
@@ -139,12 +138,80 @@ def compute_acc(
         return 0.0
 
 
+async def compute_acc_batch_async(
+    acc_tasks: List[Dict[str, Any]],
+    llm_agent: BaseLLMAgent,
+    max_concurrent: Optional[int] = None
+) -> List[float]:
+    """Compute Acc scores concurrently for multiple questions using async.
+    
+    Args:
+        acc_tasks: List of dicts with keys: question, predicted_answer, correct_answers
+        llm_agent: LLM agent for evaluation
+        max_concurrent: Maximum number of concurrent tasks (None = use min(8, len(acc_tasks)))
+        
+    Returns:
+        List of accuracy scores (0-1) in same order as acc_tasks
+    """
+    if not acc_tasks:
+        return []
+    
+    max_concurrent = max_concurrent or min(len(acc_tasks), 8)
+    max_concurrent = max(1, min(max_concurrent, len(acc_tasks)))
+    
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def compute_single_async(task, idx):
+        async with semaphore:
+            # Run sync compute_acc in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            try:
+                return await loop.run_in_executor(
+                    None,
+                    compute_acc,
+                    task['question'],
+                    task['predicted_answer'],
+                    task['correct_answers'],
+                    llm_agent,
+                    None  # interaction_memory
+                )
+            except Exception as e:
+                logger.error(f"Error computing Acc for task {idx}: {e}")
+                return 0.0
+    
+    # Create tasks for all acc computations, wrapping to include index
+    async def compute_with_idx(task, idx):
+        try:
+            result = await compute_single_async(task, idx)
+            return idx, result
+        except Exception as e:
+            logger.error(f"Error computing Acc for task {idx}: {e}")
+            return idx, 0.0
+    
+    tasks = [asyncio.create_task(compute_with_idx(task, idx)) for idx, task in enumerate(acc_tasks)]
+    
+    # Execute with progress tracking using as_completed for incremental updates
+    results = [0.0] * len(acc_tasks)
+    
+    with tqdm(total=len(acc_tasks), desc="Computing Acc scores", unit="question") as pbar:
+        # Process tasks as they complete (semaphore handles concurrency)
+        for done_coro in asyncio.as_completed(tasks):
+            try:
+                idx, result = await done_coro
+                results[idx] = result if not isinstance(result, Exception) else 0.0
+            except Exception as e:
+                logger.error(f"Error awaiting Acc computation: {e}")
+            pbar.update(1)
+    
+    return results
+
+
 def compute_acc_batch(
     acc_tasks: List[Dict[str, Any]],
     llm_agent: BaseLLMAgent,
     max_workers: Optional[int] = None
 ) -> List[float]:
-    """Compute Acc scores in parallel for multiple questions.
+    """Compute Acc scores in parallel for multiple questions (sync wrapper).
     
     Args:
         acc_tasks: List of dicts with keys: question, predicted_answer, correct_answers
@@ -154,40 +221,8 @@ def compute_acc_batch(
     Returns:
         List of accuracy scores (0-1) in same order as acc_tasks
     """
-    if not acc_tasks:
-        return []
-    
-    max_workers = max_workers or min(len(acc_tasks), 8)
-    max_workers = max(1, min(max_workers, len(acc_tasks)))
-    
-    def compute_single(task):
-        return compute_acc(
-            question=task['question'],
-            predicted_answer=task['predicted_answer'],
-            correct_answers=task['correct_answers'],
-            llm_agent=llm_agent,
-            interaction_memory=None
-        )
-    
-    results = [0.0] * len(acc_tasks)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(compute_single, task): idx
-            for idx, task in enumerate(acc_tasks)
-        }
-        
-        # Progress bar compatible with parallel processing
-        with tqdm(total=len(acc_tasks), desc="Computing Acc scores", unit="question") as pbar:
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    logger.error(f"Error computing Acc for task {idx}: {e}")
-                    results[idx] = 0.0
-                pbar.update(1)
-    
-    return results
+    # Use async version with single event loop
+    return asyncio.run(compute_acc_batch_async(acc_tasks, llm_agent, max_workers))
 
 
 class DatasetEvaluator:
@@ -297,10 +332,13 @@ class DatasetEvaluator:
         resume: bool = True,
         question_column: str = "question",
         answer_column: str = "answer",
-        batch_size: int = 1,
-        max_workers: Optional[int] = None
+        max_concurrent_questions: Optional[int] = None
     ) -> datasets.Dataset:
-        """Evaluate dataset and compute metrics with batch processing.
+        """Evaluate dataset and compute metrics with async processing.
+        
+        Uses async processing with a single event loop for efficient I/O and proper
+        rate limiting. The same entry point (system.answer()) is used for both
+        inference and evaluation.
         
         Args:
             dataset: HuggingFace dataset with questions and answers
@@ -308,8 +346,7 @@ class DatasetEvaluator:
             resume: Whether to resume from existing results
             question_column: Name of question column in dataset
             answer_column: Name of answer column in dataset
-            batch_size: Number of questions to process in parallel (1 = sequential)
-            max_workers: Maximum number of parallel workers (None = use batch_size)
+            max_concurrent_questions: Maximum concurrent questions (None = auto-detect from config, default: 8)
             
         Returns:
             Dataset with added evaluation columns
@@ -383,9 +420,57 @@ class DatasetEvaluator:
                 example.get('id', f"question_{idx}")
             ))
         
-        # Process questions
+        # Process questions using async with single event loop
         dataset_size = len(dataset)
-        self._process_parallel(tasks, results, log_path, batch_size, max_workers, dataset_size)
+        # Determine max concurrent questions
+        if max_concurrent_questions is None:
+            max_concurrent_questions = min(8, len(tasks))
+        
+        # Use async processing with single event loop
+        asyncio.run(self._process_parallel_async(
+            tasks, results, log_path, max_concurrent_questions, dataset_size
+        ))
+        
+        # Check for missing acc_scores in loaded results and compute them
+        acc_tasks_to_compute = []
+        for idx, result in enumerate(results):
+            if result is not None:
+                predicted_answer = result.get('predicted_answer')
+                acc_score = result.get('acc_score')
+                error = result.get('error')
+                # If we have a predicted answer but no acc_score and no error, compute it
+                if predicted_answer and acc_score is None and error is None:
+                    example = dataset[idx]
+                    question = example.get(question_column, "")
+                    answer = example.get(answer_column, None)
+                    if question and answer:
+                        acc_tasks_to_compute.append({
+                            'idx': idx,
+                            'question': question,
+                            'predicted_answer': predicted_answer,
+                            'correct_answers': self._normalize_answer_field(answer)
+                        })
+        
+        # Compute missing acc scores
+        if acc_tasks_to_compute:
+            logger.info(f"Computing missing Acc scores for {len(acc_tasks_to_compute)} questions...")
+            if max_concurrent_questions is None:
+                max_concurrent_questions = min(8, len(acc_tasks_to_compute))
+            acc_scores = asyncio.run(compute_acc_batch_async(
+                [{
+                    'question': t['question'],
+                    'predicted_answer': t['predicted_answer'],
+                    'correct_answers': t['correct_answers']
+                } for t in acc_tasks_to_compute],
+                self.system.llm_agent,
+                max_concurrent=max_concurrent_questions
+            ))
+            
+            for task, score in zip(acc_tasks_to_compute, acc_scores):
+                if results[task['idx']] is not None:
+                    results[task['idx']]['acc_score'] = score
+                    if log_path:
+                        self._log_result(task['idx'], results[task['idx']], log_path)
         
         # Create result dataset
         result_dataset = datasets.Dataset.from_list(results)
@@ -406,8 +491,7 @@ class DatasetEvaluator:
         predicted_answer_column: str = "predicted_answer",
         concise_answer_column: Optional[str] = "concise_answer",
         pass_at_k_column: str = "pass_at_k",
-        batch_size: int = 8,
-        max_workers: Optional[int] = None,
+        max_concurrent_questions: Optional[int] = None,
         compute_acc_scores: bool = True,
         overwrite_existing_scores: bool = False,
     ) -> datasets.Dataset:
@@ -512,10 +596,20 @@ class DatasetEvaluator:
             if log_path:
                 self._log_result(idx, merged, log_path)
 
-        # Second pass: compute Acc in parallel (optional)
+        # Second pass: compute Acc concurrently using async (optional)
         if compute_acc_scores and acc_tasks:
-            logger.info(f"Computing Acc scores for {len(acc_tasks)} questions in parallel...")
-            acc_scores = compute_acc_batch(
+            logger.info(f"Computing Acc scores for {len(acc_tasks)} questions concurrently...")
+            if max_concurrent_questions is None:
+                # Get LLM concurrency from config if available
+                try:
+                    from omegaconf import OmegaConf
+                    llm_concurrency = OmegaConf.select(self.system.cfg, "llm.concurrency") or 64
+                except:
+                    llm_concurrency = 64
+                max_concurrent = min(8, llm_concurrency, len(acc_tasks))
+            else:
+                max_concurrent = max_concurrent_questions
+            acc_scores = asyncio.run(compute_acc_batch_async(
                 [
                     {
                         "question": t["question"],
@@ -525,8 +619,8 @@ class DatasetEvaluator:
                     for t in acc_tasks
                 ],
                 self.system.llm_agent,
-                max_workers=max_workers or min(batch_size, 8),
-            )
+                max_concurrent=max_concurrent,
+            ))
 
             for task, score in zip(acc_tasks, acc_scores):
                 idx = task["idx"]
@@ -540,106 +634,113 @@ class DatasetEvaluator:
             self._save_results(result_dataset, output_path)
         return result_dataset
     
-    def _process_parallel(
+    async def _process_parallel_async(
         self,
         tasks: List[tuple],
         results: List[Optional[Dict]],
         log_path: Optional[Path],
-        batch_size: int,
-        max_workers: Optional[int],
+        max_concurrent: int,
         dataset_size: int
     ):
-        """Process questions in parallel (or sequentially if batch_size=1)."""
-        # For batch_size=1, use 1 worker (sequential processing)
-        if batch_size == 1:
-            max_workers = 1
-        else:
-            max_workers = max_workers or min(batch_size, len(tasks))
-            max_workers = max(1, min(max_workers, len(tasks)))
+        """Process questions concurrently using async with single event loop.
         
-        logger.info(f"Processing {len(tasks)} questions with {max_workers} workers")
+        Args:
+            tasks: List of tuples (idx, example, question, answer, question_id)
+            results: List to store results (indexed by question idx)
+            log_path: Optional path to log file
+            max_concurrent: Maximum number of concurrent questions to process
+            dataset_size: Total dataset size for logging
+        """
+        if not tasks:
+            return
         
-        def process_task(task_data):
+        logger.info(f"Processing {len(tasks)} questions with max_concurrent={max_concurrent} (async)")
+        
+        semaphore = asyncio.Semaphore(max_concurrent)
+        acc_tasks = []
+        
+        async def process_task_async(task_data):
             idx, example, question, answer, question_id = task_data
-            try:
-                logger.info(f"Processing question {idx + 1}/{dataset_size}: {question[:50]}...")
-                result = self._process_single_question(
-                    question=question,
-                    correct_answers=answer,
-                    question_id=str(question_id),
-                    compute_acc_now=False
-                )
-                return idx, {**example, **result}
-            except Exception as e:
-                logger.error(f"Error processing question {idx}: {e}", exc_info=True)
-                error_result = {**example, **self._create_empty_result()}
-                error_result['error'] = str(e)
-                return idx, error_result
+            async with semaphore:
+                try:
+                    logger.info(f"Processing question {idx + 1}/{dataset_size}: {question[:50]}...")
+                    # Run sync _process_single_question in thread pool
+                    # This allows I/O operations inside system.answer() to happen concurrently
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None,  # Use default ThreadPoolExecutor
+                        self._process_single_question,
+                        question,
+                        answer,
+                        str(question_id),
+                        False  # compute_acc_now
+                    )
+                    merged_result = {**example, **result}
+                    return idx, merged_result
+                except Exception as e:
+                    logger.error(f"Error processing question {idx}: {e}", exc_info=True)
+                    error_result = {**example, **self._create_empty_result()}
+                    error_result['error'] = str(e)
+                    return idx, error_result
         
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_idx = {
-                executor.submit(process_task, task): task[0]
-                for task in tasks
-            }
-            
-            acc_tasks = []
-            
-            # Progress bar compatible with parallel processing
-            with tqdm(total=len(tasks), desc="Evaluating", unit="question") as pbar:
-                for future in as_completed(future_to_idx):
-                    try:
-                        idx, merged_result = future.result()
-                        results[idx] = merged_result
-                        
-                        if log_path:
-                            self._log_result(idx, merged_result, log_path)
-                        
-                        if merged_result.get('predicted_answer') and not merged_result.get('error'):
-                            original_task = next((t for t in tasks if t[0] == idx), None)
-                            if original_task:
-                                acc_tasks.append({
-                                    'idx': idx,
-                                    'question': original_task[2],
-                                    'predicted_answer': merged_result['predicted_answer'],
-                                    'correct_answers': self._normalize_answer_field(original_task[3])
-                                })
-                    except Exception as e:
-                        idx = future_to_idx[future]
-                        logger.error(f"Error getting result for question {idx}: {e}")
-                        error_result = {
-                            **next((t[1] for t in tasks if t[0] == idx), {}),
-                            **self._create_empty_result(),
-                            'error': str(e)
-                        }
-                        results[idx] = error_result
-                        if log_path:
-                            self._log_result(idx, error_result, log_path)
+        # Create all async tasks - semaphore will limit concurrency automatically
+        # Tasks start immediately as semaphore slots become available
+        async_tasks = [asyncio.create_task(process_task_async(task)) for task in tasks]
+        
+        # Process with progress tracking - no batching, process as tasks complete
+        with tqdm(total=len(tasks), desc="Evaluating", unit="question") as pbar:
+            # Use as_completed so we process results as they finish (no waiting for batches)
+            # This allows new questions to start immediately when a slot opens
+            for done_coro in asyncio.as_completed(async_tasks):
+                try:
+                    result = await done_coro
+                    # Result is always a tuple (idx, merged_result) from process_task_async
+                    # Even on error, process_task_async returns (idx, error_result)
+                    result_idx, merged_result = result
+                    idx = result_idx
                     
-                    # Update progress bar after each task completes
+                    results[idx] = merged_result
+                    
+                    if log_path:
+                        self._log_result(idx, merged_result, log_path)
+                    
+                    if merged_result.get('predicted_answer') and not merged_result.get('error'):
+                        original_task = next((t for t in tasks if t[0] == idx), None)
+                        if original_task:
+                            acc_tasks.append({
+                                'idx': idx,
+                                'question': original_task[2],
+                                'predicted_answer': merged_result['predicted_answer'],
+                                'correct_answers': self._normalize_answer_field(original_task[3])
+                            })
+                except Exception as e:
+                    # If exception occurs, log it but don't crash the whole evaluation
+                    logger.error(f"Error processing result: {e}", exc_info=True)
                     pbar.update(1)
         
-        self._compute_and_update_acc_scores(acc_tasks, results, log_path, max_workers)
+        # Compute Acc scores asynchronously
+        await self._compute_and_update_acc_scores_async(acc_tasks, results, log_path, max_concurrent)
     
-    def _compute_and_update_acc_scores(
+    async def _compute_and_update_acc_scores_async(
         self,
         acc_tasks: List[Dict[str, Any]],
         results: List[Optional[Dict]],
         log_path: Optional[Path],
-        max_workers: Optional[int]
+        max_concurrent: Optional[int]
     ):
-        """Compute Acc scores in parallel and update results."""
+        """Compute Acc scores concurrently using async and update results."""
         if not acc_tasks:
             return
         
-        logger.info(f"Computing Acc scores for {len(acc_tasks)} questions in parallel...")
-        acc_scores = compute_acc_batch(
+        logger.info(f"Computing Acc scores for {len(acc_tasks)} questions concurrently...")
+        acc_scores = await compute_acc_batch_async(
             [{
                 'question': t['question'],
                 'predicted_answer': t['predicted_answer'],
                 'correct_answers': t['correct_answers']
             } for t in acc_tasks],
             self.system.llm_agent,
-            max_workers=max_workers
+            max_concurrent=max_concurrent
         )
         
         for task, score in zip(acc_tasks, acc_scores):

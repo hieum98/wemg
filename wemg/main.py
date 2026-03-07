@@ -21,7 +21,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -107,6 +107,7 @@ class WEMGSystem:
         # Initialize components
         self.llm_agent: Optional[BaseLLMAgent] = None
         self.retriever_agent: Optional[Union[WebSearchTool, RetrieverAgent]] = None
+        self.interaction_memory: Optional[InteractionMemory] = None  # Dataset-level memory (if enabled)
         
         # Lazy initialization flag
         self._initialized = False
@@ -136,6 +137,13 @@ class WEMGSystem:
         
         # Initialize retriever agent
         self.retriever_agent = self._create_retriever_agent()
+        
+        # Initialize dataset-level interaction memory if scope is "dataset"
+        memory_scope = OmegaConf.select(self.cfg, "memory.interaction_memory.scope") or "question"
+        if memory_scope == "dataset":
+            self.interaction_memory = self._create_interaction_memory(collection_name="dataset_memory")
+            if self.interaction_memory:
+                print("Dataset-level interaction memory enabled (shared across all questions)")
         
         self._initialized = True
         print("WEMG system initialized successfully.")
@@ -244,9 +252,17 @@ class WEMGSystem:
         # Lazy initialization
         self._initialize()
         
-        # Create fresh memory instances for each question
+        # Create fresh working memory for each question
         working_memory = self._create_working_memory()
-        interaction_memory = self._create_interaction_memory(collection_name=question_id)
+        
+        # Use dataset-level interaction memory if available, otherwise create per-question memory
+        memory_scope = OmegaConf.select(self.cfg, "memory.interaction_memory.scope") or "question"
+        if memory_scope == "dataset" and self.interaction_memory is not None:
+            # Use shared dataset-level memory (thread-safe via RLock)
+            interaction_memory = self.interaction_memory
+        else:
+            # Create per-question memory (original behavior)
+            interaction_memory = self._create_interaction_memory(collection_name=question_id)
         
         # Get node generation kwargs
         node_gen_kwargs = get_node_generation_kwargs(self.cfg)
@@ -441,6 +457,9 @@ class WEMGSystem:
         """Clean up resources."""
         if self.llm_agent:
             self.llm_agent.close()
+        if self.interaction_memory:
+            self.interaction_memory.release(should_delete_db=True)
+            self.interaction_memory = None
         logger.info("WEMG system closed.")
 
 

@@ -1,6 +1,5 @@
 import os
-from tkinter import W
-from typing import List, Dict, Optional, Set, Tuple, Union
+from typing import List, Dict, Optional, Tuple, Union
 import logging
 import asyncio
 from wemg.agents.roles.open_ie import Entity

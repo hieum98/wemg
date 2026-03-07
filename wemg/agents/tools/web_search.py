@@ -226,20 +226,18 @@ class WebSearchTool(BaseTool):
         )
         
         
-if __name__=='__main__':
+if __name__ == "__main__":
+    """Example usage of WebSearchTool."""
     serper_api_key = "your_serper_api_key"
 
     web_search = WebSearchTool(serper_api_key=serper_api_key)
     result = web_search.invoke({"query": "What is the capital of France?"})
-    breakpoint()
     print(f"Query: {result.query}")
     print(f"Success: {result.is_success}")
     print(f"Number of results: {len(result.results)}")
-    breakpoint()
     for i, r in enumerate(result.results):
         print(f"\n--- Result {i+1} ---")
         print(f"Title: {r.title}")
         print(f"Link: {r.link}")
         print(f"Snippet: {r.snippet[:200]}..." if len(r.snippet) > 200 else f"Snippet: {r.snippet}")
         print(f"Full text length: {len(r.full_text)} chars")
-            

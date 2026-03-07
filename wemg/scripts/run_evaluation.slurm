@@ -25,7 +25,7 @@ dataset=(
 )
 
 data_name_or_path=${dataset[$SLURM_ARRAY_TASK_ID]}
-output_path=results/wemg.v3-1subq/Qwen3-8B/Qwen3-4B-Emb/${data_name_or_path}
+output_path=results/wemg.v3/Qwen3-8B/Qwen3-4B-Emb/${data_name_or_path}
 model_name=Qwen3-8B
 search_strategy=mcts
 
@@ -34,6 +34,6 @@ python -m wemg.evaluation.evaluate \
     +output_path=${output_path} \
     llm.model_name=${model_name} \
     search.strategy=${search_strategy} \
-    node_generation.n_subquestions=1
+    memory.interaction_memory.scope=dataset
 
 echo "Job completed successfully."

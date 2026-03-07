@@ -167,6 +167,7 @@ def main(cfg: DictConfig) -> None:
     concise_answer_column: Optional[str] = system_cfg.pop("concise_answer_column", "concise_answer")
     compute_acc_scores: bool = bool(system_cfg.pop("compute_acc_scores", True))
     overwrite_existing_scores: bool = bool(system_cfg.pop("overwrite_existing_scores", False))
+    max_concurrent_questions: Optional[int] = system_cfg.pop("max_concurrent_questions", 8)
 
     # Resolve output path default
     if output_path_cfg:
@@ -227,8 +228,7 @@ def main(cfg: DictConfig) -> None:
             answer_column="answer",
             predicted_answer_column=predicted_answer_column,
             concise_answer_column=concise_answer_column,
-            batch_size=8,
-            max_workers=8,
+            max_concurrent_questions=max_concurrent_questions,
             compute_acc_scores=compute_acc_scores,
             overwrite_existing_scores=overwrite_existing_scores,
         )
@@ -238,8 +238,7 @@ def main(cfg: DictConfig) -> None:
             dataset=data,
             output_path=output_path,
             resume=resume,
-            batch_size=8,
-            max_workers=8
+            max_concurrent_questions=max_concurrent_questions
         )
     # Compute metrics
     metrics = evaluator.compute_aggregate_metrics(result_dataset)

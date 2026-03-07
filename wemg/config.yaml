@@ -11,7 +11,7 @@ defaults:
 llm:
   # Model settings
   model_name: "Qwen3-Next-80B-A3B-Thinking-FP8"  # Options: gpt-4o, gpt-4o-mini, claude-3-5-sonnet-20241022, etc.
-  url: "http://n0150:4000/v1"  # API endpoint URL
+  url: "http://n0142:4000/v1"  # API endpoint URL
   api_key: null  # Set via environment variable API_KEY or directly here
   client_type: "openai"  # Client type: openai, anthropic, etc.
   
@@ -60,7 +60,7 @@ retriever:
   corpus:
     embedder:
       model_name: "Qwen3-Embedding-4B"
-      url: "http://n0150:4000/v1"
+      url: "http://n0142:4000/v1"
       api_key: null  # Set via API_KEY
       embedder_type: "openai"
     corpus_path: Hieuman/wiki23-processed  # Path to corpus dataset
@@ -117,6 +117,7 @@ memory:
   # Interaction memory settings (logging)
   interaction_memory:
     enabled: True
+    scope: "question"  # Memory scope: "question" (isolated per question, default) or "dataset" (shared across all questions, thread-safe)
     log_dir: "./logs"  # Directory for interaction logs
     save_to_file: false
     
@@ -132,7 +133,7 @@ memory:
     # Embedding settings
     is_local_embedding_api: True  # Use local embedding API instead of SentenceTransformer
     embedding_model_name: "Qwen3-Embedding-4B"  # Embedding model name
-    embedding_base_url: "http://n0150:4000/v1"  # Embedding API base URL
+    embedding_base_url: "http://n0142:4000/v1"  # Embedding API base URL
     embedding_api_key: null  # Embedding API key
     
     # Cache settings

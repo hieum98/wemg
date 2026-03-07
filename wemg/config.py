@@ -6,11 +6,14 @@ overrides, and environment variables. All configuration is handled through
 OmegaConf DictConfig objects for maximum flexibility.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from omegaconf import DictConfig, OmegaConf
+
+logger = logging.getLogger(__name__)
 
 
 # =====================================================================
@@ -64,30 +67,25 @@ def load_config(
 
 def _resolve_env_vars(cfg: DictConfig) -> DictConfig:
     """Resolve environment variables in the configuration."""
-    # LLM API key
-    llm_api_key = OmegaConf.select(cfg, "llm.api_key")
-    if llm_api_key is None:
-        cfg.llm.api_key = os.environ.get("API_KEY")
+    # Map of config paths to environment variable names
+    env_var_mappings = [
+        ("llm.api_key", "API_KEY"),
+        ("retriever.web_search.api_key", "SERPER_API_KEY"),
+        ("retriever.corpus.embedder.api_key", "API_KEY"),
+        ("memory.interaction_memory.embedding_api_key", "API_KEY"),
+        ("cache.password", "REDIS_PASSWORD"),
+    ]
     
-    # Web search API key
-    web_search_api_key = OmegaConf.select(cfg, "retriever.web_search.api_key")
-    if web_search_api_key is None:
-        cfg.retriever.web_search.api_key = os.environ.get("SERPER_API_KEY")
-    
-    # Embedder API key
-    embedder_api_key = OmegaConf.select(cfg, "retriever.corpus.embedder.api_key")
-    if embedder_api_key is None:
-        cfg.retriever.corpus.embedder.api_key = os.environ.get("API_KEY")
-    
-    # Interaction memory embedding API key
-    interaction_memory_embedding_api_key = OmegaConf.select(cfg, "memory.interaction_memory.embedding_api_key")
-    if interaction_memory_embedding_api_key is None:
-        cfg.memory.interaction_memory.embedding_api_key = os.environ.get("API_KEY")
-    
-    # Cache password
-    cache_password = OmegaConf.select(cfg, "cache.password")
-    if cache_password is None:
-        cfg.cache.password = os.environ.get("REDIS_PASSWORD")
+    for config_path, env_var_name in env_var_mappings:
+        if OmegaConf.select(cfg, config_path) is None:
+            env_value = os.environ.get(env_var_name)
+            if env_value is not None:
+                # Build nested dict structure from dot-separated path and merge
+                keys = config_path.split(".")
+                nested_dict = env_value
+                for key in reversed(keys):
+                    nested_dict = {key: nested_dict}
+                cfg = OmegaConf.merge(cfg, nested_dict)
     
     return cfg
 
@@ -156,9 +154,29 @@ def validate_config(cfg: DictConfig) -> bool:
         corpus_path = OmegaConf.select(cfg, "retriever.corpus.corpus_path")
         if corpus_path is None:
             raise ValueError("Corpus path is required for corpus retriever.")
+        
+        # Check if corpus path exists (if it's a local path)
+        corpus_path_obj = Path(corpus_path)
+        # Allow HuggingFace dataset names (they won't exist as local paths)
+        if not str(corpus_path).startswith(("http://", "https://")) and not corpus_path_obj.exists():
+            # Check if it's a HuggingFace dataset name (contains "/")
+            if "/" not in str(corpus_path):
+                logger.warning(
+                    f"Corpus path '{corpus_path}' does not exist locally. "
+                    "Assuming it's a HuggingFace dataset name or will be downloaded."
+                )
+        
         index_path = OmegaConf.select(cfg, "retriever.corpus.index_path")
         if index_path is None:
             raise ValueError("Index path is required for corpus retriever.")
+        
+        # Check if index path exists (warn if it doesn't, as it will be created)
+        index_path_obj = Path(index_path)
+        if not index_path_obj.exists():
+            logger.info(
+                f"Index path '{index_path}' does not exist. "
+                "It will be created when building the index."
+            )
     
     return True
 
@@ -179,9 +197,7 @@ def get_cache_config(cfg: DictConfig) -> Optional[Dict[str, Any]]:
         Cache configuration dictionary or None if disabled.
     """
     enabled = OmegaConf.select(cfg, "cache.enabled")
-    if enabled is None:
-        enabled = True
-    if not enabled:
+    if enabled is False:
         return None
     
     return {
@@ -208,9 +224,6 @@ def get_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
         Generation kwargs dictionary.
     """
     enable_thinking = OmegaConf.select(cfg, "llm.generation.enable_thinking")
-    if enable_thinking is None:
-        enable_thinking = True
-    
     return {
         "timeout": OmegaConf.select(cfg, "llm.generation.timeout") or 300,
         "temperature": OmegaConf.select(cfg, "llm.generation.temperature") or 0.7,
@@ -219,7 +232,7 @@ def get_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
         "max_tokens": OmegaConf.select(cfg, "llm.generation.max_tokens") or 65536,
         "max_input_tokens": OmegaConf.select(cfg, "llm.generation.max_input_tokens") or 65536,
         "top_k": OmegaConf.select(cfg, "llm.generation.top_k") or 20,
-        "enable_thinking": enable_thinking,
+        "enable_thinking": enable_thinking if enable_thinking is not None else True,
         "random_seed": OmegaConf.select(cfg, "llm.generation.random_seed"),
     }
 
@@ -237,9 +250,6 @@ def get_node_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
         Node generation kwargs dictionary.
     """
     use_question_for_graph_retrieval = OmegaConf.select(cfg, "node_generation.use_question_for_graph_retrieval")
-    if use_question_for_graph_retrieval is None:
-        use_question_for_graph_retrieval = True
-    
     return {
         "n": OmegaConf.select(cfg, "node_generation.n") or 1,
         "n_subquestions": OmegaConf.select(cfg, "node_generation.n_subquestions") or 3,
@@ -247,5 +257,5 @@ def get_node_generation_kwargs(cfg: DictConfig) -> Dict[str, Any]:
         "top_k_entities": OmegaConf.select(cfg, "node_generation.top_k_entities") or 1,
         "top_k_properties": OmegaConf.select(cfg, "node_generation.top_k_properties") or 1,
         "n_hops": OmegaConf.select(cfg, "node_generation.n_hops") or 1,
-        "use_question_for_graph_retrieval": use_question_for_graph_retrieval,
+        "use_question_for_graph_retrieval": use_question_for_graph_retrieval if use_question_for_graph_retrieval is not None else True,
     }
