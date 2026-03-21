@@ -1,0 +1,796 @@
+"""Consolidated role definitions and the execute_role function.
+
+All Pydantic I/O models, system prompts, Role instances, and execution logic
+from the original base_role.py, generator.py, evaluator.py, extractor.py,
+open_ie.py, pruner.py, and base_role_execution.py.
+"""
+
+import asyncio
+import logging
+import os
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
+
+import pydantic
+
+from wemg.llm.parsing import extract_info_from_text
+from wemg.retrieval.wikidata import WikidataEntity
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
+
+
+# =============================================================================
+# Role dataclass
+# =============================================================================
+
+@dataclass
+class Role:
+    name: str
+    system_prompt: str
+    input_model: Type[pydantic.BaseModel]
+    output_model: Type[pydantic.BaseModel]
+
+
+# =============================================================================
+# Generator I/O Models
+# =============================================================================
+
+class SubquestionGenerationInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question to be answered.")
+    context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class SubquestionGenerationOutput(pydantic.BaseModel):
+    is_answerable: bool = pydantic.Field(..., description="If the main question can be answered with context.")
+    subquestions: Optional[List[str]] = pydantic.Field(None, description="Generated subquestions which are atomic, self-contained and diverse.")
+
+
+class AnswerGenerationInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question to be answered.")
+    context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class AnswerGenerationOutput(pydantic.BaseModel):
+    answer: str = pydantic.Field(..., description="The final answer.")
+    concise_answer: str = pydantic.Field(..., description="A concise version of the answer, only include the answer for the question.")
+    reasoning: str = pydantic.Field(..., description="The reasoning process behind the final answer.")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="Confidence level.")
+
+
+class QueryGeneratorInput(pydantic.BaseModel):
+    input_text: str = pydantic.Field(..., description="Input text to deconstruct into queries.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class QueryGeneratorOutput(pydantic.BaseModel):
+    queries: List[str] = pydantic.Field(..., description="Generated search queries.")
+
+
+class SelfCorrectionInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question to be answered.")
+    proposed_answer: str = pydantic.Field(..., description="The proposed answer to verify.")
+    context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class SelfCorrectionOutput(pydantic.BaseModel):
+    status: str = pydantic.Field(..., pattern=r"^(correct|partial|incorrect|unsupported)$")
+    refined_answer: str = pydantic.Field(..., description="The refined answer.")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+
+
+class QuestionRephraserInput(pydantic.BaseModel):
+    context: Optional[str] = pydantic.Field(None, description="Context for rephrasing.")
+    original_question: str = pydantic.Field(..., description="The original question.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class QuestionRephraserOutput(pydantic.BaseModel):
+    rephrased_question: str = pydantic.Field(..., description="The rephrased question.")
+
+
+class ReasoningSynthesizeInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The main question.")
+    context: str = pydantic.Field(..., description="Facts or previous reasoning steps.")
+
+    def __str__(self):
+        return f"Question:\n{self.question}\n\nContext:\n{self.context}"
+
+
+class ReasoningSynthesizeOutput(pydantic.BaseModel):
+    is_answerable: bool = pydantic.Field(..., description="If question can be answered with context.")
+    step_conclusion: str = pydantic.Field(..., description="Synthesized conclusion.")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+
+
+class Query(pydantic.BaseModel):
+    subject: str = pydantic.Field(..., description="Subject entity in the query.")
+    relation: str = pydantic.Field(..., description="Relation to query.")
+    reasoning: Optional[str] = pydantic.Field(None, description="Reasoning for inclusion.")
+
+    def __hash__(self):
+        return hash((self.subject, self.relation))
+
+
+class QueryGraphGeneratorInput(pydantic.BaseModel):
+    input_text: str = pydantic.Field(..., description="Input to deconstruct.")
+    entities: Optional[List[str]] = pydantic.Field(None, description="Entities to focus on.")
+    relations: Optional[List[str]] = pydantic.Field(None, description="Relations to use.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class QueryGraphGeneratorOutput(pydantic.BaseModel):
+    queries: List[Query] = pydantic.Field(..., description="Generated structured queries.")
+
+
+# =============================================================================
+# Evaluator I/O Models
+# =============================================================================
+
+class AnswerEvaluationInput(pydantic.BaseModel):
+    user_question: str = pydantic.Field(..., description="The user's original question.")
+    system_answer: str = pydantic.Field(..., description="The system's answer.")
+    correct_answer: Optional[str] = pydantic.Field("Not available", description="The known correct answer.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class AnswerEvaluationOutput(pydantic.BaseModel):
+    rating: float = pydantic.Field(..., ge=0.0, le=10.0, description="Rating from 0.0 to 10.0.")
+    reasoning: str = pydantic.Field(..., description="Reasoning behind the rating.")
+
+
+class MajorityVoteInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question.")
+    answers: List[str] = pydantic.Field(..., description="List of candidate answers.")
+
+    def __str__(self):
+        answers_str = "\n\n".join(f"{i+1}.\n {a}" for i, a in enumerate(self.answers))
+        return f"question:\n{self.question}\n\nanswers:\n{answers_str}"
+
+
+class MajorityVoteOutput(pydantic.BaseModel):
+    final_answer: str = pydantic.Field(..., description="Final answer by majority voting.")
+    concise_answer: str = pydantic.Field(..., description="Concise version.")
+    reasoning: str = pydantic.Field(..., description="Reasoning behind the final answer.")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+
+
+class FinalAnswerSynthesisInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question to be answered.")
+    candidate_answers: List[str] = pydantic.Field(..., description="Candidate answers.")
+
+    def __str__(self):
+        candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
+        return f"question:\n{self.question}\n\ncandidate_answers:\n{candidates_str}"
+
+
+class FinalAnswerSynthesisOutput(pydantic.BaseModel):
+    final_answer: str = pydantic.Field(..., description="Synthesized final answer.")
+    concise_answer: str = pydantic.Field(..., description="Concise version.")
+    reasoning: str = pydantic.Field(..., description="Integrated reasoning behind the final answer.")
+    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+
+
+class ConsensusEvaluationInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question to be answered.")
+    candidate_answers: List[str] = pydantic.Field(..., description="Candidate answers.")
+
+    def __str__(self):
+        candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
+        return f"question:\n{self.question}\n\ncandidate_answers:\n{candidates_str}"
+
+
+class ConsensusEvaluationOutput(pydantic.BaseModel):
+    rating: float = pydantic.Field(..., ge=0.0, le=10.0, description="Rating from 0.0 to 10.0.")
+    reasoning: str = pydantic.Field(..., description="Reasoning behind the rating.")
+
+
+# =============================================================================
+# Extractor I/O Models
+# =============================================================================
+
+class SourceType(Enum):
+    SYSTEM_PREDICTION = "System Prediction"
+    RETRIEVAL = "Retrieval"
+
+
+class ExtractionInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The user's question.")
+    raw_data: str = pydantic.Field(..., description="Raw text to analyze.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class ExtractionOutput(pydantic.BaseModel):
+    relevant_information: List[str] = pydantic.Field(..., description="Self-contained information that is (directly or indirectly) relevant to the question.")
+
+
+class MemoryItem(pydantic.BaseModel):
+    content: str = pydantic.Field(..., description="Self-contained information piece.")
+    provenance: str = pydantic.Field(..., pattern=r"^(System Prediction|Retrieval)$")
+
+
+class MemoryConsolidationInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="Question the memory should help answer.")
+    memory: str = pydantic.Field(..., description="Raw memory as list of tagged items.")
+
+    def __str__(self):
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class MemoryConsolidationOutput(pydantic.BaseModel):
+    consolidated_memory: List[MemoryItem] = pydantic.Field(..., description="Refined memory items.")
+
+
+# =============================================================================
+# Open IE I/O Models
+# =============================================================================
+
+class Entity(pydantic.BaseModel):
+    id: Optional[str] = pydantic.Field(
+        None,
+        description="Wikidata QID for the entity (e.g., 'Q42'). Must be null if unknown or uncertain.",
+    )
+    name: str = pydantic.Field(..., description="Entity name.")
+    description: Optional[str] = pydantic.Field(None, description="Brief description of the entity.")
+
+    def __hash__(self):
+        return hash(self.id if self.id else self.name)
+
+    def __eq__(self, other):
+        if not isinstance(other, Entity):
+            return False
+        if self.id and other.id:
+            return self.id == other.id
+        return self.name == other.name
+
+    def __str__(self):
+        return f"{self.name} - {self.description}" if self.description else self.name
+
+
+class NERInput(pydantic.BaseModel):
+    text: str = pydantic.Field(..., description="Text to extract entities from.")
+    known_entities: Optional[List[WikidataEntity]] = pydantic.Field(
+        None,
+        description="Optional reference list of known entities with Wikidata QIDs. Use only when certain; never guess IDs.",
+    )
+
+    def __str__(self):
+        known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
+        known_entities_str = "\n".join(known_entities_str)
+        return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
+
+
+class NEROutput(pydantic.BaseModel):
+    entities: List[Entity] = pydantic.Field(..., description="Extracted named entities.")
+
+
+class Relation(pydantic.BaseModel):
+    subject: str = pydantic.Field(..., description="Subject entity.")
+    subject_id: Optional[str] = pydantic.Field(
+        None,
+        description="Wikidata QID of the subject (e.g., 'Q42'). Must be null if unknown or uncertain.",
+    )
+    relation: str = pydantic.Field(..., description="Relationship type.")
+    object: str = pydantic.Field(..., description="Object entity.")
+    object_id: Optional[str] = pydantic.Field(
+        None,
+        description="Wikidata QID of the object (e.g., 'Q42'). Must be null if unknown or uncertain.",
+    )
+    context: Optional[str] = pydantic.Field(None, description="The context in which the relationship is stated. It should be self-contained and not rely on the original text or entities.")
+
+    def __hash__(self):
+        return hash((self.subject, self.relation, self.object, self.subject_id, self.object_id))
+
+    def __eq__(self, other):
+        if not isinstance(other, Relation):
+            return False
+        same_subject = self.subject_id==other.subject_id if self.subject_id and other.subject_id else self.subject == other.subject
+        same_object = self.object_id==other.object_id if self.object_id and other.object_id else self.object == other.object 
+        
+        return (same_subject and same_object
+                and self.relation == other.relation)
+
+    def __str__(self):
+        text = f"Subject: {self.subject}\nRelation: {self.relation}\nObject: {self.object}"
+        return text + (f"\nContext: {self.context}" if self.context else "")
+
+
+class RelationExtractionInput(pydantic.BaseModel):
+    text: str = pydantic.Field(..., description="Text to extract relationships from.")
+    known_entities: Optional[List[WikidataEntity]] = pydantic.Field(
+        None,
+        description="Optional reference list of known entities with Wikidata QIDs. Use only when certain; never guess IDs.",
+    )
+
+    def __str__(self):
+        known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
+        known_entities_str = "\n".join(known_entities_str)
+        return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
+
+
+class RelationExtractionOutput(pydantic.BaseModel):
+    relations: List[Relation] = pydantic.Field(..., description="Extracted relationships.")
+
+
+# =============================================================================
+# Pruner I/O Models
+# =============================================================================
+
+class TriplePruneInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The question to answer.")
+    triples: List[str] = pydantic.Field(..., description="List of triples to evaluate.")
+
+    def __str__(self):
+        triples_str = "\n".join(f"- [{i}]. {t}" for i, t in enumerate(self.triples))
+        return f"Question:\n{self.question}\n---\nTriples:\n{triples_str}"
+
+class TriplePruneOutput(pydantic.BaseModel):
+    keep_indices: List[int] = pydantic.Field(..., description="0-based indices of triples to keep.")
+
+
+# =============================================================================
+# System Prompts -- Generator
+# =============================================================================
+
+GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in multi-hop question answering and reasoning decomposition. Your task is to analyze whether a main question can be answered with the provided context, and if not, generate strategic subquestions that advance the reasoning process.
+
+## Core Principle: The generated subquestion must NOT be answerable using the provided context and must be self-contained, atomic and diverse.
+
+## Instructions:
+1. Analyze the Main Question: Identify core intent, key entities, and required information.
+2. Map Context to Requirements: Check if context contains all required facts.
+3. Decision Point:
+   - If YES (Sufficient): No subquestion needed.
+   - If NO (Insufficient): Proceed to generate subquestion.
+4. For Each Subquestion:
+   a. Target a distinct knowledge gap in the reasoning chain
+   b. Formulate an atomic, relevant, self-contained subquestion. Make sure each subquestion is fully understandable on its own without needing to refer back to the original question or context.
+   c. VALIDATE: Ensure subquestion CANNOT be answered by context. If it can be answered by context, generate a new subquestion. The generated subquestions must be diverse and not redundant. 
+   d. VALIDATE Independence: Each subquestion must be answerable WITHOUT requiring answers from other generated subquestions. Eliminate dependent subquestions that require answering another generated subquestion first. ONLY keep subquestions that are independently answerable (even if answering all subquestions doesn't directly solve the main question)
+"""
+
+ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
+
+## Instructions:
+1. Analyze the question and identify key components.
+2. If context provided, extract all relevant information.
+3. Resolve information gaps using your knowledge. You can use your own knowledge or your own internet search.
+4. Synthesize a clear, well-reasoned answer. State assumptions clearly if you made any assumptions or used your own internet search.
+"""
+
+SELF_CORRECT_PROMPT = """You are an expert in answer verification and refinement. Given a question, proposed answer, and context, verify correctness and provide a refined response.
+
+## Instructions:
+1. Parse question requirements
+2. Extract relevant facts from context
+3. Evaluate proposed answer: Systematically assess the proposed answer to determine if the answer is:
+    -  CORRECT:  Accurate, complete, and well-supported
+    -  PARTIAL:  Correct but incomplete or lacking detail
+    -  INCORRECT:  Contains factual errors or logical flaws
+    -  UNSUPPORTED:  Cannot be verified against available context
+4. Generate refined answer
+"""
+
+REPHRASE_QUESTION_PROMPT = """You are a Question Refiner that transforms unclear questions into precise, clear questions. Make sure the rephrased question is fully understandable on its own without needing to refer back to the original question.
+
+## Principles:
+1. Clarity First: Eliminate ambiguity and jargon.
+2. Preserve Intent: Don't alter the core inquiry.
+3. Enhance Answerability: Make specific and self-contained.
+
+## Instructions:
+1. Identify key subject and core action
+2. Note vague terms or confusing structure
+3. Rewrite to be clear and unambiguous
+"""
+
+SYNTHESIZE_PROMPT = """You are a specialized AI for multi-step reasoning. Perform a single, focused reasoning step by analyzing context and producing a consolidated synthesis.
+
+## Instructions:
+1. Analyze the main question objective
+2. Review all information in context, decide whether the context provides enough information to directly answer the main question.
+3. If the context provides enough information to directly answer the main question, state this clearly and formulate the definitive answer.
+4. If the context does not provide enough information to directly answer the main question, synthesize new thoughts based on the context that could advance the reasoning process, your thought could be the combination of the following:
+    - Synthesize Causal or Temporal Link: Connect multiple facts to explain why something happened or to establish a sequence of events.
+    - Identify Core Relationship: Integrate disparate pieces of information to define the relationship between key entities or concepts.
+    - Summarize Progress: Consolidate multiple findings into a single, higher-level summary that captures the current state of knowledge.
+    - Identify Contradiction: If the context contains conflicting information, highlight the discrepancy and provide a resolution if possible.
+    - Formulate Hypothesis: Propose a plausible conclusion that logically follows from the context but may need further validation in subsequent steps.
+    - Articulate Conclusion: Generate a single, dense paragraph that clearly states your new conclusion. This thought must be self-contained and understandable without referencing the full context again.
+
+## Critical Constraints:
+1. No External Information: Do NOT introduce any facts, assumptions, or information not present in the context.
+2. No New questions: Do not ask for new information. Your role is to synthesize, not to query.
+"""
+
+GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user input into precise, self-contained search queries.
+
+## Principles:
+1. Self-Contained: Each query understandable without original input.
+2. Atomic: One single fact per query.
+3. Essential & Non-Redundant: Every query necessary and unique.
+
+## Instructions:
+1. Parse the Input: 
+    - If the input is a question: Identify its type (e.g., factual, comparative, causal, temporal), key entities, and the required reasoning steps. 
+    - If the input is a statement: Deconstruct it into its core, verifiable claims. Identify the key entities and the asserted relationships between them. 
+2. Generate Strategic Queries: Formulate a list of search queries that are necessary to answer/verify the input. Each query is a building block to reach the final answer that follows the guiding principles above. The goal is to provide the user with all the search components they would need to solve the problem from scratch.
+3. Ensure Self-Containment: Each query must be understandable and answerable on its own. Make sure each query is self-contained and does not rely on the original input, other queries, or any external context. Rewrite queries that are not self-contained.
+4. Review for Completeness and Non-Redundancy: Ensure that the set of queries collectively covers all necessary information to answer/verify the input without any overlap or unnecessary duplication.
+"""
+
+# Reference relations will be populated at runtime when PROPERTY_LABELS is available.
+# Use set_structured_query_prompt() to inject them.
+GENERATE_STRUCTURED_QUERIES = """You are a Query Generator that decomposes questions into structured (subject, relation) queries for knowledge graph retrieval. Each query represents a single fact lookup needed to answer or verify the input.
+
+## Reference Relations (commonly used in knowledge graphs):
+{reference_relations}
+
+## Principles:
+0. Analyze the input: Identify the key entities and the required relationships between them.
+1. Relation Constraints: Use provided relations only if specified. You also should consider the relations that are not provided but are commonly used in the knowledge graph such as those in the reference relations above (this is just for reference, you can ignore it if you think it is not relevant).
+2. Entity Focus: Prioritize provided entities as subjects if specified
+3. Atomicity: One piece of information per query. For the query required complex relationship, you can break down the complex relationship into multiple simple relationships to form the query.
+4. Self-Containment: Fully specified entities, no pronouns
+5. Completeness: All queries needed for the answer
+6. Non-Redundancy: Each query seeks unique information that provides clues to answer the question, DO NOT generate redundant or unhelpful queries that are not required to answer the question.
+
+"""
+
+
+def set_structured_query_prompt(property_labels: Dict[str, Any]) -> None:
+    """Populate GENERATE_STRUCTURED_QUERIES with formatted property labels."""
+    global GENERATE_STRUCTURED_QUERIES  # noqa: PLW0603
+    reference_relations = "\n".join(
+        f"- {prop_data['label']}: {prop_data['description']}"
+        for prop_data in sorted(property_labels.values(), key=lambda x: x["label"])
+    )
+    GENERATE_STRUCTURED_QUERIES = GENERATE_STRUCTURED_QUERIES.format(
+        reference_relations=reference_relations,
+    )
+    STRUCTURED_QUERY_GENERATOR.system_prompt = GENERATE_STRUCTURED_QUERIES
+
+
+# =============================================================================
+# System Prompts -- Evaluator
+# =============================================================================
+
+JUDGE_ANSWER_PROMPT_V2 = """You are an expert evaluator. Your task is to rate the system_answer on a scale from 0.0 to 10.0 based on how effectively it addresses the user_question.
+
+Evaluation Criteria:
+1. Correctness (60%): Is the information factually accurate?
+   - If correct_answer is provided and system_answer matches correct_answer, award 10.0
+   - If no correct_answer is provided, verify accuracy using internet search or your knowledge
+2. Helpfulness & Relevance (40%): Does it address the user's core need with appropriate detail?
+
+Scoring Guidelines:
+- 9.0-10.0: Correct and comprehensive (10.0 if matches correct_answer)
+- 7.0-8.9: Mostly correct with minor issues
+- 5.0-6.9: Partially addresses question or has accuracy concerns
+- 3.0-4.9: Significant correctness or relevance issues
+- 0.0-2.9: Incorrect or completely off-topic
+
+IMPORTANT NOTE: Conduct your own internet searches/ knowledge investigation as needed to verify factual claims when correct_answer is not provided. Do not assume the system_answer is correct. You must independently verify all claims
+"""
+
+MAJORITY_VOTE_PROMPT = """You are an expert at evaluating answers. Given a question and answers, determine the final answer based on majority voting.
+
+Instructions:
+1. Analyze the question
+2. Identify underlying consensus across responses
+3. Synthesize a single, accurate answer based on majority consensus
+"""
+
+SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis. Construct a superior answer by analyzing and integrating candidate answers.
+
+Phase I - Deconstruction:
+- Break down each candidate into conclusion, premises, reasoning path
+- Assess factual accuracy, logical soundness, sufficiency
+
+Phase II - Conflict Resolution:
+- Map convergence and divergence points
+- Adjudicate conflicts using hierarchy: authoritative sources > logical soundness > majority
+
+Phase III - Synthesis:
+- Build new superior reasoning path
+- State final answer
+- Self-critique and refine
+"""
+
+CONSENSUS_EVALUATION_PROMPT = """You are an expert evaluator. Given two candidate answers with their reasoning, evaluate the consensus between the two answers. Rate from 0.0 to 10.0 how well the two answers are consistent with each other.
+
+Criteria:
+- Answer Alignment (40%): Do the final answers reach the same or compatible conclusions?
+- Reasoning Consistency (35%): Are the logical steps, assumptions, and intermediate conclusions similar?
+- Information Agreement (25%): Do both answers rely on consistent facts and evidence?
+
+Scoring Guidelines:
+- 9.0-10.0: Nearly perfect consensus - answers and reasoning are essentially identical or fully compatible
+- 7.0-8.9: Strong consensus - minor differences in phrasing or emphasis, but core conclusions align
+- 5.0-6.9: Moderate consensus - answers agree on main points but differ in details or approach
+- 3.0-4.9: Weak consensus - some overlap but significant disagreements or contradictions
+- 0.0-2.9: No consensus - answers contradict each other or address different aspects entirely
+"""
+
+# =============================================================================
+# System Prompts -- Extractor
+# =============================================================================
+
+EXTRACT_PROMPT = """You are a meticulous research analyst. Build a comprehensive dossier of information from the provided text that could help answer the question.
+
+Rules:
+- Consider both direct and indirect relevant information. An information is considered relevant if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
+- Extracted information must be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items.
+
+Instructions:
+1. Question Deconstruction: Identify primary subject, key entities, and specific information sought.
+2. Candidate Identification: Identify and quote ALL passages that seem potentially related to the concepts in the question. Be liberal and inclusive in this initial pass; we will filter and refine in the next step.
+3. Relevance Evaluation: Assess each quote against criteria (directly answering, contextual, supporting evidence, etc.).
+4. Extraction: Extract ALL relevant information verbatim. Add context for clarity but preserve original meaning, make sure each extracted information is self-contained (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items) and can be used to answer the question.
+5. Final evaluation: 
+    - Examine the extracted information to make sure each information is self-contained. If it is not, rewrite it to make it self-contained.
+    - Remove information that is not relevant to the question. The information considers relevant if it contains ANY information that could clue the answer to the question or related with any concept in the question.
+    - If the extracted information is relevant, return the extracted information as a list of strings.
+    - If the extracted information is not relevant, return an empty list.
+"""
+
+MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
+
+## Instructions
+1. Question Analysis: Identify primary subject, key entities, and specific information sought.
+2. Duplicate & Redundancy Removal: Remove duplicates and redundant information. Make sure the consolidated memory not contain any duplicate or redundant information.
+3. Relevance Evaluation: Assess each item against criteria (directly answering, contextual, supporting evidence, etc.). The information considers relevant or useful if it contains ANY information that could clue the answer to the question or related with any concept in the question. Remove information that is not relevant or useful.
+4. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
+5. Final evaluation: 
+    - Each item MUST be self-contained and clear (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items and no pronouns or other references to the original memory, question, or other items). If it is not self-contained, rewrite it to MAKE SURE it is self-contained.
+"""
+
+# =============================================================================
+# System Prompts -- Open IE
+# =============================================================================
+
+NER_PROMPT = """You are an expert Named Entity Recognition specialist. Extract all named entities from the text.
+
+You may be given an optional list of KNOWN ENTITIES, each with:
+- id: Wikidata QID (e.g., "Q42")
+- name: official Wikidata label
+- description: brief description for disambiguation
+
+Wikidata linking rules (strict):
+- If an extracted entity clearly matches a KNOWN ENTITY (by name and/or description), set its id to that QID and use the KNOWN ENTITY's official name as the entity name.
+- If there is any ambiguity or you are not fully certain, set id to null.
+- NEVER guess or invent a QID.
+
+Instructions:
+1. If text is a question, focus ONLY on entities essential to answering it
+2. Define precise boundaries (include modifiers like "Prime Minister Boris Johnson")
+3. Handle ambiguity using context (e.g., "Apple" as company vs. fruit)
+4. Extract unique entities only once (deduplicate by real-world entity; if id is present, also deduplicate by id)
+
+Rules:
+- Only extract actual named entities, not common nouns or pronouns
+- No overlapping entities; extract most complete version
+- For each entity, provide brief description for clarity
+"""
+
+RELATION_EXTRACTION_PROMPT = """You are an expert Relation Extraction specialist. Extract all meaningful relationships between entities. Each relationship should be self-contained, i.e., understandable on its own without needing to refer back to the original text or entities.
+
+You may be given an optional list of KNOWN ENTITIES, each with:
+- id: Wikidata QID (e.g., "Q42")
+- name: official Wikidata label
+- description: brief description for disambiguation
+
+Wikidata linking rules (strict):
+- If a subject/object clearly matches a KNOWN ENTITY (by name and/or description), set subject_id/object_id to that QID and use the KNOWN ENTITY's official name as subject/object.
+- If there is any ambiguity or you are not fully certain, leave subject_id/object_id as null.
+- NEVER guess or invent a QID.
+
+Instructions:
+1. Identify entity pairs with direct relationships
+2. Break down complex relationships into simpler relationships. 
+3. Only extract explicitly stated or strongly implied relationships.
+4. Use clear, concise relation types.
+5. Make sure extracted relationships are self-contained and not duplicated.
+6. Entity naming consistency:
+   - Reuse the exact same subject/object string for the same real-world entity across all extracted relations.
+   - Do not use aliases, abbreviations, or pronouns in subject/object strings.
+"""
+
+# =============================================================================
+# System Prompts -- Pruner
+# =============================================================================
+
+TRIPLE_PRUNE_PROMPT = """You are a Knowledge Graph Expert. Given a question and a list of triples, keep only triples relevant to answering the question.
+
+Instructions:
+1. Identify triples relevant to answering the question.
+2. Consider cross-triples and chain-triples, i.e., a triple is relevant if it is directly or indirectly related to the question.
+3. Output a JSON object with a single key "keep_indices" containing a list of indices (0-based) of triples to keep.
+
+"""
+
+
+# =============================================================================
+# Role Instances
+# =============================================================================
+
+SUBQUESTION_GENERATOR = Role("subquestion_generator", GENERATE_SUBQUESTION_PROMPT, SubquestionGenerationInput, SubquestionGenerationOutput)
+ANSWER_GENERATOR = Role("answer_generator", ANSWER_PROMPT, AnswerGenerationInput, AnswerGenerationOutput)
+QUERY_GENERATOR = Role("query_generator", GENERATE_QUERIES_PROMPT, QueryGeneratorInput, QueryGeneratorOutput)
+SELF_CORRECTOR = Role("self_corrector", SELF_CORRECT_PROMPT, SelfCorrectionInput, SelfCorrectionOutput)
+QUESTION_REPHRASER = Role("question_rephraser", REPHRASE_QUESTION_PROMPT, QuestionRephraserInput, QuestionRephraserOutput)
+REASONING_SYNTHESIZER = Role("reasoning_synthesizer", SYNTHESIZE_PROMPT, ReasoningSynthesizeInput, ReasoningSynthesizeOutput)
+EVALUATOR = Role("evaluator", JUDGE_ANSWER_PROMPT_V2, AnswerEvaluationInput, AnswerEvaluationOutput)
+MAJORITY_VOTER = Role("majority_voter", MAJORITY_VOTE_PROMPT, MajorityVoteInput, MajorityVoteOutput)
+FINAL_ANSWER_SYNTHESIZER = Role("final_answer_synthesizer", SYNTHESIZE_FINAL_ANSWER_PROMPT, FinalAnswerSynthesisInput, FinalAnswerSynthesisOutput)
+CONSENSUS_EVALUATOR = Role("consensus_evaluator", CONSENSUS_EVALUATION_PROMPT, ConsensusEvaluationInput, ConsensusEvaluationOutput)
+EXTRACTOR = Role("extractor", EXTRACT_PROMPT, ExtractionInput, ExtractionOutput)
+MEMORY_CONSOLIDATOR = Role("memory_consolidation", MEMORY_CONSOLIDATION_PROMPT, MemoryConsolidationInput, MemoryConsolidationOutput)
+NER = Role("named_entity_recognition", NER_PROMPT, NERInput, NEROutput)
+RELATION_EXTRACTOR = Role("relation_extraction", RELATION_EXTRACTION_PROMPT, RelationExtractionInput, RelationExtractionOutput)
+TRIPLE_PRUNER = Role("triple_pruner", TRIPLE_PRUNE_PROMPT, TriplePruneInput, TriplePruneOutput)
+STRUCTURED_QUERY_GENERATOR = Role("structured_query_generator", GENERATE_STRUCTURED_QUERIES, QueryGraphGeneratorInput, QueryGraphGeneratorOutput)
+
+
+# =============================================================================
+# Message formatting
+# =============================================================================
+
+def format_messages(
+    role: Role,
+    input_data: pydantic.BaseModel,
+    in_context_examples: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, str]]:
+    """Build message list: system + optional examples + user input."""
+    messages = [{"role": "system", "content": role.system_prompt}]
+    if in_context_examples:
+        messages.extend(in_context_examples)
+    messages.append({"role": "user", "content": str(input_data)})
+    return messages
+
+
+# =============================================================================
+# Response parsing
+# =============================================================================
+
+def parse_response(role: Role, response) -> Optional[pydantic.BaseModel]:
+    """Parse LLM response into the role's output model.
+
+    Handles: already parsed (BaseModel), dict, or str (via extract_info_from_text).
+    """
+    if isinstance(response, role.output_model):
+        return response
+    if isinstance(response, dict):
+        try:
+            return role.output_model(**response)
+        except Exception:
+            logger.error("Failed to parse response into %s. Response dict: %s", role.output_model.__name__, response)
+            try:
+                return role.output_model(
+                    **{key: response.get(key) for key in role.output_model.model_fields}
+                )
+            except Exception:
+                return None
+    if isinstance(response, str):
+        keys = list(role.output_model.model_fields.keys())
+        value_types = [
+            field.annotation.__name__
+            for field in role.output_model.model_fields.values()
+        ]
+        parsed_dict = extract_info_from_text(response, keys, value_types)
+        try:
+            return role.output_model(**parsed_dict)
+        except Exception:
+            logger.error(
+                "Failed to parse response into %s. Parsed dict: %s. Response text: %s",
+                role.output_model.__name__, parsed_dict, response,
+            )
+            return None
+    return None
+
+
+# =============================================================================
+# Role execution
+# =============================================================================
+
+async def execute_role(
+    client,
+    role: Role,
+    input_data: Union[pydantic.BaseModel, List[pydantic.BaseModel]],
+    interaction_memory=None,
+    **kwargs,
+) -> Tuple[Union[List, Any], Dict]:
+    """Execute a role with the LLM client.
+
+    Steps:
+      1. Normalize input to list
+      2. Format messages for all inputs (with optional interaction_memory examples)
+      3. Call client.execute_role(all_messages, output_schema=role.output_model, **kwargs)
+      4. Parse responses
+      5. Build log_data: {role.name: [(input_str, raw_output), ...]}
+      6. Return (parsed_results, log_data) - unwrap if single input
+    """
+    is_single = isinstance(input_data, pydantic.BaseModel)
+    if is_single:
+        input_data = [input_data]
+
+    for item in input_data:
+        assert isinstance(item, role.input_model), (
+            f"Input data must be of type {role.input_model.__name__}"
+        )
+
+    all_messages = await asyncio.gather(*[
+        _format_messages_for_item(role, item, interaction_memory)
+        for item in input_data
+    ])
+    call_kwargs = {
+        "n": kwargs.pop("n", 1),
+        "output_schema": role.output_model,
+        **kwargs,
+    }
+    response, raw_response = client.execute_role(list(all_messages), **call_kwargs)
+
+    input_strs = [str(item) for item in input_data]
+    assert len(input_strs) == len(raw_response), "input_data and raw_response must have the same length"
+
+    log_data: Dict[str, List[Tuple[str, str]]] = {
+        role.name: [
+            tuple(pair) for pair in zip(input_strs, raw_response) if pair[1]
+        ],
+    }
+
+    parsed_response: List[List[pydantic.BaseModel]] = []
+    for res in response:
+        r = []
+        for item in res:
+            parsed_item = parse_response(role, item)
+            if parsed_item:
+                r.append(parsed_item)
+        parsed_response.append(r)
+    if is_single:
+        return parsed_response[0], log_data
+    return parsed_response, log_data
+
+
+async def _format_messages_for_item(
+    role: Role,
+    input_data: pydantic.BaseModel,
+    interaction_memory,
+) -> List[Dict[str, str]]:
+    """Build messages for a single input, optionally pulling interaction_memory examples."""
+    if interaction_memory is None:
+        return format_messages(role, input_data)
+
+    if hasattr(interaction_memory, "get_examples_async"):
+        examples = await interaction_memory.get_examples_async(
+            role=role.name, query=str(input_data),
+        )
+    elif hasattr(interaction_memory, "get_examples"):
+        examples = interaction_memory.get_examples(
+            role=role.name, query=str(input_data),
+        )
+    else:
+        return format_messages(role, input_data)
+
+    flat_examples = sum(examples, [])
+    return format_messages(role, input_data, in_context_examples=flat_examples)

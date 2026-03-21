@@ -1,39 +1,21 @@
-# WEMG Configuration File
-# This configuration file manages all parameters for the WEMG system
-# using Hydra and OmegaConf for flexible configuration management.
-
-defaults:
-  - _self_
-
-# =====================================================================
-# LLM Agent Configuration
-# =====================================================================
 llm:
-  # Model settings
-  model_name: "Qwen3-Next-80B-A3B-Thinking-FP8"  # Options: gpt-4o, gpt-4o-mini, claude-3-5-sonnet-20241022, etc.
-  url: "http://n0142:4000/v1"  # API endpoint URL
-  api_key: null  # Set via environment variable API_KEY or directly here
-  client_type: "openai"  # Client type: openai, anthropic, etc.
-  
-  # Concurrency and retry settings
+  model_name: "Qwen3-Next-80B-A3B-Thinking-FP8"
+  url: "http://n0378:4000/v1"
+  api_key: null
+  client_type: "openai"
   concurrency: 64
   max_retries: 3
-  
-  # Generation parameters
   generation:
     timeout: 300
-    temperature: 0.8  # Increased for more diverse outputs
-    n: 1  # Number of samples to generate
+    temperature: 0.8
+    n: 1
     top_p: 0.8
     max_tokens: 32768
     max_input_tokens: 65536
     top_k: 20
-    enable_thinking: true  # Enable chain-of-thought reasoning
-    random_seed: null  # Set for reproducibility
+    enable_thinking: true
+    random_seed: 8888
 
-# =====================================================================
-# Cache Configuration (Redis)
-# =====================================================================
 cache:
   enabled: true
   host: "localhost"
@@ -41,134 +23,88 @@ cache:
   db: 0
   password: null
   prefix: "wemg"
-  ttl: 86400  # Cache TTL in seconds (24 hours)
+  ttl: 86400
 
-# =====================================================================
-# Retriever Configuration
-# =====================================================================
 retriever:
-  # Retriever type: "web_search" or "corpus"
   type: "corpus"
-  
-  # Web search settings
   web_search:
-    api_key: null  # Serper API key, set via SERPER_API_KEY environment variable
-    top_k: 5  # Number of web results to retrieve
-    crawl_full_text: true  # Whether to crawl full text of web pages
-  
-  # Corpus-based retriever settings (when type is "corpus")
+    api_key: null
+    top_k: 5
+    crawl_full_text: true
+    max_crawl_requests_per_second: 2.0
   corpus:
     embedder:
       model_name: "Qwen3-Embedding-4B"
-      url: "http://n0142:4000/v1"
-      api_key: null  # Set via API_KEY
+      url: "http://n0378:4000/v1"
+      api_key: null
       embedder_type: "openai"
-    corpus_path: Hieuman/wiki23-processed  # Path to corpus dataset
-    index_path: /home/hieum/uonlp/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss  # Path to FAISS index
+    corpus_path: "Hieuman/wiki23-processed"
+    index_path: "/home/hieum/uonlp/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss"
 
-# =====================================================================
-# Search Strategy Configuration
-# =====================================================================
+reranker:
+  enabled: true
+  model_name: "Qwen3-Reranker-4B"
+  url: "http://n0999:30002/v1"
+  api_key: "EMPTY"
+  top_k: 10
+  concurrency: 32
+  instruction: null
+
 search:
-  # Strategy: "mcts" (Monte Carlo Tree Search) or "cot" (Chain-of-Thought)
   strategy: "mcts"
-  
-  # MCTS-specific settings
   mcts:
-    num_iterations: 30  # Number of MCTS iterations (increased for more exploration)
-    max_tree_depth: 10  # Maximum depth of the search tree
-    max_simulation_depth: 5  # Maximum depth for simulation rollouts
-    exploration_weight: 2.5  # UCT exploration parameter (increased for more exploration)
-    is_cot_simulation: true  # Use CoT for simulation phase
-    use_golden_answer_for_reward: False  # Use golden answer for reward function
-    
-    # Early termination settings
+    num_iterations: 30
+    max_tree_depth: 10
+    max_simulation_depth: 5
+    exploration_weight: 2.5
+    use_golden_answer_for_reward: false
     early_termination:
-      enabled: true  # Enable early termination
-      min_iterations: 5  # Minimum iterations before termination (increased)
-      high_confidence_threshold: 0.9  # Reward threshold for immediate termination
-      convergence_patience: 5  # Iterations without improvement before termination (increased)
-      semantic_sufficiency_count: 3  # Number of "sufficient info" signals before termination (increased)
-  
-  # CoT-specific settings
+      enabled: true
+      min_iterations: 5
+      high_confidence_threshold: 0.9
+      convergence_patience: 5
+      semantic_sufficiency_count: 3
   cot:
-    max_depth: 10  # Maximum reasoning depth
+    max_depth: 10
 
-# =====================================================================
-# Node Generation Parameters
-# =====================================================================
 node_generation:
-  n: 1  # Number of candidates to generate per node (for deterministic operations)
-  n_subquestions: 3 # Number of diverse subquestions to generate (for tree branching)
-  top_k_websearch: 5  # Top-k web search results
-  top_k_entities: 3  # Top-k entities from knowledge graph
-  top_k_properties: 3  # Top-k properties from knowledge graph
-  n_hops: 2  # Number of hops for graph exploration
-  use_question_for_graph_retrieval: true  # Use question to generate graph retrieval queries
+  n: 1
+  n_subquestions: 3
+  top_k_websearch: 5
+  top_k_entities: 3
+  top_k_properties: 3
+  n_hops: 2
+  entity_linking_method: "llm"
+  rerank_kb_documents: true
+  azure_endpoint: null
+  azure_key: null
 
-# =====================================================================
-# Memory Configuration
-# =====================================================================
 memory:
-  # Working memory settings
   working_memory:
-    max_textual_memory_tokens: 16384  # Maximum tokens in textual memory
-  
-  # Interaction memory settings (logging)
+    max_textual_memory_tokens: 16384
   interaction_memory:
-    enabled: True
-    scope: "question"  # Memory scope: "question" (isolated per question, default) or "dataset" (shared across all questions, thread-safe)
-    log_dir: "./logs"  # Directory for interaction logs
+    enabled: true
+    scope: "question"
+    log_dir: "./logs"
     save_to_file: false
-    
-    # Database settings
-    db_path: null  # Path to persistent ChromaDB database (null = in-memory)
-    collection_name: "interaction_memory"  # ChromaDB collection name, will be reset to a unique name for each question
-    
-    # Token budget and batching
-    token_budget: 8192  # Maximum tokens per log entry (prevents OOM)
-    batch_size: 32  # Batch size for logging entries (prevents OOM)
-    batch_size_async: 100  # Batch size for async logging
-    
-    # Embedding settings
-    is_local_embedding_api: True  # Use local embedding API instead of SentenceTransformer
-    embedding_model_name: "Qwen3-Embedding-4B"  # Embedding model name
-    embedding_base_url: "http://n0142:4000/v1"  # Embedding API base URL
-    embedding_api_key: null  # Embedding API key
-    
-    # Cache settings
-    enable_embedding_cache: true  # Enable embedding cache to avoid recomputation
-    cache_max_size: 10000  # Maximum size of embedding cache
+    db_path: null
+    collection_name: "interaction_memory"
+    token_budget: 8192
+    batch_size: 32
+    batch_size_async: 100
+    is_local_embedding_api: true
+    embedding_model_name: "Qwen3-Embedding-4B"
+    embedding_base_url: "http://n0378:4000/v1"
+    embedding_api_key: null
+    enable_embedding_cache: true
+    cache_max_size: 10000
 
-# =====================================================================
-# Logging Configuration
-# =====================================================================
 logging:
-  level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-# =====================================================================
-# Output Configuration
-# =====================================================================
 output:
-  include_reasoning: true  # Include reasoning trace in output
-  include_concise_answer: true  # Include concise answer
-  show_search_tree: True  # Show search tree in output
-  verbose: false  # Verbose output mode
-
-# =====================================================================
-# Runtime Parameters
-# =====================================================================
-question: null  # Question to answer (set via command line: question="Your question here")
-
-# =====================================================================
-# Hydra Configuration
-# =====================================================================
-hydra:
-  run:
-    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
-  sweep:
-    dir: ./multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
-    subdir: ${hydra.job.num}
-  job:
-    chdir: false  # Don't change working directory
+  include_reasoning: true
+  include_concise_answer: true
+  show_search_tree: true
+  verbose: false

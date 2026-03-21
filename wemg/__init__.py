@@ -1,32 +1,14 @@
-"""WEMG - LLM agents with caching support and graph-enhanced retrieval."""
+"""WEMG - When Embedding Models Meet Graph RAG."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
-from wemg.agents.base_llm_agent import BaseClient, OpenAIClient, BaseLLMAgent
-from wemg.config import (
-    load_config,
-    create_config_from_dict,
-    validate_config,
-)
-from wemg.main import (
-    WEMGSystem,
-    AnswerResult,
-    answer_question,
-    answer_questions_batch,
-)
+from wemg.config import WEMGConfig, get_default_config_path
+from wemg.system import WEMGSystem, AnswerResult, answer_question, answer_questions_batch
 
 __all__ = [
-    # Version
     "__version__",
-    # Agents
-    "BaseClient",
-    "OpenAIClient",
-    "BaseLLMAgent",
-    # Configuration
-    "load_config",
-    "create_config_from_dict",
-    "validate_config",
-    # Main interface
+    "WEMGConfig",
+    "get_default_config_path",
     "WEMGSystem",
     "AnswerResult",
     "answer_question",

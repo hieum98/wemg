@@ -13,3 +13,5 @@ MCTS_PROFILING_ANALYSIS.md
 results/
 logs/
 results-v0/*
+.vscode/
+.cursor/

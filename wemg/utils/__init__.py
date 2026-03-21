@@ -1,27 +1,18 @@
-"""Utility modules for WEMG.
+"""Utility modules for WEMG."""
 
-This package contains utility functions for:
-- Caching
-- Graph operations
-- Parsing
-- Preprocessing
-- Common utilities
-"""
-from wemg.utils.common import merge_logs, log_to_interaction_memory
-from wemg.utils.preprocessing import (
-    approximate_token_count,
+from wemg.utils.text import approximate_token_count, format_context
+from wemg.utils.graph import (
     get_node_id,
-    format_context,
+    get_densest_node,
+    textualize_graph,
+    visualize_graph,
 )
-from wemg.utils.graph_utils import get_densest_node, textualize_graph, visualize_graph
 
 __all__ = [
-    'merge_logs',
-    'log_to_interaction_memory',
-    'approximate_token_count',
-    'get_node_id',
-    'format_context',
-    'get_densest_node',
-    'textualize_graph',
-    'visualize_graph',
+    "approximate_token_count",
+    "format_context",
+    "get_node_id",
+    "get_densest_node",
+    "textualize_graph",
+    "visualize_graph",
 ]
