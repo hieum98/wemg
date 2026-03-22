@@ -117,7 +117,7 @@ def cot_search(
         next_node = generate_next_step(current, generator, working_memory, interaction_memory)
         if next_node is None:
             break
-        working_memory.synchronize_memory(client, question, interaction_memory)
+        working_memory.synchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
         
         current = next_node
         reasoning_path.append(current)

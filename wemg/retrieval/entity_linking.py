@@ -4,9 +4,34 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple, Any, Union
 
+from wemg.llm.roles import Entity as NEREntity
+from wemg.retrieval.reranker import Reranker
 from wemg.retrieval.wikidata import WikidataEntity
 
 logger = logging.getLogger(__name__)
+
+
+def _choose_wikidata_for_mention(
+    ner_entity: NEREntity,
+    results: List[WikidataEntity],
+    reranker: Optional[Reranker],
+) -> Optional[WikidataEntity]:
+    """Pick one Wikidata entity for a NER mention; optionally rerank by NER description."""
+    if not results:
+        return None
+    first = results[0]
+    if not isinstance(first, WikidataEntity) or not first.qid:
+        return None
+    if len(results) == 1 or reranker is None:
+        return first
+    desc = (ner_entity.description or "").strip()
+    if not desc:
+        return first
+    documents = [str(e) for e in results]
+    idx = reranker.best_index(desc, documents)
+    if idx < 0 or idx >= len(results):
+        idx = 0
+    return results[idx]
 
 
 async def link_entities_llm(
@@ -16,13 +41,16 @@ async def link_entities_llm(
     top_k_entities: int = 1,
     interaction_memory=None,
     known_entities: Optional[List[Any]] = None,
+    reranker: Optional[Reranker] = None,
 ) -> Tuple[Dict, Dict, Dict]:
     """Link entities in text to Wikidata using LLM NER.
 
     1. Run NER role on text to extract Entity objects
-    2. For each entity, search Wikidata by entity.name
-    3. Return:
-     - wikidata_entities: List[WikidataEntity], only unknown entities are returned
+    2. For each entity with unknown QID, search Wikidata by entity.name (up to top_k_entities hits)
+    3. If multiple hits and ``reranker`` is set and the NER entity has a non-empty description,
+       rerank candidates so the best match aligns with that description; otherwise use the first hit.
+    4. Return:
+     - wikidata_entities: List[WikidataEntity], one resolved entity per unknown mention
      - entity_dict: Dict[str, str] {name: qid}, all entities in the text with their Wikidata QIDs
      - log_data: Dict: {NER: [(input_str, raw_output), ...]} for logging the NER role calls
     """
@@ -39,9 +67,10 @@ async def link_entities_llm(
 
     ner_output = responses[0] if responses else None
     if not ner_output or not hasattr(ner_output, 'entities') or not ner_output.entities:
-        return {}, {}, log
+        return [], {}, log
 
-    entity_names = [e.name for e in ner_output.entities if e.id is None] # only search for entities with unknown IDs
+    entities_to_link = [e for e in ner_output.entities if e.id is None]
+    entity_names = [e.name for e in entities_to_link]
     retrieval_results: Union[List[WikidataEntity], List[List[WikidataEntity]]] = await wikidata_client.asearch_entities(
         entity_names, num_results=top_k_entities, get_details=True
     )
@@ -50,10 +79,11 @@ async def link_entities_llm(
     wikidata_entities: List[WikidataEntity] = []
 
     if retrieval_results and isinstance(retrieval_results[0], list):
-        for entity, results in zip(entity_names, retrieval_results):
-            if results and isinstance(results[0], WikidataEntity) and results[0].qid:
-                entity_dict[entity] = results[0].qid
-                wikidata_entities.extend(results)
+        for ner_entity, results in zip(entities_to_link, retrieval_results):
+            chosen = _choose_wikidata_for_mention(ner_entity, results, reranker)
+            if chosen:
+                entity_dict[ner_entity.name] = chosen.qid
+                wikidata_entities.append(chosen)
 
     unique = list(set(wikidata_entities))  # deduplicate
     return unique, entity_dict, log

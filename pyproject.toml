@@ -46,6 +46,7 @@ dependencies = [
 dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=0.21.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -56,3 +57,7 @@ exclude = ["test*", "wemg_backup*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Always stream logging to the terminal during runs; DEBUG is the lowest standard level.
+log_cli = true
+log_cli_level = "DEBUG"
+log_level = "DEBUG"

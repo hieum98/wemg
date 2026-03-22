@@ -15,6 +15,7 @@ import networkx as nx
 
 from wemg.llm.roles import Relation
 from wemg.reasoning.generator import merge_logs
+from wemg.retrieval.entity_linking import link_entities_azure, link_entities_llm
 from wemg.retrieval.wikidata import WikiTriple, WikidataClient, WikidataEntity, WikidataProperty
 
 from .interaction_memory import InteractionMemory, log_to_interaction_memory
@@ -53,6 +54,10 @@ async def parse_graph_from_text(
         logger.error(f"Failed to extract relations from text. Got {type(relation_triples)}")
         relation_triples = []
     return relation_triples, re_log
+
+
+async def _gather_awaitables(tasks):
+    return list(await asyncio.gather(*tasks))
 
 
 # =============================================================================
@@ -216,8 +221,12 @@ class WorkingMemory:
                     node_data = OpenIEEntity(id=node.qid, name=node.label, description=node.description)
                 else:
                     node = self._wikidata_client.enrich_entities([node], get_details=False)[0]
+                    if node is None or not node.qid or not node.label:
+                        logger.warning(f"No entity found for {node}")
+                        return
                     node_data = OpenIEEntity(id=node.qid, name=node.label, description=node.description)
-                    self.entity_dict[node.qid] = node
+                    if node.qid not in self.entity_dict:
+                        self.entity_dict[node.qid] = node
         else:
             raise ValueError(f"Invalid node type: {type(node)}")
         
@@ -260,6 +269,10 @@ class WorkingMemory:
 
         subject_id = get_node_id(subject_data)
         object_id = get_node_id(object_data)
+        # check all nodes in the triple are in the graph memory
+        if subject_id not in self.graph_memory or object_id not in self.graph_memory:
+            logger.warning(f"Skipping invalid triple for graph memory: {triple}")
+            return
 
         logger.info(f"Adding edge to graph memory: {str(triple)}")
 
@@ -289,7 +302,7 @@ class WorkingMemory:
         )
         return cluster_text
 
-    def connect_graph_memory(self, max_hops: int = 2) -> bool:
+    def connect_graph_memory(self, max_hops: int = 1) -> bool:
         """Connect disconnected components in graph memory using Wikidata paths."""
         from wemg.retrieval.wikidata import WikidataPathBetweenEntities
         from wemg.utils.graph import get_densest_node
@@ -328,7 +341,7 @@ class WorkingMemory:
             self._wikidata_client.afind_path(densest_qids[i], densest_qids[i + 1], max_hops=max_hops)
             for i in valid_pairs
         ]
-        paths = asyncio.run(asyncio.gather(*tasks))
+        paths = asyncio.run(_gather_awaitables(tasks))
         for i, path in zip(valid_pairs, paths):
             if path and isinstance(path, WikidataPathBetweenEntities) and path.path:
                 for triple in path.path:
@@ -387,6 +400,61 @@ class WorkingMemory:
 
         return enhanced_triples
 
+    async def _link_entities_async(
+        self,
+        client,
+        text: str,
+        known_entities: Optional[List[WikidataEntity]],
+        interaction_memory: Optional[InteractionMemory] = None,
+        *,
+        entity_linking_method: str = "llm",
+        top_k_entities: int = 1,
+        reranker=None,
+        azure_endpoint: Optional[str] = None,
+        azure_key: Optional[str] = None,
+    ) -> Tuple[List[WikidataEntity], Dict]:
+        """Link entities in ``text``; returns resolved entities and role log only (no cache writes)."""
+        if not (text and text.strip()) or self._wikidata_client is None:
+            return [], {}
+        if entity_linking_method == "azure":
+            wikidata_entities, _, link_log = await link_entities_azure(
+                text,
+                self._wikidata_client,
+                endpoint=azure_endpoint,
+                key=azure_key,
+            )
+        else:
+            wikidata_entities, _, link_log = await link_entities_llm(
+                client,
+                text,
+                self._wikidata_client,
+                top_k_entities=top_k_entities,
+                interaction_memory=interaction_memory,
+                known_entities=known_entities,
+                reranker=reranker,
+            )
+        flat: List[WikidataEntity] = []
+        for e in wikidata_entities:
+            if isinstance(e, WikidataEntity) and e.qid:
+                flat.append(e)
+        return flat, (link_log if isinstance(link_log, dict) else {})
+
+    def _merge_linked_entities_into_cache(self, entities: List[WikidataEntity]) -> None:
+        """Apply linking results to ``entity_dict`` (call only from sync code, after awaitables finish)."""
+        for e in entities:
+            if e.qid:
+                self.entity_dict[e.qid] = e
+
+    @staticmethod
+    def _entity_link_kwargs_from_call(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "entity_linking_method": kwargs.get("entity_linking_method", "llm"),
+            "top_k_entities": kwargs.get("top_k_entities", 1),
+            "reranker": kwargs.get("reranker"),
+            "azure_endpoint": kwargs.get("azure_endpoint"),
+            "azure_key": kwargs.get("azure_key"),
+        }
+
     # -----------------------------------------------------------------
     # Graph Consolidation
     # -----------------------------------------------------------------
@@ -396,6 +464,7 @@ class WorkingMemory:
         client,
         question: str,
         interaction_memory: Optional[InteractionMemory] = None,
+        **kwargs,
     ) -> None:
         """Consolidate graph memory by processing each component."""
         from wemg.llm.roles import SourceType
@@ -439,6 +508,7 @@ class WorkingMemory:
         client,
         question: str,
         interaction_memory: Optional[InteractionMemory] = None,
+        **kwargs,
     ) -> None:
         """Synchronize graph and textual memory bidirectionally."""
         from wemg.llm.roles import SourceType
@@ -453,9 +523,23 @@ class WorkingMemory:
 
         if self.textual_memory:
             textual_memory = self.format_textual_memory()
+            known_snapshot = [
+                e for e in self.entity_dict.values() if isinstance(e, WikidataEntity)
+            ] or None
+            link_kw = self._entity_link_kwargs_from_call(kwargs)
+            linked_entities, link_log = asyncio.run(
+                self._link_entities_async(
+                    client,
+                    textual_memory,
+                    known_snapshot,
+                    interaction_memory,
+                    **link_kw,
+                )
+            )
+            self._merge_linked_entities_into_cache(linked_entities)
             known_entities = list(self.entity_dict.values())
             triples, parse_log = asyncio.run(parse_graph_from_text(client, textual_memory, interaction_memory=interaction_memory, known_entities=known_entities))
-            log_to_interaction_memory(interaction_memory, parse_log)
+            log_to_interaction_memory(interaction_memory, merge_logs(link_log, parse_log))
             enhanced_triples = self._enhance_triples(triples)
             for triple in enhanced_triples:
                 self.add_edge_to_graph_memory(triple)

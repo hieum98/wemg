@@ -8,6 +8,7 @@ import random
 import re
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
 
@@ -154,6 +155,8 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2
 LIMIT_PER_QUERY = 100
 MAX_ENTITIES_PER_HOP = 500
+# Cap total SPARQL rows for batched k-hop queries (scales with number of seeds).
+MAX_BATCH_SPARQL_ROWS = 10000
 BATCH_SIZE = 25
 
 DEFAULT_PROPERTIES = [
@@ -321,6 +324,10 @@ class WikidataClient:
             else DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND
         )
         self._semaphore = threading.Semaphore(10)
+        self._cache_lock = threading.Lock()
+        # Raw 1-hop triples per QID (pre-enrichment); shared across k-hop and find_path.
+        self._outgoing_triples_cache: Dict[str, List[WikiTriple]] = {}
+        self._bidirectional_triples_cache: Dict[str, List[WikiTriple]] = {}
         self._wikibase_client = None
         if WIKIBASE_AVAILABLE:
             try:
@@ -733,10 +740,56 @@ class WikidataClient:
     # Triple retrieval
     # ------------------------------------------------------------------
 
-    def _get_outgoing_triples(self, qid: str) -> List[WikiTriple]:
-        prop_uris = " ".join(
+    def _prop_uris_clause(self) -> str:
+        return " ".join(
             f"<http://www.wikidata.org/prop/direct/{p}>" for p in self.properties
         )
+
+    @staticmethod
+    def _batch_sparql_limit(num_seeds: int) -> int:
+        return min(MAX_BATCH_SPARQL_ROWS, max(LIMIT_PER_QUERY, LIMIT_PER_QUERY * max(1, num_seeds)))
+
+    def _parse_outgoing_row(self, subject_qid: str, row: Dict) -> Optional[WikiTriple]:
+        rel_uri = row.get("relation", {}).get("value", "")
+        if "/prop/direct/" not in rel_uri:
+            return None
+        pid = rel_uri.split("/")[-1]
+        label, desc = self._get_property_label(pid)
+        prop = WikidataProperty(pid=pid, label=label, description=desc)
+        subject = WikidataEntity(
+            qid=subject_qid, url=f"https://www.wikidata.org/wiki/{subject_qid}",
+        )
+        obj_data = row.get("object", {})
+        obj_type = obj_data.get("type", "")
+        obj_value = obj_data.get("value", "")
+
+        if obj_type == "uri" and "/entity/" in obj_value:
+            obj_qid = obj_value.split("/")[-1].upper()
+            if obj_qid.startswith("Q") and obj_qid[1:].isdigit():
+                obj_entity = WikidataEntity(
+                    qid=obj_qid, url=f"https://www.wikidata.org/wiki/{obj_qid}",
+                )
+                return WikiTriple(subject=subject, relation=prop, object=obj_entity)
+            return WikiTriple(subject=subject, relation=prop, object=obj_value)
+        return WikiTriple(subject=subject, relation=prop, object=obj_value)
+
+    def _parse_incoming_row(self, object_qid: str, row: Dict) -> Optional[WikiTriple]:
+        subj_uri = row.get("subject", {}).get("value", "")
+        rel_uri = row.get("relation", {}).get("value", "")
+        if "/entity/" not in subj_uri or "/prop/direct/" not in rel_uri:
+            return None
+        subj_qid = subj_uri.split("/")[-1].upper()
+        if not (subj_qid.startswith("Q") and subj_qid[1:].isdigit()):
+            return None
+        pid = rel_uri.split("/")[-1]
+        label, desc = self._get_property_label(pid)
+        prop = WikidataProperty(pid=pid, label=label, description=desc)
+        subj = WikidataEntity(qid=subj_qid, url=f"https://www.wikidata.org/wiki/{subj_qid}")
+        obj_entity = WikidataEntity(qid=object_qid, url=f"https://www.wikidata.org/wiki/{object_qid}")
+        return WikiTriple(subject=subj, relation=prop, object=obj_entity)
+
+    def _fetch_outgoing_triples_uncached(self, qid: str) -> List[WikiTriple]:
+        prop_uris = self._prop_uris_clause()
         sparql = f"""
         SELECT ?relation ?object WHERE {{
           wd:{qid} ?relation ?object .
@@ -746,40 +799,14 @@ class WikidataClient:
         """
         bindings = self._sparql_query(sparql)
         triples: List[WikiTriple] = []
-        subject = WikidataEntity(qid=qid, url=f"https://www.wikidata.org/wiki/{qid}")
-
         for row in bindings:
-            rel_uri = row.get("relation", {}).get("value", "")
-            if "/prop/direct/" not in rel_uri:
-                continue
-            pid = rel_uri.split("/")[-1]
-            label, desc = self._get_property_label(pid)
-            prop = WikidataProperty(pid=pid, label=label, description=desc)
-
-            obj_data = row.get("object", {})
-            obj_type = obj_data.get("type", "")
-            obj_value = obj_data.get("value", "")
-
-            if obj_type == "uri" and "/entity/" in obj_value:
-                obj_qid = obj_value.split("/")[-1].upper()
-                if obj_qid.startswith("Q") and obj_qid[1:].isdigit():
-                    obj_entity = WikidataEntity(
-                        qid=obj_qid, url=f"https://www.wikidata.org/wiki/{obj_qid}"
-                    )
-                    triples.append(WikiTriple(subject=subject, relation=prop, object=obj_entity))
-                else:
-                    triples.append(WikiTriple(subject=subject, relation=prop, object=obj_value))
-            else:
-                triples.append(WikiTriple(subject=subject, relation=prop, object=obj_value))
-
+            t = self._parse_outgoing_row(qid, row)
+            if t is not None:
+                triples.append(t)
         return triples
 
-    def _get_bidirectional_triples(self, qid: str) -> List[WikiTriple]:
-        triples = self._get_outgoing_triples(qid)
-
-        prop_uris = " ".join(
-            f"<http://www.wikidata.org/prop/direct/{p}>" for p in self.properties
-        )
+    def _fetch_incoming_triples_uncached(self, qid: str) -> List[WikiTriple]:
+        prop_uris = self._prop_uris_clause()
         sparql = f"""
         SELECT ?subject ?relation WHERE {{
           ?subject ?relation wd:{qid} .
@@ -788,23 +815,145 @@ class WikidataClient:
         LIMIT {LIMIT_PER_QUERY}
         """
         bindings = self._sparql_query(sparql)
-        obj_entity = WikidataEntity(qid=qid, url=f"https://www.wikidata.org/wiki/{qid}")
-
+        triples: List[WikiTriple] = []
         for row in bindings:
-            subj_uri = row.get("subject", {}).get("value", "")
-            rel_uri = row.get("relation", {}).get("value", "")
-            if "/entity/" not in subj_uri or "/prop/direct/" not in rel_uri:
-                continue
-            subj_qid = subj_uri.split("/")[-1].upper()
-            if not (subj_qid.startswith("Q") and subj_qid[1:].isdigit()):
-                continue
-            pid = rel_uri.split("/")[-1]
-            label, desc = self._get_property_label(pid)
-            prop = WikidataProperty(pid=pid, label=label, description=desc)
-            subj = WikidataEntity(qid=subj_qid, url=f"https://www.wikidata.org/wiki/{subj_qid}")
-            triples.append(WikiTriple(subject=subj, relation=prop, object=obj_entity))
-
+            t = self._parse_incoming_row(qid, row)
+            if t is not None:
+                triples.append(t)
         return triples
+
+    def _get_outgoing_triples(self, qid: str) -> List[WikiTriple]:
+        with self._cache_lock:
+            if qid in self._outgoing_triples_cache:
+                return list(self._outgoing_triples_cache[qid])
+        triples = self._fetch_outgoing_triples_uncached(qid)
+        with self._cache_lock:
+            self._outgoing_triples_cache[qid] = triples
+        return list(triples)
+
+    def _get_bidirectional_triples(self, qid: str) -> List[WikiTriple]:
+        with self._cache_lock:
+            if qid in self._bidirectional_triples_cache:
+                return list(self._bidirectional_triples_cache[qid])
+            if qid in self._outgoing_triples_cache:
+                outgoing = list(self._outgoing_triples_cache[qid])
+            else:
+                outgoing = None
+        if outgoing is None:
+            outgoing = self._fetch_outgoing_triples_uncached(qid)
+            with self._cache_lock:
+                self._outgoing_triples_cache[qid] = outgoing
+        incoming = self._fetch_incoming_triples_uncached(qid)
+        triples = self._deduplicate_triples(outgoing + incoming)
+        with self._cache_lock:
+            self._bidirectional_triples_cache[qid] = triples
+        return list(triples)
+
+    def _fetch_outgoing_batch_uncached(self, qids: List[str]) -> Dict[str, List[WikiTriple]]:
+        """Outgoing triples for many seeds in one SPARQL query."""
+        if not qids:
+            return {}
+        prop_uris = self._prop_uris_clause()
+        values_clause = " ".join(f"wd:{q}" for q in qids)
+        limit = self._batch_sparql_limit(len(qids))
+        sparql = f"""
+        SELECT ?seed ?relation ?object WHERE {{
+          VALUES ?seed {{ {values_clause} }}
+          ?seed ?relation ?object .
+          VALUES ?relation {{ {prop_uris} }}
+        }}
+        LIMIT {limit}
+        """
+        bindings = self._sparql_query(sparql)
+        by_seed: Dict[str, List[WikiTriple]] = defaultdict(list)
+        for row in bindings:
+            seed_uri = row.get("seed", {}).get("value", "")
+            if "/entity/" not in seed_uri:
+                continue
+            seed_qid = seed_uri.split("/")[-1].upper()
+            if not (seed_qid.startswith("Q") and seed_qid[1:].isdigit()):
+                continue
+            t = self._parse_outgoing_row(seed_qid, row)
+            if t is not None:
+                by_seed[seed_qid].append(t)
+        return dict(by_seed)
+
+    def _fetch_incoming_batch_uncached(self, qids: List[str]) -> Dict[str, List[WikiTriple]]:
+        """Incoming triples (subject ?relation seed) for many seeds in one SPARQL query."""
+        if not qids:
+            return {}
+        prop_uris = self._prop_uris_clause()
+        values_clause = " ".join(f"wd:{q}" for q in qids)
+        limit = self._batch_sparql_limit(len(qids))
+        sparql = f"""
+        SELECT ?seed ?subject ?relation WHERE {{
+          VALUES ?seed {{ {values_clause} }}
+          ?subject ?relation ?seed .
+          VALUES ?relation {{ {prop_uris} }}
+        }}
+        LIMIT {limit}
+        """
+        bindings = self._sparql_query(sparql)
+        by_seed: Dict[str, List[WikiTriple]] = defaultdict(list)
+        for row in bindings:
+            seed_uri = row.get("seed", {}).get("value", "")
+            if "/entity/" not in seed_uri:
+                continue
+            seed_qid = seed_uri.split("/")[-1].upper()
+            if not (seed_qid.startswith("Q") and seed_qid[1:].isdigit()):
+                continue
+            t = self._parse_incoming_row(seed_qid, row)
+            if t is not None:
+                by_seed[seed_qid].append(t)
+        return dict(by_seed)
+
+    @staticmethod
+    def _triple_touches_seed(t: WikiTriple, seed_qid: str) -> bool:
+        if hasattr(t.subject, "qid") and t.subject.qid == seed_qid:
+            return True
+        if isinstance(t.object, WikidataEntity) and t.object.qid == seed_qid:
+            return True
+        return False
+
+    def _get_k_hop_multi_seed_one_hop(
+        self,
+        normalized: List[Optional[str]],
+        bidirectional: bool,
+        enrich: bool,
+    ) -> List[List[WikiTriple]]:
+        """Optimized path: k=1, two or more valid QIDs — batched SPARQL + one enrichment pass."""
+        unique_seeds = list(dict.fromkeys(nq for nq in normalized if nq))
+        out_by_seed = self._fetch_outgoing_batch_uncached(unique_seeds)
+        in_by_seed = self._fetch_incoming_batch_uncached(unique_seeds) if bidirectional else {}
+
+        for s in unique_seeds:
+            out_list = out_by_seed.get(s, [])
+            inc_list = in_by_seed.get(s, []) if bidirectional else []
+            bid_list = self._deduplicate_triples(out_list + inc_list)
+            with self._cache_lock:
+                self._outgoing_triples_cache[s] = list(out_list)
+                self._bidirectional_triples_cache[s] = bid_list
+
+        merged: List[WikiTriple] = []
+        for s in unique_seeds:
+            merged.extend(out_by_seed.get(s, []))
+            if bidirectional:
+                merged.extend(in_by_seed.get(s, []))
+        merged = self._deduplicate_triples(merged)
+        if enrich:
+            merged = self._enrich_triples(merged)
+        merged = [
+            t for t in merged
+            if not self._has_fake_property_label(getattr(t, "relation", None))
+        ]
+
+        all_results: List[List[WikiTriple]] = []
+        for nq in normalized:
+            if not nq:
+                all_results.append([])
+                continue
+            all_results.append([t for t in merged if self._triple_touches_seed(t, nq)])
+        return all_results
 
     @staticmethod
     def _deduplicate_triples(triples: List[WikiTriple]) -> List[WikiTriple]:
@@ -829,11 +978,21 @@ class WikidataClient:
     ) -> Union[List[WikiTriple], List[List[WikiTriple]]]:
         """Get k-hop triples from entity QIDs via SPARQL."""
         is_single = isinstance(qids, str)
-        qid_list = [qids] if is_single else list(qids)
+        raw_list = [qids] if is_single else list(qids)
+        normalized: List[Optional[str]] = []
+        for q in raw_list:
+            normalized.append(_normalize_qid(q))
+
+        num_valid = sum(1 for n in normalized if n)
+        # Batched SPARQL + single enrichment when multiple seeds and exactly one hop.
+        if k == 1 and num_valid >= 2:
+            all_results = self._get_k_hop_multi_seed_one_hop(
+                normalized, bidirectional, enrich,
+            )
+            return all_results[0] if is_single else all_results
 
         all_results: List[List[WikiTriple]] = []
-        for seed in qid_list:
-            seed_qid = _normalize_qid(seed)
+        for seed_qid in normalized:
             if not seed_qid:
                 all_results.append([])
                 continue

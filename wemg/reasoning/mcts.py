@@ -63,7 +63,7 @@ def expand(node: MCTSNode, generator: NodeGenerator, is_cot_simulation: bool = F
     if not gens:
         return [], False
     
-    results = asyncio.run(asyncio.gather(*[gen(node, generator) for gen in gens]))
+    results = asyncio.run(_gather_expand_generators(node, generator, gens))
     
     all_nodes = []
     has_semantic_signal = False
@@ -77,6 +77,12 @@ def expand(node: MCTSNode, generator: NodeGenerator, is_cot_simulation: bool = F
     
     log_to_interaction_memory(generator.interaction_memory, merge_logs(*all_logs))
     return all_nodes, has_semantic_signal
+
+
+async def _gather_expand_generators(
+    node: MCTSNode, generator: NodeGenerator, gens: List
+) -> List[Tuple[List[MCTSNode], GenerationResult, bool]]:
+    return list(await asyncio.gather(*[gen(node, generator) for gen in gens]))
 
 
 async def _generate_final_answer_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[MCTSNode], GenerationResult, bool]:
@@ -297,7 +303,7 @@ def mcts_search(
         reward = evaluate(terminal, client, working_memory, golden_answer)
         terminal.backpropagate(reward)
         
-        working_memory.synchronize_memory(client, question, interaction_memory)
+        working_memory.synchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
         
         if terminal.is_terminal():
             if pass_at_k is None and correct_answers:

@@ -33,6 +33,19 @@ class Reranker:
         inst = instruction if instruction is not None else self.instruction
         return self._client.rerank_documents(question, documents, top_k=k, instruction=inst)
 
+    def best_index(
+        self,
+        query: str,
+        documents: List[str],
+        instruction: Optional[str] = None,
+    ) -> int:
+        """Index of the highest-scoring document for the query (0 if documents empty)."""
+        if not documents or not query:
+            return 0
+        inst = instruction if instruction is not None else self.instruction
+        sorted_indices, _, _ = self._client.get_reranking_scores(query, documents, inst)
+        return sorted_indices[0] if sorted_indices else 0
+
     def close(self) -> None:
         """Close the underlying LLM client."""
         if self._client:

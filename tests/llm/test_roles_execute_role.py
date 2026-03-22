@@ -1,15 +1,9 @@
-"""Real-model tests for execute_role in wemg.llm.roles.
-
-Uses a live LLM endpoint configured via environment variables and existing
-Role definitions (e.g., SUBQUESTION_GENERATOR). These tests are marked
-with @pytest.mark.requires_llm so they can be selectively run.
-"""
-
-import os
-import asyncio
+"""Live `execute_role` tests using config-backed LLM client."""
 
 import pytest
+import pydantic
 
+from tests.conftest import requires_llm_credentials
 from wemg.llm.client import LLMClient
 from wemg.llm.roles import (
     SUBQUESTION_GENERATOR,
@@ -17,30 +11,25 @@ from wemg.llm.roles import (
     SubquestionGenerationOutput,
     execute_role,
 )
-from conftest import get_llm_env, requires_llm
-import pydantic
 
 
-def _make_client():
-    api_key, url, model = get_llm_env()
-    if not url:
-        pytest.skip("LLM_URL or OPENAI_BASE_URL not set")
+def _make_client(wemg_config):
+    requires_llm_credentials(wemg_config)
     return LLMClient(
-        model_name=model,
-        url=url,
-        api_key=api_key,
+        model_name=wemg_config.llm.model_name,
+        url=wemg_config.llm.url,
+        api_key=wemg_config.llm.api_key,
         max_retries=1,
-        max_tokens=32768,
+        max_tokens=min(wemg_config.llm.generation.max_tokens, 8192),
         temperature=0.0,
+        cache_config={"enabled": False},
     )
 
 
 @pytest.mark.requires_llm
 @pytest.mark.asyncio
-async def test_execute_role_single_input_real():
-    """Single SubquestionGenerationInput with real model."""
-    requires_llm()
-    client = _make_client()
+async def test_execute_role_single_input_real(wemg_config):
+    client = _make_client(wemg_config)
     try:
         inp = SubquestionGenerationInput(
             question="What is the capital of France?",
@@ -68,10 +57,8 @@ async def test_execute_role_single_input_real():
 
 @pytest.mark.requires_llm
 @pytest.mark.asyncio
-async def test_execute_role_batch_input_real():
-    """Two SubquestionGenerationInput instances in a batch."""
-    requires_llm()
-    client = _make_client()
+async def test_execute_role_batch_input_real(wemg_config):
+    client = _make_client(wemg_config)
     try:
         inp1 = SubquestionGenerationInput(
             question="What is the capital of France?",
@@ -93,7 +80,6 @@ async def test_execute_role_batch_input_real():
             assert isinstance(res, list)
             if res:
                 assert all(isinstance(r, SubquestionGenerationOutput) for r in res)
-
         assert SUBQUESTION_GENERATOR.name in log_data
         entries = log_data[SUBQUESTION_GENERATOR.name]
         assert len(entries) == 2
@@ -105,13 +91,10 @@ async def test_execute_role_batch_input_real():
 
 @pytest.mark.asyncio
 async def test_execute_role_rejects_wrong_input_type():
-    """execute_role should assert when input type does not match role.input_model."""
-
     class OtherInput(pydantic.BaseModel):
         text: str
 
     wrong_input = OtherInput(text="not a SubquestionGenerationInput")
-
     with pytest.raises(AssertionError):
         await execute_role(
             client=None,
@@ -122,10 +105,8 @@ async def test_execute_role_rejects_wrong_input_type():
 
 @pytest.mark.requires_llm
 @pytest.mark.asyncio
-async def test_execute_role_log_data_non_empty_real():
-    """execute_role with n=2 returns non-empty log_data for real model."""
-    requires_llm()
-    client = _make_client()
+async def test_execute_role_log_data_non_empty_real(wemg_config):
+    client = _make_client(wemg_config)
     try:
         inp = SubquestionGenerationInput(
             question="List sub-questions to understand climate change.",
@@ -147,4 +128,3 @@ async def test_execute_role_log_data_non_empty_real():
         assert raw_output != ""
     finally:
         client.close()
-

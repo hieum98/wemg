@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import pydantic
 
-from wemg.llm.parsing import extract_info_from_text
+from wemg.llm.parsing import extract_info_from_text, extraction_type_from_annotation
 from wemg.retrieval.wikidata import WikidataEntity
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ class AnswerGenerationOutput(pydantic.BaseModel):
     answer: str = pydantic.Field(..., description="The final answer.")
     concise_answer: str = pydantic.Field(..., description="A concise version of the answer, only include the answer for the question.")
     reasoning: str = pydantic.Field(..., description="The reasoning process behind the final answer.")
-    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$", description="Confidence level.")
+    confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
 class QueryGeneratorInput(pydantic.BaseModel):
@@ -86,9 +86,9 @@ class SelfCorrectionInput(pydantic.BaseModel):
 
 
 class SelfCorrectionOutput(pydantic.BaseModel):
-    status: str = pydantic.Field(..., pattern=r"^(correct|partial|incorrect|unsupported)$")
+    status: str = pydantic.Field(..., description="Status of the answer should be one of correct, partial, incorrect or unsupported")
     refined_answer: str = pydantic.Field(..., description="The refined answer.")
-    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+    confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
 class QuestionRephraserInput(pydantic.BaseModel):
@@ -114,7 +114,7 @@ class ReasoningSynthesizeInput(pydantic.BaseModel):
 class ReasoningSynthesizeOutput(pydantic.BaseModel):
     is_answerable: bool = pydantic.Field(..., description="If question can be answered with context.")
     step_conclusion: str = pydantic.Field(..., description="Synthesized conclusion.")
-    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+    confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
 class Query(pydantic.BaseModel):
@@ -170,7 +170,7 @@ class MajorityVoteOutput(pydantic.BaseModel):
     final_answer: str = pydantic.Field(..., description="Final answer by majority voting.")
     concise_answer: str = pydantic.Field(..., description="Concise version.")
     reasoning: str = pydantic.Field(..., description="Reasoning behind the final answer.")
-    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+    confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
 class FinalAnswerSynthesisInput(pydantic.BaseModel):
@@ -186,7 +186,7 @@ class FinalAnswerSynthesisOutput(pydantic.BaseModel):
     final_answer: str = pydantic.Field(..., description="Synthesized final answer.")
     concise_answer: str = pydantic.Field(..., description="Concise version.")
     reasoning: str = pydantic.Field(..., description="Integrated reasoning behind the final answer.")
-    confidence_level: str = pydantic.Field(..., pattern=r"^(high|medium|low)$")
+    confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
 class ConsensusEvaluationInput(pydantic.BaseModel):
@@ -275,9 +275,12 @@ class NERInput(pydantic.BaseModel):
     )
 
     def __str__(self):
-        known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
-        known_entities_str = "\n".join(known_entities_str)
-        return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
+        if self.known_entities:
+            known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
+            known_entities_str = "\n".join(known_entities_str)
+            return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
+        else:
+            return f"Text:\n{self.text}"
 
 
 class NEROutput(pydantic.BaseModel):
@@ -323,9 +326,12 @@ class RelationExtractionInput(pydantic.BaseModel):
     )
 
     def __str__(self):
-        known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
-        known_entities_str = "\n".join(known_entities_str)
-        return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
+        if self.known_entities:
+            known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
+            known_entities_str = "\n".join(known_entities_str)
+            return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
+        else:
+            return f"Text:\n{self.text}"
 
 
 class RelationExtractionOutput(pydantic.BaseModel):
@@ -367,6 +373,11 @@ GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in mul
    b. Formulate an atomic, relevant, self-contained subquestion. Make sure each subquestion is fully understandable on its own without needing to refer back to the original question or context.
    c. VALIDATE: Ensure subquestion CANNOT be answered by context. If it can be answered by context, generate a new subquestion. The generated subquestions must be diverse and not redundant. 
    d. VALIDATE Independence: Each subquestion must be answerable WITHOUT requiring answers from other generated subquestions. Eliminate dependent subquestions that require answering another generated subquestion first. ONLY keep subquestions that are independently answerable (even if answering all subquestions doesn't directly solve the main question)
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- is_answerable: boolean — true if the main question can be answered from the provided context alone; false otherwise
+- subquestions: array of strings, or null — if is_answerable is true, use null or []; if false, list atomic, diverse, non-redundant subquestions (each must not be answerable from the context)
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
@@ -376,6 +387,13 @@ ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-rea
 2. If context provided, extract all relevant information.
 3. Resolve information gaps using your knowledge. You can use your own knowledge or your own internet search.
 4. Synthesize a clear, well-reasoned answer. State assumptions clearly if you made any assumptions or used your own internet search.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- answer: string — complete answer addressing the question
+- concise_answer: string — only the direct answer, minimal wording (no explanation)
+- reasoning: string — transparent step-by-step reasoning that led to the answer
+- confidence_level: string — short label (e.g. high, medium, low) reflecting how sure you are
 """
 
 SELF_CORRECT_PROMPT = """You are an expert in answer verification and refinement. Given a question, proposed answer, and context, verify correctness and provide a refined response.
@@ -389,6 +407,12 @@ SELF_CORRECT_PROMPT = """You are an expert in answer verification and refinement
     -  INCORRECT:  Contains factual errors or logical flaws
     -  UNSUPPORTED:  Cannot be verified against available context
 4. Generate refined answer
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- status: string — one of: correct, partial, incorrect, unsupported (lowercase)
+- refined_answer: string — the verified or improved answer
+- confidence_level: string — short label reflecting verification confidence
 """
 
 REPHRASE_QUESTION_PROMPT = """You are a Question Refiner that transforms unclear questions into precise, clear questions. Make sure the rephrased question is fully understandable on its own without needing to refer back to the original question.
@@ -402,6 +426,10 @@ REPHRASE_QUESTION_PROMPT = """You are a Question Refiner that transforms unclear
 1. Identify key subject and core action
 2. Note vague terms or confusing structure
 3. Rewrite to be clear and unambiguous
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- rephrased_question: string — the refined question, fully self-contained
 """
 
 SYNTHESIZE_PROMPT = """You are a specialized AI for multi-step reasoning. Perform a single, focused reasoning step by analyzing context and producing a consolidated synthesis.
@@ -421,6 +449,12 @@ SYNTHESIZE_PROMPT = """You are a specialized AI for multi-step reasoning. Perfor
 ## Critical Constraints:
 1. No External Information: Do NOT introduce any facts, assumptions, or information not present in the context.
 2. No New questions: Do not ask for new information. Your role is to synthesize, not to query.
+
+## Output Format:
+Respond with a single JSON object with exactly these keys:
+- is_answerable: boolean — true only if the context alone is sufficient to answer the main question
+- step_conclusion: string — synthesized conclusion for this step (definitive answer if is_answerable, otherwise the best justified inference from context only)
+- confidence_level: string — short label for how strong the step_conclusion is given the context
 """
 
 GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user input into precise, self-contained search queries.
@@ -437,6 +471,10 @@ GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user i
 2. Generate Strategic Queries: Formulate a list of search queries that are necessary to answer/verify the input. Each query is a building block to reach the final answer that follows the guiding principles above. The goal is to provide the user with all the search components they would need to solve the problem from scratch.
 3. Ensure Self-Containment: Each query must be understandable and answerable on its own. Make sure each query is self-contained and does not rely on the original input, other queries, or any external context. Rewrite queries that are not self-contained.
 4. Review for Completeness and Non-Redundancy: Ensure that the set of queries collectively covers all necessary information to answer/verify the input without any overlap or unnecessary duplication.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- queries: array of strings — each string is one self-contained search query
 """
 
 # Reference relations will be populated at runtime when PROPERTY_LABELS is available.
@@ -455,6 +493,12 @@ GENERATE_STRUCTURED_QUERIES = """You are a Query Generator that decomposes quest
 5. Completeness: All queries needed for the answer
 6. Non-Redundancy: Each query seeks unique information that provides clues to answer the question, DO NOT generate redundant or unhelpful queries that are not required to answer the question.
 
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- queries: array of objects; each object has:
+  - subject: string — subject entity (fully specified, no pronouns)
+  - relation: string — relation or property to look up
+  - reasoning: string or null — brief justification for why this query is needed
 """
 
 
@@ -491,6 +535,11 @@ Scoring Guidelines:
 - 0.0-2.9: Incorrect or completely off-topic
 
 IMPORTANT NOTE: Conduct your own internet searches/ knowledge investigation as needed to verify factual claims when correct_answer is not provided. Do not assume the system_answer is correct. You must independently verify all claims
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- rating: number — float from 0.0 to 10.0 inclusive
+- reasoning: string — brief justification referencing correctness and relevance
 """
 
 MAJORITY_VOTE_PROMPT = """You are an expert at evaluating answers. Given a question and answers, determine the final answer based on majority voting.
@@ -499,6 +548,13 @@ Instructions:
 1. Analyze the question
 2. Identify underlying consensus across responses
 3. Synthesize a single, accurate answer based on majority consensus
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- final_answer: string — best integrated answer
+- concise_answer: string — minimal wording direct answer only
+- reasoning: string — how consensus was determined and why this answer was chosen
+- confidence_level: string — short label for confidence in the synthesized answer
 """
 
 SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis. Construct a superior answer by analyzing and integrating candidate answers.
@@ -515,6 +571,13 @@ Phase III - Synthesis:
 - Build new superior reasoning path
 - State final answer
 - Self-critique and refine
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- final_answer: string — synthesized best answer
+- concise_answer: string — direct answer only, minimal wording
+- reasoning: string — integrated reasoning across candidates
+- confidence_level: string — short label for confidence in the synthesis
 """
 
 CONSENSUS_EVALUATION_PROMPT = """You are an expert evaluator. Given two candidate answers with their reasoning, evaluate the consensus between the two answers. Rate from 0.0 to 10.0 how well the two answers are consistent with each other.
@@ -530,6 +593,11 @@ Scoring Guidelines:
 - 5.0-6.9: Moderate consensus - answers agree on main points but differ in details or approach
 - 3.0-4.9: Weak consensus - some overlap but significant disagreements or contradictions
 - 0.0-2.9: No consensus - answers contradict each other or address different aspects entirely
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- rating: number — float from 0.0 to 10.0 inclusive measuring consensus strength
+- reasoning: string — what aligned or conflicted between the candidates
 """
 
 # =============================================================================
@@ -552,17 +620,30 @@ Instructions:
     - Remove information that is not relevant to the question. The information considers relevant if it contains ANY information that could clue the answer to the question or related with any concept in the question.
     - If the extracted information is relevant, return the extracted information as a list of strings.
     - If the extracted information is not relevant, return an empty list.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- relevant_information: array of strings — each string is one self-contained fact or quote useful for the question (empty array if nothing relevant)
 """
 
 MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 
 ## Instructions
 1. Question Analysis: Identify primary subject, key entities, and specific information sought.
-2. Duplicate & Redundancy Removal: Remove duplicates and redundant information. Make sure the consolidated memory not contain any duplicate or redundant information.
-3. Relevance Evaluation: Assess each item against criteria (directly answering, contextual, supporting evidence, etc.). The information considers relevant or useful if it contains ANY information that could clue the answer to the question or related with any concept in the question. Remove information that is not relevant or useful.
-4. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
-5. Final evaluation: 
-    - Each item MUST be self-contained and clear (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items and no pronouns or other references to the original memory, question, or other items). If it is not self-contained, rewrite it to MAKE SURE it is self-contained.
+2. Memory Atomization: Atomize the memory into a list of atomic, self-contained information items. Each information item should be self-contained and clear (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items and no pronouns or other references to the original memory, question, or other items).
+3. Deduplication: Deduplicate the memory items by content. If two items have the same content, keep only one of them. If one item is completely contained in another item, remove the contained item.
+4. Relevance Evaluation: Assess each item against criteria (directly answering, contextual, supporting evidence, etc.). The information considers relevant or useful if it contains ANY information that could clue the answer to the question or related with any concept in the question.
+5. Irrelevant Information Removal: Remove information that is not relevant to the question.
+6. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
+7. Refinement: Check each item to make sure it is self-contained and clear. If it is not, rewrite it to make it self-contained and clear.
+8. Repeat the process until the memory is refined to the best of your ability.
+9. Return the refined memory as a list of information items.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- consolidated_memory: array of objects; each object has:
+  - content: string — one atomic, self-contained information item
+  - provenance: string — exactly "System Prediction" or "Retrieval"
 """
 
 # =============================================================================
@@ -572,41 +653,49 @@ MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Y
 NER_PROMPT = """You are an expert Named Entity Recognition specialist. Extract all named entities from the text.
 
 You may be given an optional list of KNOWN ENTITIES, each with:
-- id: Wikidata QID (e.g., "Q42")
+- id: Wikidata QID 
 - name: official Wikidata label
 - description: brief description for disambiguation
 
 Wikidata linking rules (strict):
 - If an extracted entity clearly matches a KNOWN ENTITY (by name and/or description), set its id to that QID and use the KNOWN ENTITY's official name as the entity name.
 - If there is any ambiguity or you are not fully certain, set id to null.
-- NEVER guess or invent a QID.
+- NEVER guess or invent a QID if it is not provided, leave it as null.
 
 Instructions:
-1. If text is a question, focus ONLY on entities essential to answering it
+1. If text is a question, focus ONLY on entities which are main clues to answer the question. Don't guess or invent answers for the question.
 2. Define precise boundaries (include modifiers like "Prime Minister Boris Johnson")
 3. Handle ambiguity using context (e.g., "Apple" as company vs. fruit)
 4. Extract unique entities only once (deduplicate by real-world entity; if id is present, also deduplicate by id)
+5. Set id to null if the entity is not in the KNOWN ENTITIES list.
 
 Rules:
 - Only extract actual named entities, not common nouns or pronouns
 - No overlapping entities; extract most complete version
 - For each entity, provide brief description for clarity
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- entities: array of objects; each object has:
+  - id: string or null — Wikidata QID when certain from KNOWN ENTITIES; otherwise null
+  - name: string — canonical entity name
+  - description: string or null — short disambiguating phrase when helpful
 """
 
 RELATION_EXTRACTION_PROMPT = """You are an expert Relation Extraction specialist. Extract all meaningful relationships between entities. Each relationship should be self-contained, i.e., understandable on its own without needing to refer back to the original text or entities.
 
 You may be given an optional list of KNOWN ENTITIES, each with:
-- id: Wikidata QID (e.g., "Q42")
+- id: Wikidata QID 
 - name: official Wikidata label
 - description: brief description for disambiguation
 
 Wikidata linking rules (strict):
 - If a subject/object clearly matches a KNOWN ENTITY (by name and/or description), set subject_id/object_id to that QID and use the KNOWN ENTITY's official name as subject/object.
 - If there is any ambiguity or you are not fully certain, leave subject_id/object_id as null.
-- NEVER guess or invent a QID.
+- NEVER guess or invent a QID if it is not provided, leave it as null.
 
 Instructions:
-1. Identify entity pairs with direct relationships
+1. Identify entity pairs with direct relationships. Don't guess or invent answers for the question.
 2. Break down complex relationships into simpler relationships. 
 3. Only extract explicitly stated or strongly implied relationships.
 4. Use clear, concise relation types.
@@ -614,6 +703,17 @@ Instructions:
 6. Entity naming consistency:
    - Reuse the exact same subject/object string for the same real-world entity across all extracted relations.
    - Do not use aliases, abbreviations, or pronouns in subject/object strings.
+   - Set subject_id/object_id to null if the subject/object is not in the KNOWN ENTITIES list.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- relations: array of objects; each object has:
+  - subject: string
+  - subject_id: string or null
+  - relation: string
+  - object: string
+  - object_id: string or null
+  - context: string or null — self-contained snippet if needed
 """
 
 # =============================================================================
@@ -623,9 +723,13 @@ Instructions:
 TRIPLE_PRUNE_PROMPT = """You are a Knowledge Graph Expert. Given a question and a list of triples, keep only triples relevant to answering the question.
 
 Instructions:
-1. Identify triples relevant to answering the question.
+1. Identify triples relevant to answering the question. Don't guess or invent answers for the question.
 2. Consider cross-triples and chain-triples, i.e., a triple is relevant if it is directly or indirectly related to the question.
 3. Output a JSON object with a single key "keep_indices" containing a list of indices (0-based) of triples to keep.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- keep_indices: array of integers — 0-based indices of triples to retain (may be empty if none are relevant)
 
 """
 
@@ -693,11 +797,15 @@ def parse_response(role: Role, response) -> Optional[pydantic.BaseModel]:
                 return None
     if isinstance(response, str):
         keys = list(role.output_model.model_fields.keys())
-        value_types = [
-            field.annotation.__name__
-            for field in role.output_model.model_fields.values()
+        specs = [
+            extraction_type_from_annotation(f.annotation)
+            for f in role.output_model.model_fields.values()
         ]
-        parsed_dict = extract_info_from_text(response, keys, value_types)
+        value_types = [s[0] for s in specs]
+        field_optional = [s[1] for s in specs]
+        parsed_dict = extract_info_from_text(
+            response, keys, value_types, field_optional=field_optional
+        )
         try:
             return role.output_model(**parsed_dict)
         except Exception:

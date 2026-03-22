@@ -183,7 +183,6 @@ class WEMGSystem:
             "n_subquestions": ng.n_subquestions,
             "top_k_websearch": ng.top_k_websearch,
             "top_k_entities": ng.top_k_entities,
-            "top_k_properties": ng.top_k_properties,
             "n_hops": ng.n_hops,
             "entity_linking_method": ng.entity_linking_method,
             "rerank_kb_documents": ng.rerank_kb_documents,

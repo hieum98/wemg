@@ -1,6 +1,6 @@
 llm:
-  model_name: "Qwen3-Next-80B-A3B-Thinking-FP8"
-  url: "http://n0378:4000/v1"
+  model_name: "Qwen3-8B"
+  url: "http://n0385:4000/v1"
   api_key: null
   client_type: "openai"
   concurrency: 64
@@ -35,7 +35,7 @@ retriever:
   corpus:
     embedder:
       model_name: "Qwen3-Embedding-4B"
-      url: "http://n0378:4000/v1"
+      url: "http://n0385:4000/v1"
       api_key: null
       embedder_type: "openai"
     corpus_path: "Hieuman/wiki23-processed"
@@ -71,9 +71,8 @@ node_generation:
   n: 1
   n_subquestions: 3
   top_k_websearch: 5
-  top_k_entities: 3
-  top_k_properties: 3
-  n_hops: 2
+  top_k_entities: 5
+  n_hops: 1
   entity_linking_method: "llm"
   rerank_kb_documents: true
   azure_endpoint: null

@@ -9,7 +9,7 @@ import openai
 import pydantic
 
 from wemg.llm.cache import RedisCacheManager
-from wemg.llm.parsing import extract_info_from_text
+from wemg.llm.parsing import extract_info_from_text, extraction_type_from_annotation
 
 litellm.drop_params = True
 logger = logging.getLogger(__name__)
@@ -146,7 +146,6 @@ class LLMClient:
                 logger.warning(f"Error during completion: {e}. Retrying...")
                 response = None
                 time.sleep(2 * attempts)
-
             if response is None or not hasattr(response, "choices"):
                 logger.warning(
                     f"Response is None or does not have choices at attempt {attempts}"
@@ -217,7 +216,7 @@ class LLMClient:
                             f"Failed to parse structured output for "
                             f"{content[:100]}... at attempt {attempts}: {e}"
                         )
-                        if attempts == self.max_retries - 1:
+                        if attempts == self.max_retries:
                             output = {
                                 "output": content,
                                 "raw_output": content,
@@ -302,10 +301,12 @@ class LLMClient:
         if output_schema is not None:
             assert issubclass(output_schema, pydantic.BaseModel)
             schema_keys = list(output_schema.model_fields.keys())
-            schema_value_types = [
-                field.annotation.__name__
-                for field in output_schema.model_fields.values()
+            _specs = [
+                extraction_type_from_annotation(f.annotation)
+                for f in output_schema.model_fields.values()
             ]
+            schema_value_types = [s[0] for s in _specs]
+            schema_field_optional = [s[1] for s in _specs]
 
         if isinstance(messages[0], list):
             results = self.batch_generate(messages, **kwargs)
@@ -321,7 +322,7 @@ class LLMClient:
             raw_output = None
 
             for item in res:
-                if raw_output is None and item["is_valid"]:
+                if raw_output is None:
                     raw_output = item["raw_output"]
 
                 if output_schema:
@@ -330,13 +331,16 @@ class LLMClient:
                         outputs.append(parsed_output)
                     else:
                         if isinstance(item["output"], str):
-                            data = item["output"]
+                            data = item["output"].strip()
                         elif isinstance(item["output"], dict):
-                            data = json.dumps(item["output"])
+                            data = json.dumps(item["output"]).strip()
                         else:
-                            data = str(item["output"])
+                            data = str(item["output"]).strip()
                         extracted = extract_info_from_text(
-                            data, schema_keys, schema_value_types
+                            data,
+                            schema_keys,
+                            schema_value_types,
+                            field_optional=schema_field_optional,
                         )
                         try:
                             parsed_output = output_schema(**extracted)

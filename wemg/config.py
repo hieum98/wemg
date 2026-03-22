@@ -106,7 +106,6 @@ class NodeGenerationConfig(BaseModel):
     n_subquestions: int = 3
     top_k_websearch: int = 5
     top_k_entities: int = 3
-    top_k_properties: int = 3
     n_hops: int = 2
     entity_linking_method: Literal["llm", "azure"] = "llm"
     azure_endpoint: Optional[str] = None
@@ -207,12 +206,14 @@ class WEMGConfig(BaseModel):
         else:
             data = {}
 
+        # Merge env before CLI overrides so explicit values (e.g. llm.api_key=null) win.
+        _resolve_env_vars(data)
+
         if overrides:
             for override in overrides:
                 key, _, raw_value = override.partition("=")
                 _set_nested(data, key.strip(), _parse_override_value(raw_value.strip()))
 
-        _resolve_env_vars(data)
         return cls.model_validate(data)
 
     @classmethod

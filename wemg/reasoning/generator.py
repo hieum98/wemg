@@ -17,8 +17,12 @@ from wemg.llm.roles import (
 from wemg.retrieval.wikidata import WikidataClient, WikidataEntity, WikiTriple
 from wemg.retrieval.entity_linking import link_entities_llm, link_entities_azure
 from wemg.utils.text import format_context
+from wemg.llm.roles import SourceType
 
 logger = logging.getLogger(__name__)
+
+# Max triples per TRIPLE_PRUNER LLM call when pruning large lists.
+_PRUNE_TRIPLES_BATCH_SIZE = 8
 
 
 @dataclass
@@ -26,6 +30,7 @@ class GenerationResult:
     answers: List[Any] = field(default_factory=list)
     retrieved_triples: List[WikiTriple] = field(default_factory=list)
     retrieved_entities: List[WikidataEntity] = field(default_factory=list)
+    information_items: List[str] = field(default_factory=list)
     log_data: Dict = field(default_factory=dict)
 
 
@@ -112,6 +117,7 @@ class NodeGenerator:
             answers=answers,
             retrieved_triples=retrieved_triples,
             retrieved_entities=retrieved_entities,
+            information_items=all_info,
             log_data=merge_logs(exploration_log, extractor_log, qa_log),
         )
     
@@ -180,30 +186,14 @@ class NodeGenerator:
         return GenerationResult(
             answers=corrections, retrieved_triples=triples,
             retrieved_entities=retrieved_entities,
+            information_items=all_info,
             log_data=merge_logs(exploration_log, extractor_log, qa_log),
         )
     
     async def generate_synthesis(self, user_question: str) -> GenerationResult:
         """Generate reasoning synthesis."""
         memory = self.working_memory.format_textual_memory()
-        documents, triples, retrieved_entities, exploration_log = await self._explore(user_question)
-        
-        extractor_inputs = [ExtractionInput(question=user_question, raw_data=d) for d in list(set(documents))]
-        if extractor_inputs:
-            extracted, extractor_log = await execute_role(
-                client=self.client, role=EXTRACTOR, input_data=extractor_inputs,
-                interaction_memory=self.interaction_memory, n=1
-            )
-            info = []
-            for item in sum(extracted, []):
-                if hasattr(item, 'relevant_information') and item.relevant_information:
-                    info.extend(item.relevant_information)
-        else:
-            info = []
-            extractor_log = {}
-        
-        all_info = info + [str(t) for t in triples]
-        context = format_context(memory=memory, retrieval_info=all_info)
+        context = format_context(memory=memory)
         
         synth_input = ReasoningSynthesizeInput(question=user_question, context=context)
         outputs, reasoning_log = await execute_role(
@@ -211,10 +201,13 @@ class NodeGenerator:
             interaction_memory=self.interaction_memory, n=self.kwargs.get('n', 1)
         )
         
-        return GenerationResult(answers=outputs, log_data=merge_logs(exploration_log, extractor_log, reasoning_log))
+        return GenerationResult(answers=outputs, log_data=reasoning_log)
     
     def update_working_memory(self, result: GenerationResult) -> None:
         """Update working memory with generation results."""
+        for item in result.information_items:
+            self.working_memory.add_textual_memory(item, source=SourceType.RETRIEVAL)
+
         entity_dict = {e.qid: e for e in result.retrieved_entities}
         self.working_memory.entity_dict.update(entity_dict)
         for entity in result.retrieved_entities:
@@ -314,6 +307,7 @@ class NodeGenerator:
                 top_k_entities=top_k_entities,
                 interaction_memory=self.interaction_memory,
                 known_entities=known_entities,
+                reranker=self.reranker,
             )
 
         # collect known question entities
@@ -331,7 +325,6 @@ class NodeGenerator:
         if isinstance(triples, list) and triples and isinstance(triples[0], list):
             triples = sum(triples, [])
         triples = list(set(triples)) if triples else []
-        
         all_entities = entities
         if triples:
             triples, prune_log = await self._prune_triples(question, triples)
@@ -343,17 +336,29 @@ class NodeGenerator:
         """Prune triples to keep only question-relevant ones."""
         if not triples:
             return [], {}
-        triples_str = [str(t) for t in triples]
-        inp = TriplePruneInput(question=question, triples=triples_str)
+        chunks = [
+            triples[i : i + _PRUNE_TRIPLES_BATCH_SIZE]
+            for i in range(0, len(triples), _PRUNE_TRIPLES_BATCH_SIZE)
+        ]
+        inputs = [
+            TriplePruneInput(question=question, triples=[str(t) for t in chunk])
+            for chunk in chunks
+        ]
         responses, log = await execute_role(
-            client=self.client, role=TRIPLE_PRUNER, input_data=inp,
+            client=self.client, role=TRIPLE_PRUNER, input_data=inputs,
             interaction_memory=self.interaction_memory, n=1
         )
-        out = responses[0] if responses else None
-        if not out or not hasattr(out, 'keep_indices'):
-            return triples, log
-        keep = set(out.keep_indices)
-        return [triples[i] for i in range(len(triples)) if i in keep], log
+        # List input → list of per-item parsed outputs (each item is n completions).
+        kept: List[WikiTriple] = []
+        for chunk, out_list in zip(chunks, responses):
+            out = out_list[0] if out_list else None
+            if not out or not hasattr(out, 'keep_indices'):
+                kept.extend(chunk)
+                continue
+            keep = set(out.keep_indices)
+            kept.extend(chunk[i] for i in range(len(chunk)) if i in keep)
+        kept = list(set(kept))
+        return kept, log
 
     @staticmethod
     def _collect_entities_from_triples(triples: List[WikiTriple]) -> List[WikidataEntity]:

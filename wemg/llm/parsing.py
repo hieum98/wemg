@@ -1,16 +1,77 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+import types
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union, get_args, get_origin
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def extraction_type_from_annotation(annotation: Any) -> tuple[str, bool]:
+    """Map a Pydantic field annotation to (value_type, is_optional) for extract_info_from_text.
+
+    Strips ``Optional`` / ``Union[T, None]`` / ``T | None``, ``Annotated``, and normalizes
+    ``list`` / ``List[...]`` to the parser's ``list`` label.
+    """
+    is_optional = False
+    ann: Any = annotation
+
+    while True:
+        origin = get_origin(ann)
+        args = get_args(ann) or ()
+
+        if origin is Annotated:
+            if args:
+                ann = args[0]
+                continue
+            break
+
+        if origin is Union or origin is types.UnionType:
+            has_none = any(a is type(None) for a in args)
+            non_none = [a for a in args if a is not type(None)]
+            if has_none:
+                is_optional = True
+            if len(non_none) == 1:
+                ann = non_none[0]
+                continue
+            if len(non_none) > 1:
+                ann = non_none[0]
+                continue
+            return "str", is_optional
+
+        if origin is list:
+            return "list", is_optional
+
+        if origin is Literal:
+            return "Literal", is_optional
+
+        break
+
+    if isinstance(ann, type):
+        if ann is str:
+            return "str", is_optional
+        if ann is int:
+            return "int", is_optional
+        if ann is float:
+            return "float", is_optional
+        if ann is bool:
+            return "bool", is_optional
+
+    name = getattr(ann, "__name__", "") or "str"
+    if name in ("List", "list"):
+        return "list", is_optional
+    if name in ("str", "int", "float", "bool", "Literal"):
+        return name, is_optional
+
+    return name, is_optional
 
 
 def extract_info_from_text(
     text: str,
     keys: List[str],
     value_type: Optional[List[str]] = None,
+    field_optional: Optional[List[bool]] = None,
 ) -> Dict[str, Any]:
     if value_type is None:
         value_type = ["str"] * len(keys)
@@ -21,17 +82,27 @@ def extract_info_from_text(
             f"Got {len(keys)} keys and {len(value_type)} types."
         )
 
+    if field_optional is not None and len(field_optional) != len(keys):
+        raise ValueError(
+            f"keys and field_optional must have the same length. "
+            f"Got {len(keys)} keys and {len(field_optional)} flags."
+        )
+
+    optional_by_key = field_optional if field_optional is not None else [False] * len(keys)
+
     extracted_info: Dict[str, Any] = {}
 
     # Strategy 1: direct JSON parse
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
-            for key, vtype in zip(keys, value_type):
+            for key, vtype, opt in zip(keys, value_type, optional_by_key):
                 if key in parsed:
                     extracted_info[key] = _convert_value(parsed[key], vtype)
                 else:
-                    extracted_info[key] = _get_default_value(vtype)
+                    extracted_info[key] = (
+                        None if opt else _get_default_value(vtype)
+                    )
             return extracted_info
     except (json.JSONDecodeError, ValueError):
         pass
@@ -42,21 +113,23 @@ def extract_info_from_text(
         try:
             parsed = json.loads(match.group(0))
             if isinstance(parsed, dict) and any(k in parsed for k in keys):
-                for key, vtype in zip(keys, value_type):
+                for key, vtype, opt in zip(keys, value_type, optional_by_key):
                     if key in parsed and key not in extracted_info:
                         extracted_info[key] = _convert_value(parsed[key], vtype)
         except (json.JSONDecodeError, ValueError):
             continue
 
     # Strategy 3: per-field regex extraction
-    for key, vtype in zip(keys, value_type):
+    for key, vtype, opt in zip(keys, value_type, optional_by_key):
         if key not in extracted_info:
-            extracted_info[key] = _extract_field_with_regex(text, key, vtype)
+            extracted_info[key] = _extract_field_with_regex(text, key, vtype, optional=opt)
 
     return extracted_info
 
 
 def _convert_value(value: Any, vtype: str) -> Any:
+    if value is None:
+        return None
     try:
         if vtype in ("str", "Literal"):
             return str(value)
@@ -117,7 +190,9 @@ def _get_default_value(vtype: str) -> Any:
     return defaults.get(vtype)
 
 
-def _extract_field_with_regex(text: str, key: str, vtype: str) -> Any:
+def _extract_field_with_regex(
+    text: str, key: str, vtype: str, *, optional: bool = False
+) -> Any:
     if vtype in ("str", "Literal"):
         patterns = [
             rf'"{key}":\s*"([^"]*)"',
@@ -132,7 +207,7 @@ def _extract_field_with_regex(text: str, key: str, vtype: str) -> Any:
             if match:
                 value = match.group(1).strip().rstrip(",").strip().strip("\"'")
                 return value
-        return ""
+        return None if optional else ""
 
     if vtype == "bool":
         patterns = [
@@ -143,7 +218,7 @@ def _extract_field_with_regex(text: str, key: str, vtype: str) -> Any:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 return match.group(1).lower() in ("true", "1", "yes")
-        return False
+        return None if optional else False
 
     if vtype in ("int", "float"):
         num = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
@@ -162,7 +237,7 @@ def _extract_field_with_regex(text: str, key: str, vtype: str) -> Any:
                     return float(match.group(1))
                 except ValueError:
                     pass
-        return 0
+        return None if optional else 0
 
     if vtype in ("list", "List"):
         patterns = [
@@ -194,7 +269,7 @@ def _extract_field_with_regex(text: str, key: str, vtype: str) -> Any:
                 ]
                 if items:
                     return items
-        return []
+        return None if optional else []
 
     raise ValueError(
         f"Unsupported value type: {vtype}. "

@@ -2,8 +2,9 @@
 
 import pytest
 
-# Skip entire module if core dependencies are missing
 pytest.importorskip("SPARQLWrapper")
+
+pytestmark = [pytest.mark.requires_wikidata, pytest.mark.integration]
 
 from wemg.retrieval.wikidata import (
     WikidataEntity,
@@ -277,6 +278,27 @@ def test_get_k_hop_triples_list_qids_real():
     for triples in all_triples:
         assert isinstance(triples, list)
         assert all(isinstance(t, WikiTriple) for t in triples)
+
+
+def test_get_k_hop_triples_multi_seed_enrich_true():
+    """Multi-seed k=1 with enrich=True yields relation labels (batched path + one enrich pass)."""
+    client = _make_client()
+    try:
+        all_triples = client.get_k_hop_triples(
+            ["Q64", "Q183"], k=1, bidirectional=True, enrich=True,
+        )
+    except Exception as e:
+        pytest.skip(f"Wikidata API unavailable (k-hop multi enrich): {e}")
+
+    assert isinstance(all_triples, list)
+    assert len(all_triples) == 2
+    flat = [t for sub in all_triples for t in sub]
+    if not flat:
+        pytest.skip("No triples returned for multi-seed enrich test")
+    assert any(
+        isinstance(t.relation, WikidataProperty) and t.relation.label
+        for t in flat
+    )
 
 
 def test_get_k_hop_triples_enrich_true():
