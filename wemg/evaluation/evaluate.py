@@ -5,9 +5,12 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from wemg.config import _parse_override_value, get_default_config_path
+import yaml
+
+from wemg.config import WEMGConfig, _parse_override_value, get_default_config_path
 from wemg.evaluation.datasets import load_dataset_any
 from wemg.evaluation.runner import DatasetEvaluator
 from wemg.system import WEMGSystem
@@ -46,6 +49,21 @@ def split_eval_overrides(
         else:
             config_overrides.append(f"{key_stripped}={raw_value.strip()}")
     return eval_params, config_overrides
+
+
+def _write_resolved_config_to_output(output_dir: Path, cfg: WEMGConfig) -> None:
+    """Persist the resolved WEMG config (after env + overrides) for reproducibility."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "config.yaml"
+    data = cfg.model_dump(mode="json")
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            data,
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+        )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -115,6 +133,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     system = WEMGSystem(config_path=args.config, config_overrides=config_overrides)
+    _write_resolved_config_to_output(Path(str(output_path)), system.cfg)
     try:
         ds = load_dataset_any(
             str(dataset_ref),
