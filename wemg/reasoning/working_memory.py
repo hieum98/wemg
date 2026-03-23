@@ -16,7 +16,13 @@ import networkx as nx
 from wemg.llm.roles import Relation
 from wemg.reasoning.generator import merge_logs
 from wemg.retrieval.entity_linking import link_entities_azure, link_entities_llm
-from wemg.retrieval.wikidata import WikiTriple, WikidataClient, WikidataEntity, WikidataProperty
+from wemg.retrieval.wikidata import (
+    WikiTriple,
+    WikidataClient,
+    WikidataEntity,
+    WikidataProperty,
+    filter_entities_relevant_to_text,
+)
 
 from .interaction_memory import InteractionMemory, log_to_interaction_memory
 
@@ -249,13 +255,11 @@ class WorkingMemory:
             relation_label = str(triple.relation) if triple.relation else None
         elif isinstance(triple, WikiTriple):
             if isinstance(triple.subject, WikidataEntity):
-                subject = OpenIEEntity(id=triple.subject.qid, name=triple.subject.label, description=triple.subject.description)
-                subject_data = self.add_node_to_graph_memory(subject)
+                subject_data = self.add_node_to_graph_memory(triple.subject)
             else:
                 subject_data = str(triple.subject)
             if isinstance(triple.object, WikidataEntity):
-                object = OpenIEEntity(id=triple.object.qid, name=triple.object.label, description=triple.object.description)
-                object_data = self.add_node_to_graph_memory(object)
+                object_data = self.add_node_to_graph_memory(triple.object)
             else:
                 object_data = str(triple.object)
             assert isinstance(triple.relation, WikidataProperty), "Relation must be a WikidataProperty for a WikiTriple"
@@ -269,10 +273,6 @@ class WorkingMemory:
 
         subject_id = get_node_id(subject_data)
         object_id = get_node_id(object_data)
-        # check all nodes in the triple are in the graph memory
-        if subject_id not in self.graph_memory or object_id not in self.graph_memory:
-            logger.warning(f"Skipping invalid triple for graph memory: {triple}")
-            return
 
         logger.info(f"Adding edge to graph memory: {str(triple)}")
 
@@ -486,7 +486,10 @@ class WorkingMemory:
             for item in consolidated_output.consolidated_memory
         ]
         consolidated_text = "\n".join(f"- {t}" for t in consolidated)
-        known_entities = list(self.entity_dict.values())
+        known_entities = filter_entities_relevant_to_text(
+            list(self.entity_dict.values()),
+            consolidated_text,
+        )
         triples, parse_log = asyncio.run(parse_graph_from_text(client, consolidated_text, interaction_memory=interaction_memory, known_entities=known_entities))
         log = merge_logs(consolidation_log, parse_log)
         log_to_interaction_memory(interaction_memory, log)
@@ -523,9 +526,10 @@ class WorkingMemory:
 
         if self.textual_memory:
             textual_memory = self.format_textual_memory()
-            known_snapshot = [
-                e for e in self.entity_dict.values() if isinstance(e, WikidataEntity)
-            ] or None
+            known_snapshot = filter_entities_relevant_to_text(
+                [e for e in self.entity_dict.values() if isinstance(e, WikidataEntity)],
+                textual_memory,
+            )
             link_kw = self._entity_link_kwargs_from_call(kwargs)
             linked_entities, link_log = asyncio.run(
                 self._link_entities_async(
@@ -537,7 +541,10 @@ class WorkingMemory:
                 )
             )
             self._merge_linked_entities_into_cache(linked_entities)
-            known_entities = list(self.entity_dict.values())
+            known_entities = filter_entities_relevant_to_text(
+                list(self.entity_dict.values()),
+                textual_memory,
+            )
             triples, parse_log = asyncio.run(parse_graph_from_text(client, textual_memory, interaction_memory=interaction_memory, known_entities=known_entities))
             log_to_interaction_memory(interaction_memory, merge_logs(link_log, parse_log))
             enhanced_triples = self._enhance_triples(triples)

@@ -57,7 +57,7 @@ exclude = ["test*", "wemg_backup*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# Always stream logging to the terminal during runs; DEBUG is the lowest standard level.
+# Always stream logging to the terminal during runs; INFO is the lowest standard level. (DEBUG is too verbose)
 log_cli = true
-log_cli_level = "DEBUG"
-log_level = "DEBUG"
+log_cli_level = "INFO"
+log_level = "INFO"

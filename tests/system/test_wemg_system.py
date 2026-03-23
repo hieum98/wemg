@@ -75,7 +75,6 @@ def test_wemg_system_answer_cot_smoke(wemg_config_path, wemg_config, smoke_syste
         print("\n--- CoT reasoning tree ---")
         if result.search_tree is not None:
             result.search_tree.print_tree()
-        breakpoint()
         print_slow_integration_output("test_wemg_system_answer_cot_smoke", result=result)
         assert result.question == _MULTIHOP_COT_SMOKE_QUESTION
         assert result.answer or result.concise_answer
@@ -100,7 +99,7 @@ def test_answer_questions_batch_smoke(wemg_config_path, wemg_config, smoke_syste
         _MULTIHOP_BATCH_SMOKE_QUESTION,
         config_path=wemg_config_path,
         config_overrides=overrides,
-        max_workers=1,
+        max_workers=2,
     )
     assert len(results) == len(_MULTIHOP_BATCH_SMOKE_QUESTION)
     for i, r in enumerate(results):

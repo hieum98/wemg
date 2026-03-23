@@ -93,7 +93,7 @@ memory:
     batch_size_async: 100
     is_local_embedding_api: true
     embedding_model_name: "Qwen3-Embedding-4B"
-    embedding_base_url: "http://n0378:4000/v1"
+    embedding_base_url: "http://n0385:4000/v1"
     embedding_api_key: null
     enable_embedding_cache: true
     cache_max_size: 10000

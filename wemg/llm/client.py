@@ -10,6 +10,7 @@ import pydantic
 
 from wemg.llm.cache import RedisCacheManager
 from wemg.llm.parsing import extract_info_from_text, extraction_type_from_annotation
+from wemg.utils.text import truncate_text_to_max_tokens
 
 litellm.drop_params = True
 logger = logging.getLogger(__name__)
@@ -426,7 +427,11 @@ class LLMClient:
             documents = [documents]
         if not documents:
             return [], [], []
-        
+        # Trim documents if they are too long (max 32768 tokens)
+        _max_doc_tokens = 32768
+        documents = [
+            truncate_text_to_max_tokens(d, _max_doc_tokens) for d in documents
+        ]
 
         last_err: Optional[Exception] = None
         body = {

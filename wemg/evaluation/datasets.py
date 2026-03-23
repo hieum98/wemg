@@ -1,43 +1,40 @@
 """Dataset loading and preprocessing for evaluation."""
 
 import logging
+import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 def load_dataset_any(name_or_path: str, max_examples: Optional[int] = None, shuffle: bool = False):
     """Load a dataset from HuggingFace, local disk, or JSON file.
-    
+
+    Known dataset names use the same loaders as ``main`` branch
+    ``wemg/evaluation/evaluate.py`` (``preprocess_dataset``).
+
     Returns a HuggingFace Dataset object.
     """
-    from datasets import load_dataset, load_from_disk, Dataset
-    import json
-    
+    from datasets import load_dataset, load_from_disk
+
     path = Path(name_or_path)
-    
-    # Try known dataset names first
+
     known = _get_known_dataset(name_or_path)
     if known is not None:
         ds = known
     elif path.is_dir() and _is_hf_dataset_dir(path):
         ds = load_from_disk(str(path))
-    elif path.is_file() and path.suffix in (".json", ".jsonl"):
-        with open(path) as f:
-            if path.suffix == ".jsonl":
-                data = [json.loads(line) for line in f]
-            else:
-                data = json.load(f)
-        ds = Dataset.from_list(data)
+    elif path.is_file() and path.suffix.lower() in (".json", ".jsonl"):
+        ds = load_dataset("json", data_files=str(path), split="train")
     else:
         ds = load_dataset(name_or_path, split="train")
-    
+
     if shuffle:
         ds = ds.shuffle(seed=42)
-    if max_examples and len(ds) > max_examples:
+    if max_examples is not None and len(ds) > max_examples:
         ds = ds.select(range(max_examples))
-    
+
     return ds
 
 
@@ -46,54 +43,89 @@ def _is_hf_dataset_dir(path: Path) -> bool:
 
 
 def _get_known_dataset(name: str):
-    """Load and preprocess known evaluation datasets."""
+    """Load and preprocess known evaluation datasets (aligned with main ``evaluate.py``)."""
     from datasets import load_dataset
-    
-    name_lower = name.lower()
-    
+
+    key = name.lower().replace("-", "_")
+
     # Graph QA datasets
-    if name_lower == "cwq":
-        ds = load_dataset("rewenthy/ComplexWebQuestions", split="test")
-        return ds.rename_columns({"question": "question", "answers": "answer"})
-    
-    elif name_lower == "webqsp":
-        ds = load_dataset("rmanluo/RoG-webqsp", split="test")
-        return ds.map(lambda x: {
-            "question": x["question"],
-            "answer": [a["answer"] for a in x.get("answer", [])] if isinstance(x.get("answer"), list) else x.get("answer", ""),
-        })
-    
-    elif name_lower == "qald_10":
-        ds = load_dataset("KGQA/qald_10-en", split="test")
-        return ds.rename_columns({"question": "question", "answer": "answer"})
-    
-    elif name_lower in ("hotpotqa_adv", "hotpotqa-adv"):
-        ds = load_dataset("rmanluo/RoG-hotpotqa", split="test")
-        return ds.rename_columns({"question": "question", "answer": "answer"})
-    
-    elif name_lower == "grail_qa":
-        ds = load_dataset("grail_qa", split="validation")
-        return ds.rename_columns({"question": "question", "answer": "answer"})
-    
+    if key == "cwq":
+        data = load_dataset("Hieuman/cwq-train-eval", split="validation")
+        to_remove_columns = set(data.column_names) - {"question", "answers"}
+        data = data.remove_columns(list(to_remove_columns))
+
+        def preprocess_example(example):
+            answers = example["answers"]
+            all_answers = list(answers.get("answer", []))
+            aliases = answers.get("aliases", [])
+            if aliases and isinstance(aliases[0], list):
+                aliases = sum(aliases, [])
+            all_answers = all_answers + list(aliases)
+            return {"question": example["question"], "answer": list(set(all_answers))}
+
+        return data.map(
+            preprocess_example,
+            num_proc=os.cpu_count(),
+            remove_columns=["answers"],
+        )
+
+    if key == "webqsp":
+        data = load_dataset("ml1996/webqsp", split="test")
+        to_remove_columns = set(data.column_names) - {"question", "answer"}
+        return data.remove_columns(list(to_remove_columns))
+
+    if key == "qald_10":
+        return load_dataset("Hieuman/qald_10_en", split="train")
+
+    if key == "hotpotqa_adv":
+        return load_dataset("Hieuman/Hotpotqa-adv", split="train")
+
+    if key == "grail_qa":
+        data = load_dataset("Hieuman/grail_qa", split="validation")
+        data = data.map(
+            lambda x: {
+                "question": x["question"],
+                "answer": x["answer"].get("entity_name", []),
+            }
+        )
+        to_remove_columns = set(data.column_names) - {"question", "answer"}
+        return data.remove_columns(list(to_remove_columns))
+
     # Text QA datasets
-    elif name_lower == "2wiki":
-        ds = load_dataset("xanhho/2WikiMultihopQA", split="test")
-        return ds.rename_columns({"question": "question", "answer": "answer"})
-    
-    elif name_lower == "hotpotqa":
-        ds = load_dataset("hotpotqa/hotpot_qa", "fullwiki", split="validation")
-        return ds.rename_columns({"question": "question", "answer": "answer"})
-    
-    elif name_lower == "musique":
-        ds = load_dataset("drt/musique", split="validation")
-        return ds.rename_columns({"question": "question", "answer": "answer"})
-    
-    elif name_lower == "bamboogle":
-        ds = load_dataset("m-ric/bamboogle", split="test")
-        return ds.rename_columns({"question": "question", "answer": "answer"})
-    
-    elif name_lower == "frames":
-        ds = load_dataset("google/frames-benchmark", split="test")
-        return ds.rename_columns({"Prompt": "question", "Answer": "answer"})
-    
+    if key == "2wiki":
+        data = load_dataset(
+            "RUC-NLPIR/FlashRAG_datasets", "2wikimultihopqa", split="dev"
+        )
+        data = data.rename_column("golden_answers", "answer")
+        to_remove_columns = set(data.column_names) - {"question", "answer"}
+        return data.remove_columns(list(to_remove_columns))
+
+    if key == "hotpotqa":
+        data = load_dataset("RUC-NLPIR/FlashRAG_datasets", "hotpotqa", split="dev")
+        data = data.rename_column("golden_answers", "answer")
+        to_remove_columns = set(data.column_names) - {"question", "answer"}
+        return data.remove_columns(list(to_remove_columns))
+
+    if key == "musique":
+        data = load_dataset("RUC-NLPIR/FlashRAG_datasets", "musique", split="dev")
+        data = data.rename_column("golden_answers", "answer")
+        to_remove_columns = set(data.column_names) - {"question", "answer"}
+        return data.remove_columns(list(to_remove_columns))
+
+    if key == "bamboogle":
+        data = load_dataset("RUC-NLPIR/FlashRAG_datasets", "bamboogle", split="test")
+        data = data.rename_column("golden_answers", "answer")
+        to_remove_columns = set(data.column_names) - {"question", "answer"}
+        return data.remove_columns(list(to_remove_columns))
+
+    if key == "frames":
+        data = load_dataset("google/frames-benchmark", split="test")
+        return data.map(
+            lambda x: {
+                "question": x["Prompt"],
+                "answer": [x["Answer"]],
+            },
+            remove_columns=data.column_names,
+        )
+
     return None

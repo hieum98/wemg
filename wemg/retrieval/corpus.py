@@ -36,6 +36,11 @@ class CorpusRetriever:
             self._query_prefix = ""
             self._candidate_prefix = ""
 
+    def warmup(self) -> None:
+        """Eagerly load embedder and corpus/index (e.g. before multi-threaded batch use)."""
+        _ = self.embedder
+        _ = self.corpus
+
     @property
     def embedder(self):
         if self._embedder is None:

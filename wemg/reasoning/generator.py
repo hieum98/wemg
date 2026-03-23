@@ -14,7 +14,12 @@ from wemg.llm.roles import (
     SelfCorrectionInput, QuestionRephraserInput, ReasoningSynthesizeInput,
     ExtractionInput, TriplePruneInput,
 )
-from wemg.retrieval.wikidata import WikidataClient, WikidataEntity, WikiTriple
+from wemg.retrieval.wikidata import (
+    WikidataClient,
+    WikidataEntity,
+    WikiTriple,
+    filter_entities_relevant_to_text,
+)
 from wemg.retrieval.entity_linking import link_entities_llm, link_entities_azure
 from wemg.utils.text import format_context
 from wemg.llm.roles import SourceType
@@ -294,7 +299,10 @@ class NodeGenerator:
         n_hops = self.kwargs.get('n_hops', 1)
         assert self.wikidata_client is not None and isinstance(self.wikidata_client, WikidataClient), "WikidataClient must be provided"
 
-        known_entities = list([e for e in self.working_memory.entity_dict.values() if isinstance(e, WikidataEntity)]) or None
+        known_entities = filter_entities_relevant_to_text(
+            [e for e in self.working_memory.entity_dict.values() if isinstance(e, WikidataEntity)],
+            question,
+        )
         if entity_linking_method == "azure":
             entities, entity_dict, link_log = await link_entities_azure(
                 question, self.wikidata_client,

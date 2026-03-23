@@ -2,6 +2,8 @@
 
 import logging
 import os
+import re
+import hashlib
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +25,51 @@ from wemg.reasoning.nodes import ReasoningNode
 from wemg.utils.graph import textualize_graph, visualize_graph
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_chroma_collection_name(
+    name: Optional[str],
+    *,
+    fallback_prefix: str = "interaction_memory",
+) -> str:
+    """Return a Chroma-compatible collection name.
+
+    Chroma names must be 3-512 chars, use [a-zA-Z0-9._-], and start/end
+    with an alphanumeric character.
+    """
+    if name is None:
+        return f"{fallback_prefix}_{uuid.uuid4().hex[:8]}"
+
+    raw = str(name).strip()
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+
+    sanitized = re.sub(r"[^a-zA-Z0-9._-]+", "_", raw)
+    sanitized = re.sub(r"^[^a-zA-Z0-9]+", "", sanitized)
+    sanitized = re.sub(r"[^a-zA-Z0-9]+$", "", sanitized)
+
+    candidate = sanitized
+    if (
+        not candidate
+        or len(candidate) < 3
+        or not candidate[0].isalnum()
+        or not candidate[-1].isalnum()
+    ):
+        candidate = f"{fallback_prefix}_{sanitized}" if sanitized else f"{fallback_prefix}_{digest}"
+        candidate = re.sub(r"[^a-zA-Z0-9._-]+", "_", candidate)
+        candidate = re.sub(r"^[^a-zA-Z0-9]+", "", candidate)
+        candidate = re.sub(r"[^a-zA-Z0-9]+$", "", candidate)
+
+    if len(candidate) < 3:
+        candidate = f"{fallback_prefix}_{digest}"
+
+    if len(candidate) > 512:
+        head = candidate[: 512 - 1 - len(digest)]
+        candidate = f"{head}_{digest}"
+        candidate = re.sub(r"[^a-zA-Z0-9]+$", "", candidate)
+        if len(candidate) < 3:
+            candidate = f"{fallback_prefix}_{digest}"
+
+    return candidate
 
 
 @dataclass
@@ -66,7 +113,7 @@ class WEMGSystem:
         self._initialized = False
     
     def _setup_logging(self):
-        log_level = getattr(logging, self.cfg.logging.level.upper(), logging.INFO)
+        log_level = getattr(logging, self.cfg.logging.level.upper(), logging.CRITICAL)
         logging.basicConfig(level=log_level, format=self.cfg.logging.format)
     
     def _initialize(self):
@@ -74,6 +121,7 @@ class WEMGSystem:
             return
         
         logger.info("Initializing WEMG system...")
+        logger.info(f"Config: {self.cfg}")
         self.client = self._create_client()
         self.retriever = self._create_retriever()
         self.reranker = self._create_reranker()
@@ -165,6 +213,7 @@ class WEMGSystem:
             return None
         if collection_name is None:
             collection_name = f"interaction_memory_{uuid.uuid4().hex[:8]}"
+        collection_name = _sanitize_chroma_collection_name(collection_name)
         return InteractionMemory(
             db_path=im.db_path,
             collection_name=collection_name,
@@ -273,6 +322,62 @@ class WEMGSystem:
             working_memory=working_memory,
         )
     
+    def answer_batch(
+        self,
+        questions: List[str],
+        question_ids: Optional[List[str]] = None,
+        golden_answers: Optional[List] = None,
+        max_workers: Optional[int] = None,
+        **kwargs,
+    ) -> List[AnswerResult]:
+        """Answer many questions concurrently (thread pool), sharing one system instance."""
+        if not questions:
+            return []
+        self._initialize()
+        if isinstance(self.retriever, CorpusRetriever):
+            logger.info("Warming up corpus retriever before batch workers start.")
+            self.retriever.warmup()
+
+        n = len(questions)
+        if question_ids is not None and len(question_ids) != n:
+            raise ValueError("question_ids length must match questions")
+        if golden_answers is not None and len(golden_answers) != n:
+            raise ValueError("golden_answers length must match questions")
+
+        if max_workers is None:
+            max_workers = min(n, self.cfg.llm.concurrency, 8)
+        max_workers = max(1, min(max_workers, n))
+        logger.info(f"Answering {n} questions with {max_workers} workers")
+
+        def _answer_at(idx: int) -> AnswerResult:
+            q = questions[idx]
+            qid = question_ids[idx] if question_ids is not None else str(idx)
+            ga = None
+            if golden_answers is not None:
+                ga = golden_answers[idx]
+                if ga is not None:
+                    if isinstance(ga, (list, tuple)):
+                        ga = list(ga)
+                    elif not isinstance(ga, str):
+                        ga = str(ga)
+            return self.answer(q, question_id=qid, golden_answer=ga, **kwargs)
+
+        results: List[Optional[AnswerResult]] = [None] * n
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_answer_at, i): i for i in range(n)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    results[idx] = AnswerResult(
+                        question=questions[idx],
+                        answer=f"Error: {e}",
+                        concise_answer=f"Error: {e}",
+                        metadata={"error": str(e)},
+                    )
+        return results  # type: ignore[return-value]
+    
     def close(self):
         if self.client:
             self.client.close()
@@ -298,22 +403,7 @@ def answer_questions_batch(questions: List[str], config_path=None, config_overri
     if not questions:
         return []
     system = WEMGSystem(config_path=config_path, config_overrides=config_overrides)
-    system._initialize()
-    
-    if max_workers is None:
-        max_workers = min(len(questions), system.cfg.llm.concurrency, 8)
-    max_workers = max(1, min(max_workers, len(questions)))
-    
-    results = [None] * len(questions)
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(system.answer, q, **kwargs): i for i, q in enumerate(questions)}
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    results[idx] = AnswerResult(question=questions[idx], answer=f"Error: {e}", concise_answer=f"Error: {e}", metadata={"error": str(e)})
-        return results
+        return system.answer_batch(questions, max_workers=max_workers, **kwargs)
     finally:
         system.close()

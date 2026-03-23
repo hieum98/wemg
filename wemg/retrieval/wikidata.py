@@ -89,6 +89,46 @@ class WikidataEntity(pydantic.BaseModel):
         return "\n".join(parts)
 
 
+def _surface_form_matches_text(text: str, surface: str) -> bool:
+    """Return True if *surface* (label or alias) is plausibly mentioned in *text*."""
+    s = surface.strip()
+    if len(s) < 2:
+        return False
+    if " " in s:
+        return s.lower() in text.lower()
+    # Single-token forms: word-boundary match so short strings do not match inside longer words.
+    pat = r"(?<!\w)" + re.escape(s) + r"(?!\w)"
+    return re.search(pat, text, re.IGNORECASE) is not None
+
+
+def entity_surface_mentioned_in_text(entity: WikidataEntity, text: str) -> bool:
+    """True if *entity*'s label or any alias matches *text* (case-insensitive)."""
+    if not text or not str(text).strip():
+        return False
+    surfaces: List[str] = []
+    if entity.label:
+        surfaces.append(entity.label)
+    surfaces.extend(a for a in (entity.aliases or []) if a)
+    return any(_surface_form_matches_text(text, surf) for surf in surfaces)
+
+
+def filter_entities_relevant_to_text(
+    entities: Optional[List[WikidataEntity]],
+    text: Optional[str],
+) -> Optional[List[WikidataEntity]]:
+    """Restrict *entities* to those whose label or alias appears in *text*.
+
+    Used to bound ``known_entities`` in NER / relation-extraction prompts without
+    truncating descriptions. Returns ``None`` if there is nothing to pass.
+    """
+    if not entities:
+        return None
+    if not text or not str(text).strip():
+        return None
+    out = [e for e in entities if isinstance(e, WikidataEntity) and entity_surface_mentioned_in_text(e, text)]
+    return out or None
+
+
 class WikidataProperty(pydantic.BaseModel):
     pid: str
     label: Optional[str] = None

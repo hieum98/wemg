@@ -14,6 +14,19 @@ def approximate_token_count(messages: Union[List[Dict[str, str]], str]) -> int:
         return sum(len(encoding.encode(m["content"])) for m in messages)
 
 
+def truncate_text_to_max_tokens(
+    text: str, max_tokens: int, encoding_name: str = "cl100k_base"
+) -> str:
+    """Return text truncated to at most max_tokens (cl100k_base by default)."""
+    if max_tokens <= 0 or not text:
+        return text if max_tokens > 0 else ""
+    encoding = tiktoken.get_encoding(encoding_name)
+    ids = encoding.encode(text)
+    if len(ids) <= max_tokens:
+        return text
+    return encoding.decode(ids[:max_tokens])
+
+
 def format_context(
     memory: str = None,
     retrieval_info: List[str] = None,

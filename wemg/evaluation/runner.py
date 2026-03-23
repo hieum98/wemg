@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,8 @@ class DatasetEvaluator:
         resume: bool = True,
         question_column: str = "question",
         answer_column: str = "answer",
-        max_concurrent: int = 1,
+        max_concurrent: Optional[int] = None,
+        log_batch_size: Optional[int] = None,
     ) -> Dict:
         """Run evaluation: generate answers + compute metrics.
         
@@ -36,7 +37,12 @@ class DatasetEvaluator:
             resume: Whether to resume from previous run
             question_column: Column name for questions
             answer_column: Column name for correct answers
-            max_concurrent: Number of questions to process concurrently
+            max_concurrent: Max concurrent workers per answer_batch chunk. None uses
+                min(chunk size, llm.concurrency, 8), same as answer_questions_batch.
+            log_batch_size: How many unanswered questions to run per answer_batch before
+                appending to the log. None defaults to the same cap as max_concurrent
+                (min(llm.concurrency, 8)). Smaller values checkpoint more often if the
+                process stops mid-run.
         """
         output_dir = Path(output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -51,93 +57,153 @@ class DatasetEvaluator:
                     completed[entry["question"]] = entry
             logger.info(f"Resuming: {len(completed)} questions already processed")
         
-        # Process questions
-        sub_ems = []
-        accs = []
-        pass_at_k_values = []
-        
         from wemg.evaluation.metrics import compute_sub_em
         
+        n = len(dataset)
+        sub_ems: List[float] = [0.0] * n
+        accs: List[Optional[float]] = [None] * n
+        pass_at_k_values: List[Optional[int]] = [None] * n
+        predictions: Dict[str, str] = {}
+        for q, entry in completed.items():
+            predictions[q] = entry.get("predicted_answer", "")
+        
+        pending: List[tuple] = []
         for i, example in enumerate(dataset):
             question = example[question_column]
             correct = example[answer_column]
-            
             if question in completed:
                 entry = completed[question]
-                sub_ems.append(entry.get("sub_em", 0.0))
-                accs.append(entry.get("acc"))
-                pass_at_k_values.append(entry.get("pass_at_k"))
-                continue
-            
-            try:
-                result = self.system.answer(question, question_id=str(i), golden_answer=correct if isinstance(correct, str) else str(correct))
-                predicted = result.concise_answer or result.answer
-                sub_em = compute_sub_em(predicted, correct)
-                pass_at_k = result.metadata.get("pass_at_k") if result.metadata else None
-                
-                entry = {
-                    "question": question,
-                    "correct_answer": correct,
-                    "predicted_answer": predicted,
-                    "full_answer": result.answer,
-                    "sub_em": sub_em,
-                    "pass_at_k": pass_at_k,
-                    "acc": None,
-                }
-                
-                sub_ems.append(sub_em)
-                accs.append(None)
-                pass_at_k_values.append(pass_at_k)
-                
-            except Exception as e:
-                logger.error(f"Error processing question {i}: {e}")
-                entry = {
-                    "question": question,
-                    "correct_answer": correct,
-                    "predicted_answer": f"Error: {e}",
-                    "sub_em": 0.0,
-                    "acc": None,
-                    "pass_at_k": None,
-                    "error": str(e),
-                }
-                sub_ems.append(0.0)
-                accs.append(None)
-                pass_at_k_values.append(None)
-            
+                sub_ems[i] = float(entry.get("sub_em", 0.0))
+                accs[i] = entry.get("acc")
+                pass_at_k_values[i] = entry.get("pass_at_k")
+            else:
+                pending.append((i, question, correct))
+        
+        def append_logs(entries: List[Dict[str, Any]]) -> None:
             with open(log_file, "a") as f:
-                f.write(json.dumps(entry) + "\n")
-            
-            logger.info(f"[{i+1}/{len(dataset)}] Sub-EM: {sub_ems[-1]:.1f} | Q: {question[:60]}...")
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+                f.flush()
         
-        # Compute Acc scores in batch
-        acc_tasks = []
-        for i, example in enumerate(dataset):
-            if accs[i] is None:
-                question = example[question_column]
-                correct = example[answer_column]
-                # Find predicted answer from log
-                if question in completed:
-                    predicted = completed[question].get("predicted_answer", "")
+        def process_answer_results(
+            batch: List[Tuple[int, str, Any]],
+            results: List,
+        ) -> List[Dict[str, Any]]:
+            """Build log entries and update sub_ems / predictions for one answer_batch."""
+            out: List[Dict[str, Any]] = []
+            for (i, question, correct), result in zip(batch, results):
+                err = result.metadata.get("error") if result.metadata else None
+                if err:
+                    logger.error(f"Error processing question {i}: {err}")
+                    err_text = f"Error: {err}"
+                    entry = {
+                        "question": question,
+                        "correct_answer": correct,
+                        "predicted_answer": err_text,
+                        "sub_em": 0.0,
+                        "acc": None,
+                        "pass_at_k": None,
+                        "error": str(err),
+                    }
+                    sub_ems[i] = 0.0
+                    pass_at_k_values[i] = None
+                    predictions[question] = err_text
                 else:
-                    with open(log_file) as f:
-                        for line in f:
-                            e = json.loads(line)
-                            if e["question"] == question:
-                                predicted = e.get("predicted_answer", "")
-                                break
-                        else:
-                            predicted = ""
-                acc_tasks.append((i, question, predicted, correct))
+                    try:
+                        predicted = result.concise_answer or result.answer
+                        sub_em = compute_sub_em(predicted, correct)
+                        pass_at_k = result.metadata.get("pass_at_k") if result.metadata else None
+                        entry = {
+                            "question": question,
+                            "correct_answer": correct,
+                            "predicted_answer": predicted,
+                            "full_answer": result.answer,
+                            "sub_em": sub_em,
+                            "pass_at_k": pass_at_k,
+                            "acc": None,
+                        }
+                        sub_ems[i] = sub_em
+                        pass_at_k_values[i] = pass_at_k
+                        predictions[question] = predicted
+                    except Exception as e:
+                        logger.error(f"Error processing question {i}: {e}")
+                        err_text = f"Error: {e}"
+                        entry = {
+                            "question": question,
+                            "correct_answer": correct,
+                            "predicted_answer": err_text,
+                            "sub_em": 0.0,
+                            "acc": None,
+                            "pass_at_k": None,
+                            "error": str(e),
+                        }
+                        sub_ems[i] = 0.0
+                        pass_at_k_values[i] = None
+                        predictions[question] = err_text
+                out.append(entry)
+                logger.info(f"[{i+1}/{n}] Sub-EM: {sub_ems[i]:.1f} | Q: {question[:60]}...")
+            return out
         
-        if acc_tasks and self.system.client:
-            from wemg.evaluation.metrics import compute_acc
-            for idx, question, predicted, correct in acc_tasks:
-                try:
-                    acc = asyncio.run(compute_acc(question, predicted, correct, self.system.client))
+        if pending:
+            cfg_cap = min(self.system.cfg.llm.concurrency, 8)
+            if log_batch_size is not None:
+                chunk_size = max(1, log_batch_size)
+            elif max_concurrent is not None:
+                chunk_size = max(1, max_concurrent)
+            else:
+                chunk_size = max(1, cfg_cap)
+            total_pending = len(pending)
+            for chunk_start in range(0, total_pending, chunk_size):
+                batch = pending[chunk_start : chunk_start + chunk_size]
+                questions = [p[1] for p in batch]
+                qids = [str(p[0]) for p in batch]
+                golds = [
+                    list(c) if isinstance(c, (list, tuple)) else (c if isinstance(c, str) else str(c))
+                    for _, _, c in batch
+                ]
+                mw = max_concurrent
+                if mw is not None:
+                    mw = max(1, min(mw, len(batch)))
+                results = self.system.answer_batch(
+                    questions,
+                    question_ids=qids,
+                    golden_answers=golds,
+                    max_workers=mw,
+                )
+                entries = process_answer_results(batch, results)
+                append_logs(entries)
+        
+        # Compute Acc scores in batch (async concurrent)
+        acc_task_rows: List[tuple] = []
+        for i, example in enumerate(dataset):
+            if accs[i] is not None:
+                continue
+            question = example[question_column]
+            correct = example[answer_column]
+            predicted = predictions.get(question, "")
+            acc_task_rows.append((i, question, predicted, correct))
+        
+        if acc_task_rows and self.system.client:
+            from wemg.evaluation.metrics import compute_acc_batch
+            acc_max = max_concurrent if max_concurrent is not None else 10
+            tasks = [(q, pred, cor) for _, q, pred, cor in acc_task_rows]
+            try:
+                acc_results = asyncio.run(
+                    compute_acc_batch(tasks, self.system.client, max_concurrent=acc_max)
+                )
+                for (idx, _, _, _), acc in zip(acc_task_rows, acc_results):
                     accs[idx] = acc
-                except Exception as e:
-                    logger.error(f"Acc computation failed for question {idx}: {e}")
-                    accs[idx] = 0.0
+            except Exception as e:
+                logger.error(f"Acc batch failed: {e}")
+                from wemg.evaluation.metrics import compute_acc
+                for idx, question, predicted, correct in acc_task_rows:
+                    try:
+                        accs[idx] = asyncio.run(
+                            compute_acc(question, predicted, correct, self.system.client)
+                        )
+                    except Exception as e2:
+                        logger.error(f"Acc computation failed for question {idx}: {e2}")
+                        accs[idx] = 0.0
         
         # Compute aggregate metrics
         from wemg.evaluation.metrics import compute_aggregate_metrics
@@ -167,7 +233,7 @@ class DatasetEvaluator:
         prediction_column: str = "predicted_answer",
     ) -> Dict:
         """Score existing predictions without running WEMG."""
-        from wemg.evaluation.metrics import compute_sub_em, compute_aggregate_metrics
+        from wemg.evaluation.metrics import compute_sub_em, compute_aggregate_metrics, compute_acc_batch
         
         sub_ems = []
         accs = []
@@ -180,16 +246,24 @@ class DatasetEvaluator:
         
         # Compute Acc if client available
         if self.system.client:
-            from wemg.evaluation.metrics import compute_acc
-            for i, example in enumerate(dataset):
-                try:
-                    acc = asyncio.run(compute_acc(
-                        example[question_column], example.get(prediction_column, ""),
-                        example[answer_column], self.system.client
-                    ))
+            tasks = [
+                (example[question_column], example.get(prediction_column, ""), example[answer_column])
+                for example in dataset
+            ]
+            try:
+                acc_results = asyncio.run(compute_acc_batch(tasks, self.system.client))
+                for i, acc in enumerate(acc_results):
                     accs[i] = acc
-                except Exception:
-                    accs[i] = 0.0
+            except Exception:
+                from wemg.evaluation.metrics import compute_acc
+                for i, example in enumerate(dataset):
+                    try:
+                        accs[i] = asyncio.run(compute_acc(
+                            example[question_column], example.get(prediction_column, ""),
+                            example[answer_column], self.system.client
+                        ))
+                    except Exception:
+                        accs[i] = 0.0
         
         metrics = compute_aggregate_metrics(sub_ems, accs, [])
         
