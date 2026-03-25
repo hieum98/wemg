@@ -333,9 +333,9 @@ class NodeGenerator:
         triples = list(set(triples)) if triples else []
         all_entities = entities # keep all entities from the question
         if triples:
-            # triples, prune_log = await self._prune_triples(question, triples)
+            triples, prune_log = await self._prune_triples(question, triples)
             all_entities = list(set(all_entities + self._collect_entities_from_triples(triples)))
-            # link_log = merge_logs(link_log, prune_log)
+            link_log = merge_logs(link_log, prune_log)
         return triples, all_entities, link_log
     
     async def _prune_triples(self, question: str, triples: List[WikiTriple]) -> Tuple[List[WikiTriple], Dict]:
