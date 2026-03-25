@@ -670,17 +670,17 @@ Instructions:
 2. Define precise boundaries (include modifiers like "Prime Minister Boris Johnson")
 3. Handle ambiguity using context (e.g., "Apple" as company vs. fruit)
 4. Extract unique entities only once (deduplicate by real-world entity; if id is present, also deduplicate by id)
-5. Set id to null if the entity is not in the KNOWN ENTITIES list.
 
 Rules:
 - Only extract actual named entities, not common nouns or pronouns
 - No overlapping entities; extract most complete version
 - For each entity, provide brief description for clarity
+- If the entity is not in the KNOWN ENTITIES list or KNOWN ENTITIES is not provided, set id to null.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
 - entities: array of objects; each object has:
-  - id: string or null — Wikidata QID when certain from KNOWN ENTITIES; otherwise null
+  - id: string or null — Wikidata QID when certain from KNOWN ENTITIES or KNOWN ENTITIES is not provided; otherwise null (NEVER GUESS A QID IF IT IS NOT PROVIDED)
   - name: string — canonical entity name
   - description: string or null — short disambiguating phrase when helpful
 """
@@ -712,10 +712,10 @@ Instructions:
 Respond with a JSON object with exactly these keys:
 - relations: array of objects; each object has:
   - subject: string
-  - subject_id: string or null
+  - subject_id: string or null, must be null if the subject is not in the KNOWN ENTITIES list or KNOWN ENTITIES is not provided. (NEVER GUESS A QID IF IT IS NOT PROVIDED)
   - relation: string
   - object: string
-  - object_id: string or null
+  - object_id: string or null, must be null if the object is not in the KNOWN ENTITIES list or KNOWN ENTITIES is not provided. (NEVER GUESS A QID IF IT IS NOT PROVIDED)
   - context: string or null — self-contained snippet if needed
 """
 

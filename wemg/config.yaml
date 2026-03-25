@@ -31,7 +31,7 @@ retriever:
     api_key: null
     top_k: 5
     crawl_full_text: true
-    max_crawl_requests_per_second: 2.0
+    max_crawl_requests_per_second: 2
   corpus:
     embedder:
       model_name: "Qwen3-Embedding-4B"

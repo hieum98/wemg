@@ -239,7 +239,7 @@ class NodeGenerator:
             interaction_memory=self.interaction_memory, n=1
         )
         queries = responses[0].queries if responses else [question]
-        
+
         tasks = [self._retrieve_from_web(q) for q in queries]
         web_results = await asyncio.gather(*tasks)
         documents = list(set(sum(web_results, [])))
@@ -256,11 +256,9 @@ class NodeGenerator:
         entities = list(set(entities))
         # Get details for all entities
         assert self.wikidata_client is not None and isinstance(self.wikidata_client, WikidataClient), "WikidataClient must be provided"
-        # recall the entities from the working memory
         all_entities = [self.working_memory.entity_dict.get(e.qid) if self.working_memory.entity_dict.get(e.qid) else e 
                         for e in entities]
         all_entities = self.wikidata_client.enrich_entities(all_entities, get_details=True)
-
         kb_documents = []
         for entity in all_entities:
             if hasattr(entity, 'wikipedia_content') and entity.wikipedia_content:
@@ -335,9 +333,9 @@ class NodeGenerator:
         triples = list(set(triples)) if triples else []
         all_entities = entities # keep all entities from the question
         if triples:
-            triples, prune_log = await self._prune_triples(question, triples)
+            # triples, prune_log = await self._prune_triples(question, triples)
             all_entities = list(set(all_entities + self._collect_entities_from_triples(triples)))
-            link_log = merge_logs(link_log, prune_log)
+            # link_log = merge_logs(link_log, prune_log)
         return triples, all_entities, link_log
     
     async def _prune_triples(self, question: str, triples: List[WikiTriple]) -> Tuple[List[WikiTriple], Dict]:

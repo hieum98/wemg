@@ -65,11 +65,13 @@ async def link_entities_llm(
         n=1,
     )
 
+    known_entities_dict = {e.qid: e for e in known_entities if e.qid} if known_entities else {}
+
     ner_output = responses[0] if responses else None
     if not ner_output or not hasattr(ner_output, 'entities') or not ner_output.entities:
         return [], {}, log
 
-    entities_to_link = [e for e in ner_output.entities if e.id is None]
+    entities_to_link = [e for e in ner_output.entities if e.id is None or e.id not in known_entities_dict]
     entity_names = [e.name for e in entities_to_link]
     retrieval_results: Union[List[WikidataEntity], List[List[WikidataEntity]]] = await wikidata_client.asearch_entities(
         entity_names, num_results=top_k_entities, get_details=True

@@ -4,6 +4,7 @@ k-hop triple traversal, and path finding."""
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -11,6 +12,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
+from urllib.parse import unquote
 
 import pydantic
 from SPARQLWrapper import SPARQLWrapper, JSON
@@ -34,9 +36,10 @@ except ImportError:
     MEDIAWIKI_AVAILABLE = False
 
 # Rate limit for Wikipedia page fetches (same default as web crawl to avoid destination rate limits).
-DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND = 2.0
+DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND = 10
 _wiki_rate_lock = threading.Lock()
 _wiki_last_request_time: List[float] = [0.0]
+WIKIPEDIA_DUMP_DATASET = "Hieuman/wiki23-processed"
 
 
 def _wikipedia_rate_limit(max_requests_per_second: float) -> None:
@@ -103,12 +106,13 @@ def _surface_form_matches_text(text: str, surface: str) -> bool:
 
 def entity_surface_mentioned_in_text(entity: WikidataEntity, text: str) -> bool:
     """True if *entity*'s label or any alias matches *text* (case-insensitive)."""
+    text = text.lower()
     if not text or not str(text).strip():
         return False
     surfaces: List[str] = []
     if entity.label:
-        surfaces.append(entity.label)
-    surfaces.extend(a for a in (entity.aliases or []) if a)
+        surfaces.append(entity.label.lower())
+    surfaces.extend(a.lower() for a in (entity.aliases or []) if a)
     return any(_surface_form_matches_text(text, surf) for surf in surfaces)
 
 
@@ -368,6 +372,7 @@ class WikidataClient:
         # Raw 1-hop triples per QID (pre-enrichment); shared across k-hop and find_path.
         self._outgoing_triples_cache: Dict[str, List[WikiTriple]] = {}
         self._bidirectional_triples_cache: Dict[str, List[WikiTriple]] = {}
+        self._wikipedia_dump_dataset = self._load_wikipedia_dump_dataset()
         self._wikibase_client = None
         if WIKIBASE_AVAILABLE:
             try:
@@ -448,6 +453,181 @@ class WikidataClient:
             return False
         label = prop.label.strip()
         return bool(label and not (label.startswith("P") and label[1:].isdigit()))
+
+    def _fetch_wikipedia_contents_concurrent(
+        self,
+        entities: List[WikidataEntity],
+        *,
+        max_workers: Optional[int] = None,
+    ) -> None:
+        """Fetch Wikipedia page contents concurrently for entities.
+
+        Uses the global `_wikipedia_rate_limit` gate to respect the configured
+        max RPS while allowing network I/O to overlap across requests.
+        """
+        if not (MEDIAWIKI_AVAILABLE and entities):
+            return
+
+        # Only fetch missing content, and de-duplicate by URL/title.
+        by_url: Dict[str, List[WikidataEntity]] = {}
+        for e in entities:
+            if not e or not e.wikipedia_url or e.wikipedia_content:
+                continue
+            by_url.setdefault(e.wikipedia_url, []).append(e)
+
+        if not by_url:
+            return
+
+        # Prefer URL-matched content from the local/wiki dump before web requests.
+        dump_matches = self._lookup_wikipedia_dump_contents(set(by_url.keys()))
+        for url, content in dump_matches.items():
+            if not content:
+                continue
+            for e in by_url.get(url, []):
+                e.wikipedia_content = content
+            by_url.pop(url, None)
+
+        if not by_url:
+            return
+
+        # Pick a conservative default concurrency that still overlaps latency.
+        if max_workers is None:
+            max_workers = min(16, max(4, int(self._max_wikipedia_rps or 1)))
+
+        wiki_local = threading.local()
+
+        def _get_wiki() -> "MediaWikiAPI":
+            wiki = getattr(wiki_local, "wiki", None)
+            if wiki is None:
+                wiki = MediaWikiAPI()
+                setattr(wiki_local, "wiki", wiki)
+            return wiki
+
+        def _fetch_one(url: str) -> Tuple[str, Optional[str]]:
+            try:
+                _wikipedia_rate_limit(self._max_wikipedia_rps)
+                title = url.split("/wiki/")[-1]
+                page = _get_wiki().page(title)
+                return url, getattr(page, "content", None)
+            except Exception as e:
+                logger.warning(f"Failed to fetch Wikipedia content for {url}: {e}")
+                return url, None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_fetch_one, url) for url in by_url.keys()]
+            for fut in as_completed(futures):
+                url, content = fut.result()
+                if not content:
+                    continue
+                for e in by_url.get(url, []):
+                    e.wikipedia_content = content
+
+    @staticmethod
+    def _canonicalize_wikipedia_url(url: str) -> Optional[str]:
+        if not isinstance(url, str):
+            return None
+        value = url.strip()
+        if not value:
+            return None
+        if "/wiki/" not in value:
+            return None
+        title = value.split("/wiki/", 1)[-1].split("#", 1)[0].split("?", 1)[0]
+        title = unquote(title).strip().replace(" ", "_")
+        if not title:
+            return None
+        return f"https://en.wikipedia.org/wiki/{title}"
+
+    @staticmethod
+    def _load_wikipedia_dump_dataset():
+        try:
+            from datasets import load_dataset
+            ds = load_dataset(WIKIPEDIA_DUMP_DATASET, split="train")
+
+            # Precompute canonical URL once so per-call lookups can filter cheaply.
+            if "url" in getattr(ds, "column_names", []) and "_canonical_url" not in ds.column_names:
+                def _add_canonical(batch: Dict[str, Any]) -> Dict[str, Any]:
+                    urls = batch.get("url") or []
+                    canon = [WikidataClient._canonicalize_wikipedia_url(u) for u in urls]
+                    return {"_canonical_url": canon}
+
+                ds = ds.map(
+                    _add_canonical,
+                    batched=True,
+                    batch_size=10_000,
+                    num_proc=max(1, os.cpu_count() or 1),
+                    desc="Precompute Wikipedia canonical URLs",
+                )
+
+            return ds
+        except Exception as e:
+            logger.debug(f"Failed to load Wikipedia dump dataset ({WIKIPEDIA_DUMP_DATASET}): {e}")
+            return None
+
+    def _lookup_wikipedia_dump_contents(self, urls: Set[str]) -> Dict[str, Optional[str]]:
+        if not urls:
+            return {}
+
+        canonical_to_raw: Dict[str, List[str]] = {}
+        for raw in urls:
+            canonical = self._canonicalize_wikipedia_url(raw)
+            if canonical:
+                canonical_to_raw.setdefault(canonical, []).append(raw)
+
+        if not canonical_to_raw:
+            return {}
+
+        result: Dict[str, Optional[str]] = {}
+        if self._wikipedia_dump_dataset is None:
+            for raw_urls in canonical_to_raw.values():
+                for raw in raw_urls:
+                    result[raw] = None
+            return result
+
+        try:
+            target_urls = set(canonical_to_raw.keys())
+            ds = self._wikipedia_dump_dataset
+
+            def _row_url_in_targets(row: Dict[str, Any]) -> bool:
+                canonical_row_url = row.get("_canonical_url") or self._canonicalize_wikipedia_url(
+                    row.get("url")
+                    or row.get("source")
+                    or row.get("wikipedia_url")
+                    or row.get("wiki_url")
+                )
+                return bool(canonical_row_url in target_urls)
+
+            filtered = ds.filter(_row_url_in_targets, num_proc=os.cpu_count())
+            aggregated: Dict[str, List[str]] = defaultdict(list)
+            for row in filtered:
+                canonical_row_url = row.get("_canonical_url") or self._canonicalize_wikipedia_url(
+                    row.get("url")
+                    or row.get("source")
+                    or row.get("wikipedia_url")
+                    or row.get("wiki_url")
+                )
+                if not canonical_row_url or canonical_row_url not in target_urls:
+                    continue
+                content = (
+                    row.get("contents")
+                    or row.get("content")
+                    or row.get("text")
+                    or row.get("article")
+                )
+                if isinstance(content, str):
+                    text = content.strip()
+                    if text:
+                        aggregated[canonical_row_url].append(text)
+
+            for canonical, raw_urls in canonical_to_raw.items():
+                joined = "\n\n".join(aggregated.get(canonical, [])) or None
+                for raw in raw_urls:
+                    result[raw] = joined
+        except Exception as e:
+            logger.debug(f"Failed Wikipedia dump lookup ({WIKIPEDIA_DUMP_DATASET}): {e}")
+            for raw_urls in canonical_to_raw.values():
+                for raw in raw_urls:
+                    result[raw] = None
+        return result
 
     def _has_fake_property_label(self, prop: Any) -> bool:
         """Return True if the property has no real label (missing or equals PID)."""
@@ -583,16 +763,7 @@ class WikidataClient:
                     )
 
         if get_details and MEDIAWIKI_AVAILABLE:
-            wiki = MediaWikiAPI()
-            for qid_val, entity in list(entity_map.items()):
-                if entity.wikipedia_url:
-                    try:
-                        _wikipedia_rate_limit(self._max_wikipedia_rps)
-                        title = entity.wikipedia_url.split("/wiki/")[-1]
-                        page = wiki.page(title)
-                        entity.wikipedia_content = page.content
-                    except Exception:
-                        pass
+            self._fetch_wikipedia_contents_concurrent(list(entity_map.values()))
 
         return entity_map
 
@@ -1209,7 +1380,12 @@ class WikidataClient:
         enriched_map = self._get_entities_batch(
             list(set(qids_to_enrich)), get_details=get_details,
         )
-        return [enriched_map.get(e.qid, e) if e else e for e in entities]
+        all_entities = [enriched_map.get(e.qid, e) if e else e for e in entities]
+        # Fetch Wikipedia content if not already fetched
+        if get_details and MEDIAWIKI_AVAILABLE:
+            self._fetch_wikipedia_contents_concurrent(all_entities)
+
+        return all_entities
 
     def enrich_properties(
         self, properties: List[WikidataProperty],
