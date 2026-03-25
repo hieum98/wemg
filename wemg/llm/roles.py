@@ -358,7 +358,7 @@ class TriplePruneOutput(pydantic.BaseModel):
 # System Prompts -- Generator
 # =============================================================================
 
-GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in multi-hop question answering and reasoning decomposition. Your task is to analyze whether a main question can be answered with the provided context, and if not, generate strategic subquestions that advance the reasoning process.
+GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in multi-hop question answering and reasoning decomposition. Your task is to analyze whether a main question can be answered with the provided context, and if not, generate strategic subquestions that advance the reasoning process to answer the main question. Your subquestions must be self-contained, atomic and diverse.
 
 ## Core Principle: The generated subquestion must NOT be answerable using the provided context and must be self-contained, atomic and diverse.
 
@@ -369,24 +369,27 @@ GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in mul
    - If YES (Sufficient): No subquestion needed.
    - If NO (Insufficient): Proceed to generate subquestion.
 4. For Each Subquestion:
-   a. Target a distinct knowledge gap in the reasoning chain
-   b. Formulate an atomic, relevant, self-contained subquestion. Make sure each subquestion is fully understandable on its own without needing to refer back to the original question or context.
-   c. VALIDATE: Ensure subquestion CANNOT be answered by context. If it can be answered by context, generate a new subquestion. The generated subquestions must be diverse and not redundant. 
-   d. VALIDATE Independence: Each subquestion must be answerable WITHOUT requiring answers from other generated subquestions. Eliminate dependent subquestions that require answering another generated subquestion first. ONLY keep subquestions that are independently answerable (even if answering all subquestions doesn't directly solve the main question)
+   a. Target a distinct knowledge gap lacking in the context, this knowledge gap when answered will advance the reasoning process to answer the main question.
+   b. Don't ask the trivial questions that can be answered by context or easy to answer by general knowledge. If the question is truely trivial and you are sure 100 percent about the answer, generate answer after the subquestion (and consider this subquestion-answer pair as a single subquestion).
+   c. Formulate an atomic, relevant, self-contained subquestion. Make sure each subquestion is fully understandable on its own without needing to refer back to the original question or context.
+   d. VALIDATE: 
+    - Remember that your responsibility is to generate subquestions, DON'T GUESS OR INVENT ANSWERS that you are not sure about. If the sub-question is truely trivial and you are sure 100 percent about the answer, generate answer after the subquestion (and consider this subquestion-answer pair as a single subquestion).
+    - Ensure subquestion is helpful to advance the reasoning process to answer the main question. If it is not, generate a new subquestion.
+    - Ensure subquestion CANNOT be answered by context. If it can be answered by context, generate a new subquestion. The generated subquestions must be diverse and not redundant. 
+    - Each subquestion must be answerable WITHOUT requiring answers from other generated subquestions. Eliminate dependent subquestions that require answering another generated subquestion first. ONLY keep subquestions that are independently answerable (even if answering all subquestions doesn't directly solve the main question).
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
 - is_answerable: boolean — true if the main question can be answered from the provided context alone; false otherwise
-- subquestions: array of strings, or null — if is_answerable is true, use null or []; if false, list atomic, diverse, non-redundant subquestions (each must not be answerable from the context)
+- subquestions: array of strings, or null — if is_answerable is true, use null or []; if false, list atomic, diverse, non-redundant subquestions
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
 
 ## Instructions:
-1. Analyze the question and identify key components.
-2. If context provided, extract all relevant information.
-3. Resolve information gaps using your knowledge. You can use your own knowledge or your own internet search.
-4. Synthesize a clear, well-reasoned answer. State assumptions clearly if you made any assumptions or used your own internet search.
+1. Analyze the question and identify key components. Determine if the question is trivial or not by checking if it can be answered by context or easy to answer by general knowledge (you are sure 100 percent about the answer). If it is truely trivial, answer the question directly and return the answer.
+2. If the question is not trivial, extract all relevant information from the context. If the context is not provided, use your own knowledge or your own internet search.
+3. Synthesize a clear, well-reasoned answer. State assumptions clearly if you made any assumptions or used your own internet search.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
@@ -725,7 +728,6 @@ TRIPLE_PRUNE_PROMPT = """You are a Knowledge Graph Expert. Given a question and 
 Instructions:
 1. Identify triples relevant to answering the question. Don't guess or invent answers for the question.
 2. Consider cross-triples and chain-triples, i.e., a triple is relevant if it is directly or indirectly related to the question.
-3. Output a JSON object with a single key "keep_indices" containing a list of indices (0-based) of triples to keep.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:

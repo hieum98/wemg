@@ -82,7 +82,7 @@ memory:
   working_memory:
     max_textual_memory_tokens: 16384
   interaction_memory:
-    enabled: true
+    enabled: false
     scope: "question"
     log_dir: "./logs"
     save_to_file: false
@@ -99,7 +99,7 @@ memory:
     cache_max_size: 10000
 
 logging:
-  level: "INFO"
+  level: "WARNING"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 output:

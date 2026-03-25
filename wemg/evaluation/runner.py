@@ -3,10 +3,83 @@
 import asyncio
 import json
 import logging
+import pickle
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_slug(text: str, max_len: int = 48) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in text).strip("_")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    if not cleaned:
+        return "question"
+    return cleaned[:max_len]
+
+
+def _question_artifact_dir(base_dir: Path, question: str, index: int) -> Path:
+    digest = hashlib.sha1(question.encode("utf-8")).hexdigest()[:10]
+    slug = _safe_slug(question)
+    return base_dir / f"q_{index:05d}_{digest}_{slug}"
+
+
+def _serialize_search_tree(node: Any) -> Optional[Dict[str, Any]]:
+    if node is None:
+        return None
+    payload: Dict[str, Any] = {
+        "node_type": getattr(getattr(node, "node_type", None), "value", str(getattr(node, "node_type", "UNKNOWN"))),
+        "content": dict(getattr(getattr(node, "node_state", None), "content", {}) or {}),
+    }
+    if hasattr(node, "visits"):
+        payload["visits"] = int(getattr(node, "visits", 0))
+    if hasattr(node, "value"):
+        payload["value"] = float(getattr(node, "value", 0.0))
+    children = list(getattr(node, "children", []) or [])
+    payload["children"] = [_serialize_search_tree(child) for child in children]
+    return payload
+
+
+def _save_question_artifacts(
+    artifacts_root: Path,
+    index: int,
+    question: str,
+    result: Any,
+) -> Dict[str, Any]:
+    q_dir = _question_artifact_dir(artifacts_root, question, index)
+    q_dir.mkdir(parents=True, exist_ok=True)
+
+    out: Dict[str, Any] = {
+        "artifact_dir": str(q_dir),
+        "search_tree_path": None,
+        "textual_memory_path": None,
+        "graph_memory_path": None,
+    }
+
+    tree_payload = _serialize_search_tree(getattr(result, "search_tree", None))
+    if tree_payload is not None:
+        tree_path = q_dir / "search_tree.json"
+        with open(tree_path, "w", encoding="utf-8") as f:
+            json.dump(tree_payload, f, indent=2, ensure_ascii=False)
+        out["search_tree_path"] = str(tree_path)
+
+    working_memory = getattr(result, "working_memory", None)
+    if working_memory is not None:
+        textual_path = q_dir / "working_memory_textual.json"
+        with open(textual_path, "w", encoding="utf-8") as f:
+            json.dump(list(getattr(working_memory, "textual_memory", []) or []), f, indent=2, ensure_ascii=False)
+        out["textual_memory_path"] = str(textual_path)
+
+        graph = getattr(working_memory, "graph_memory", None)
+        if graph is not None:
+            graph_path = q_dir / "working_memory_graph.pkl"
+            with open(graph_path, "wb") as f:
+                pickle.dump(graph, f)
+            out["graph_memory_path"] = str(graph_path)
+
+    return out
 
 
 class DatasetEvaluator:
@@ -47,6 +120,8 @@ class DatasetEvaluator:
         output_dir = Path(output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
         log_file = output_dir / "evaluation_log.jsonl"
+        artifacts_root = output_dir / "artifacts"
+        artifacts_root.mkdir(parents=True, exist_ok=True)
         
         # Load existing results for resume
         completed = {}
@@ -105,6 +180,11 @@ class DatasetEvaluator:
                         "pass_at_k": None,
                         "error": str(err),
                     }
+                    try:
+                        entry["artifacts"] = _save_question_artifacts(artifacts_root, i, question, result)
+                    except Exception as artifact_error:
+                        logger.warning(f"Could not persist artifacts for question {i}: {artifact_error}")
+                        entry["artifacts_error"] = str(artifact_error)
                     sub_ems[i] = 0.0
                     pass_at_k_values[i] = None
                     predictions[question] = err_text
@@ -122,6 +202,11 @@ class DatasetEvaluator:
                             "pass_at_k": pass_at_k,
                             "acc": None,
                         }
+                        try:
+                            entry["artifacts"] = _save_question_artifacts(artifacts_root, i, question, result)
+                        except Exception as artifact_error:
+                            logger.warning(f"Could not persist artifacts for question {i}: {artifact_error}")
+                            entry["artifacts_error"] = str(artifact_error)
                         sub_ems[i] = sub_em
                         pass_at_k_values[i] = pass_at_k
                         predictions[question] = predicted
@@ -137,6 +222,11 @@ class DatasetEvaluator:
                             "pass_at_k": None,
                             "error": str(e),
                         }
+                        try:
+                            entry["artifacts"] = _save_question_artifacts(artifacts_root, i, question, result)
+                        except Exception as artifact_error:
+                            logger.warning(f"Could not persist artifacts for question {i}: {artifact_error}")
+                            entry["artifacts_error"] = str(artifact_error)
                         sub_ems[i] = 0.0
                         pass_at_k_values[i] = None
                         predictions[question] = err_text

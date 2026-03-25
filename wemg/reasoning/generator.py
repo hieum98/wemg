@@ -27,7 +27,7 @@ from wemg.llm.roles import SourceType
 logger = logging.getLogger(__name__)
 
 # Max triples per TRIPLE_PRUNER LLM call when pruning large lists.
-_PRUNE_TRIPLES_BATCH_SIZE = 8
+_PRUNE_TRIPLES_BATCH_SIZE = 64
 
 
 @dataclass
@@ -333,7 +333,7 @@ class NodeGenerator:
         if isinstance(triples, list) and triples and isinstance(triples[0], list):
             triples = sum(triples, [])
         triples = list(set(triples)) if triples else []
-        all_entities = entities
+        all_entities = entities # keep all entities from the question
         if triples:
             triples, prune_log = await self._prune_triples(question, triples)
             all_entities = list(set(all_entities + self._collect_entities_from_triples(triples)))

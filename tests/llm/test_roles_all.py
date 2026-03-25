@@ -118,7 +118,7 @@ def _all_execute_role_cases():
         pytest.param(
             SUBQUESTION_GENERATOR,
             SubquestionGenerationInput(
-                question="What is the population of the capital city of France?",
+                question="Which element has an atomic number that is double that of hydrogen?",
                 context="France is a country in Europe.",
             ),
             None,
