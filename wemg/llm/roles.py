@@ -368,20 +368,21 @@ GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in mul
 3. Decision Point:
    - If YES (Sufficient): No subquestion needed.
    - If NO (Insufficient): Proceed to generate subquestion.
-4. For Each Subquestion:
+4. Identify the knowledge gaps that are lacking in the context and the subquestions that can answer these knowledge gaps.
+5. For Each Subquestion:
    a. Target a distinct knowledge gap lacking in the context, this knowledge gap when answered will advance the reasoning process to answer the main question.
    b. Don't ask the trivial questions that can be answered by context or easy to answer by general knowledge. If the question is truely trivial and you are sure 100 percent about the answer, generate answer after the subquestion (and consider this subquestion-answer pair as a single subquestion).
    c. Formulate an atomic, relevant, self-contained subquestion. Make sure each subquestion is fully understandable on its own without needing to refer back to the original question or context.
    d. VALIDATE: 
     - Remember that your responsibility is to generate subquestions, DON'T GUESS OR INVENT ANSWERS that you are not sure about. If the sub-question is truely trivial and you are sure 100 percent about the answer, generate answer after the subquestion (and consider this subquestion-answer pair as a single subquestion).
-    - Ensure subquestion is helpful to advance the reasoning process to answer the main question. If it is not, generate a new subquestion.
-    - Ensure subquestion CANNOT be answered by context. If it can be answered by context, generate a new subquestion. The generated subquestions must be diverse and not redundant. 
+    - Ensure subquestion is helpful to advance the reasoning process to answer the main question. If it is not, discard it.
+    - Ensure subquestion CANNOT be answered by context. If it can be answered by context, discard it. The generated subquestions should be diverse and not redundant. 
     - Each subquestion must be answerable WITHOUT requiring answers from other generated subquestions. Eliminate dependent subquestions that require answering another generated subquestion first. ONLY keep subquestions that are independently answerable (even if answering all subquestions doesn't directly solve the main question).
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
 - is_answerable: boolean — true if the main question can be answered from the provided context alone; false otherwise
-- subquestions: array of strings, or null — if is_answerable is true, use null or []; if false, list atomic, diverse, non-redundant subquestions
+- subquestions: array of strings, or null — if is_answerable is true, use null or []; if false, list atomic, diverse, non-redundant subquestions that are helpful to advance the reasoning process to answer the main question and cannot be answered by context.
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.

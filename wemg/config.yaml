@@ -7,9 +7,9 @@ llm:
   max_retries: 3
   generation:
     timeout: 300
-    temperature: 0.8
+    temperature: 0.6
     n: 1
-    top_p: 0.8
+    top_p: 0.95
     max_tokens: 32768
     max_input_tokens: 65536
     top_k: 20
@@ -75,6 +75,8 @@ node_generation:
   n_hops: 1
   entity_linking_method: "llm"
   rerank_kb_documents: true
+  triple_pruning_delta: 0.05
+  triple_pruning_top_k: 32
   azure_endpoint: null
   azure_key: null
 

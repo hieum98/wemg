@@ -4,8 +4,9 @@ import pytest
 
 from tests.conftest import requires_llm_credentials
 from tests.helpers.slow_integration_debug import print_slow_integration_output
+from wemg.reasoning import generator as generator_module
 from wemg.llm.roles import AnswerGenerationOutput
-from wemg.reasoning.generator import GenerationResult, merge_logs
+from wemg.reasoning.generator import GenerationResult, NodeGenerator, merge_logs
 from wemg.retrieval.wikidata import WikidataEntity, WikidataProperty, WikiTriple
 
 
@@ -196,3 +197,92 @@ async def test_node_generator_generate_synthesis(wemg_config, live_node_generato
     assert isinstance(result, GenerationResult)
     assert isinstance(result.log_data, dict)
     assert isinstance(result.answers, list)
+
+
+def _make_triples(n: int) -> list[WikiTriple]:
+    rel = WikidataProperty(pid="P1", label="related to", description=None)
+    return [
+        WikiTriple(subject=f"S{i}", relation=rel, object=f"O{i}")
+        for i in range(n)
+    ]
+
+
+def test_stage_a_triple_pruning_delta_and_top_k():
+    triples = _make_triples(4)
+
+    class DummyReranker:
+        def get_scores(self, query, documents, instruction=None):
+            return [0, 1, 2, 3], [0.90, 0.87, 0.84, 0.10]
+
+    ng = NodeGenerator(
+        client=None,
+        retriever=None,
+        wikidata_client=None,
+        working_memory=None,
+        reranker=DummyReranker(),
+        triple_pruning_delta=0.08,
+        triple_pruning_top_k=2,
+    )
+
+    kept = ng._stage_a_prune_triples("q", triples)
+    assert kept == [triples[0], triples[1]]
+
+
+@pytest.mark.asyncio
+async def test_prune_triples_stage_b_runs_on_stage_a_survivors(monkeypatch):
+    triples = _make_triples(4)
+
+    class DummyReranker:
+        def get_scores(self, query, documents, instruction=None):
+            return [0, 1, 2, 3], [0.90, 0.87, 0.84, 0.10]
+
+    ng = NodeGenerator(
+        client=None,
+        retriever=None,
+        wikidata_client=None,
+        working_memory=None,
+        reranker=DummyReranker(),
+        triple_pruning_delta=0.08,
+        triple_pruning_top_k=2,
+    )
+
+    captured = {}
+
+    async def fake_execute_role(**kwargs):
+        captured["inputs"] = kwargs["input_data"]
+        out = type("Out", (), {"keep_indices": [0]})()
+        return [[out]], {"TRIPLE_PRUNER": [("in", "out")]}
+
+    monkeypatch.setattr(generator_module, "execute_role", fake_execute_role)
+
+    kept, log = await ng._prune_triples("q", triples)
+    assert len(captured["inputs"]) == 1
+    assert len(captured["inputs"][0].triples) == 2
+    assert len(kept) == 1
+    assert "TRIPLE_PRUNER" in log
+
+
+@pytest.mark.asyncio
+async def test_prune_triples_without_reranker_uses_all_inputs(monkeypatch):
+    triples = _make_triples(3)
+    ng = NodeGenerator(
+        client=None,
+        retriever=None,
+        wikidata_client=None,
+        working_memory=None,
+        reranker=None,
+    )
+
+    captured = {}
+
+    async def fake_execute_role(**kwargs):
+        captured["inputs"] = kwargs["input_data"]
+        out = type("Out", (), {"keep_indices": [0, 1]})()
+        return [[out]], {"TRIPLE_PRUNER": [("in", "out")]}
+
+    monkeypatch.setattr(generator_module, "execute_role", fake_execute_role)
+
+    kept, log = await ng._prune_triples("q", triples)
+    assert len(captured["inputs"][0].triples) == 3
+    assert len(kept) == 2
+    assert "TRIPLE_PRUNER" in log
