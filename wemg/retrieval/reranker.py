@@ -46,6 +46,19 @@ class Reranker:
         sorted_indices, _, _ = self._client.get_reranking_scores(query, documents, inst)
         return sorted_indices[0] if sorted_indices else 0
 
+    def get_scores(
+        self,
+        query: str,
+        documents: List[str],
+        instruction: Optional[str] = None,
+    ) -> tuple[List[int], List[float]]:
+        """Return reranker order and scores for query-doc pairs."""
+        if not documents or not query:
+            return [], []
+        inst = instruction if instruction is not None else self.instruction
+        sorted_indices, _, scores = self._client.get_reranking_scores(query, documents, inst)
+        return sorted_indices, scores
+
     def close(self) -> None:
         """Close the underlying LLM client."""
         if self._client:

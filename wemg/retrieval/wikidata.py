@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
 from urllib.parse import unquote
 
+from datasets import disable_progress_bars, enable_progress_bars
 import pydantic
 from SPARQLWrapper import SPARQLWrapper, JSON
 
@@ -477,7 +478,7 @@ class WikidataClient:
 
         if not by_url:
             return
-
+        disable_progress_bars()
         # Prefer URL-matched content from the local/wiki dump before web requests.
         dump_matches = self._lookup_wikipedia_dump_contents(set(by_url.keys()))
         for url, content in dump_matches.items():
@@ -486,7 +487,7 @@ class WikidataClient:
             for e in by_url.get(url, []):
                 e.wikipedia_content = content
             by_url.pop(url, None)
-
+        enable_progress_bars()
         if not by_url:
             return
 
@@ -1374,13 +1375,13 @@ class WikidataClient:
         qids_to_enrich = [
             e.qid for e in entities if e and not self._is_entity_enriched(e)
         ]
-        if not qids_to_enrich:
-            return entities
-
-        enriched_map = self._get_entities_batch(
-            list(set(qids_to_enrich)), get_details=get_details,
-        )
-        all_entities = [enriched_map.get(e.qid, e) if e else e for e in entities]
+        if qids_to_enrich:
+            enriched_map = self._get_entities_batch(
+                list(set(qids_to_enrich)), get_details=get_details,
+            )
+        else:
+            enriched_map = {}
+        all_entities = [enriched_map.get(e.qid, e) for e in entities]
         # Fetch Wikipedia content if not already fetched
         if get_details and MEDIAWIKI_AVAILABLE:
             self._fetch_wikipedia_contents_concurrent(all_entities)

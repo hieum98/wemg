@@ -137,6 +137,20 @@ visualize_graph_memory(
 )
 ```
 
+## Profling the evaluation
+
+```bash
+# Load environment variables from .env file
+set -a
+source .env
+set +a
+
+# Run evaluation and profile the execution
+python -m cProfile -o results/profiling/cprofile/profile.prof wemg.evaluation.evaluate \
+    +dataset_name_or_path=<dataset_name_or_path> \
+    +output_path=results/profiling/<dataset_name_or_path>
+```
+
 ## Notes
 
 - `load_question_artifacts(...)` can identify an entry by index or exact question string.

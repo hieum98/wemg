@@ -235,6 +235,8 @@ class WEMGSystem:
             "n_hops": ng.n_hops,
             "entity_linking_method": ng.entity_linking_method,
             "rerank_kb_documents": ng.rerank_kb_documents,
+            "triple_pruning_delta": ng.triple_pruning_delta,
+            "triple_pruning_top_k": ng.triple_pruning_top_k,
             "azure_endpoint": ng.azure_endpoint,
             "azure_key": ng.azure_key,
             "max_crawl_requests_per_second": self.cfg.retriever.web_search.max_crawl_requests_per_second,

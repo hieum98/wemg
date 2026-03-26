@@ -27,7 +27,7 @@ from wemg.llm.roles import SourceType
 logger = logging.getLogger(__name__)
 
 # Max triples per TRIPLE_PRUNER LLM call when pruning large lists.
-_PRUNE_TRIPLES_BATCH_SIZE = 64
+_PRUNE_TRIPLES_BATCH_SIZE = 16
 
 
 @dataclass
@@ -337,14 +337,44 @@ class NodeGenerator:
             all_entities = list(set(all_entities + self._collect_entities_from_triples(triples)))
             link_log = merge_logs(link_log, prune_log)
         return triples, all_entities, link_log
+
+    def _stage_a_prune_triples(self, question: str, triples: List[WikiTriple]) -> List[WikiTriple]:
+        """Stage A: reranker score filtering with delta and top-k cap."""
+        if not triples or not self.reranker:
+            return triples
+
+        triple_docs = [str(t) for t in triples]
+        sorted_indices, scores = self.reranker.get_scores(question, triple_docs)
+        if not sorted_indices or not scores:
+            return triples
+
+        delta = float(self.kwargs.get("triple_pruning_delta", 0.05))
+        top_k = int(self.kwargs.get("triple_pruning_top_k", 64))
+        if top_k <= 0:
+            top_k = len(triples)
+
+        top_score = scores[0]
+        kept_indices = [
+            idx
+            for idx, score in zip(sorted_indices, scores)
+            if score >= (top_score - delta)
+        ]
+        if not kept_indices:
+            kept_indices = [sorted_indices[0]]
+        if len(kept_indices) > top_k:
+            kept_indices = kept_indices[:top_k]
+
+        return [triples[i] for i in kept_indices]
     
     async def _prune_triples(self, question: str, triples: List[WikiTriple]) -> Tuple[List[WikiTriple], Dict]:
-        """Prune triples to keep only question-relevant ones."""
+        """Prune triples with Stage A reranker, then Stage B TRIPLE_PRUNER."""
         if not triples:
             return [], {}
+        stage_a_kept = self._stage_a_prune_triples(question, triples)
+
         chunks = [
-            triples[i : i + _PRUNE_TRIPLES_BATCH_SIZE]
-            for i in range(0, len(triples), _PRUNE_TRIPLES_BATCH_SIZE)
+            stage_a_kept[i : i + _PRUNE_TRIPLES_BATCH_SIZE]
+            for i in range(0, len(stage_a_kept), _PRUNE_TRIPLES_BATCH_SIZE)
         ]
         inputs = [
             TriplePruneInput(question=question, triples=[str(t) for t in chunk])

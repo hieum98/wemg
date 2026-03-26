@@ -111,6 +111,8 @@ class NodeGenerationConfig(BaseModel):
     azure_endpoint: Optional[str] = None
     azure_key: Optional[str] = None
     rerank_kb_documents: bool = True
+    triple_pruning_delta: float = 0.05
+    triple_pruning_top_k: int = 64
 
 
 
