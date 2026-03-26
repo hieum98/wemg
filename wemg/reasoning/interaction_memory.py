@@ -9,7 +9,6 @@ This module contains:
 
 import asyncio
 import logging
-import os
 import threading
 import time
 import uuid
@@ -24,7 +23,6 @@ from openai import OpenAI
 from wemg.utils.text import approximate_token_count
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 
 # =============================================================================

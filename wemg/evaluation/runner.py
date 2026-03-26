@@ -101,6 +101,7 @@ class DatasetEvaluator:
         answer_column: str = "answer",
         max_concurrent: Optional[int] = None,
         log_batch_size: Optional[int] = None,
+        clear_kb_cache_every_n_batches: Optional[int] = 1,
     ) -> Dict:
         """Run evaluation: generate answers + compute metrics.
         
@@ -116,6 +117,9 @@ class DatasetEvaluator:
                 appending to the log. None defaults to the same cap as max_concurrent
                 (min(llm.concurrency, 8)). Smaller values checkpoint more often if the
                 process stops mid-run.
+            clear_kb_cache_every_n_batches: Periodically clear in-process Wikidata
+                triple caches every N processed chunks to bound memory growth.
+                Set to None or <=0 to disable periodic cache clears.
         """
         output_dir = Path(output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -130,7 +134,7 @@ class DatasetEvaluator:
                 for line in f:
                     entry = json.loads(line)
                     completed[entry["question"]] = entry
-            logger.info(f"Resuming: {len(completed)} questions already processed")
+            print(f"Resuming: {len(completed)} questions already processed")
         
         from wemg.evaluation.metrics import compute_sub_em
         
@@ -243,6 +247,13 @@ class DatasetEvaluator:
             else:
                 chunk_size = max(1, cfg_cap)
             total_pending = len(pending)
+            cache_clear_every = (
+                int(clear_kb_cache_every_n_batches)
+                if clear_kb_cache_every_n_batches is not None
+                else 0
+            )
+            if cache_clear_every < 0:
+                cache_clear_every = 0
             for chunk_start in range(0, total_pending, chunk_size):
                 batch = pending[chunk_start : chunk_start + chunk_size]
                 questions = [p[1] for p in batch]
@@ -262,6 +273,27 @@ class DatasetEvaluator:
                 )
                 entries = process_answer_results(batch, results)
                 append_logs(entries)
+
+                # Bound process memory in long-running eval by clearing Wikidata
+                # triple caches periodically between chunks.
+                chunk_index = (chunk_start // chunk_size) + 1
+                if cache_clear_every > 0 and (chunk_index % cache_clear_every == 0):
+                    wikidata_client = getattr(self.system, "wikidata_client", None)
+                    if wikidata_client is not None and hasattr(
+                        wikidata_client, "clear_triple_caches"
+                    ):
+                        try:
+                            wikidata_client.clear_triple_caches()
+                            logger.info(
+                                "Cleared Wikidata triple caches after chunk %d",
+                                chunk_index,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to clear Wikidata triple caches at chunk %d: %s",
+                                chunk_index,
+                                e,
+                            )
         
         # Compute Acc scores in batch (async concurrent)
         acc_task_rows: List[tuple] = []

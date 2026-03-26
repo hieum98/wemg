@@ -1,11 +1,9 @@
 import json
 import logging
-import os
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 try:
     import redis

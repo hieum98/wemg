@@ -8,7 +8,6 @@ This module contains:
 import asyncio
 import copy
 import logging
-import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -27,7 +26,6 @@ from wemg.retrieval.wikidata import (
 from .interaction_memory import InteractionMemory, log_to_interaction_memory
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 
 # =============================================================================

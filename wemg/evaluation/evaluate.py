@@ -29,6 +29,7 @@ EVAL_OVERRIDE_KEYS = frozenset(
         "answer_column",
         "max_concurrent",
         "log_batch_size",
+        "clear_kb_cache_every_n_batches",
         "score_only",
         "prediction_column",
     }
@@ -81,7 +82,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         nargs="*",
         help=(
             "Overrides: evaluation keys (dataset_name_or_path, output_path, resume, max_examples, "
-            "shuffle, question_column, answer_column, max_concurrent, log_batch_size, score_only, "
+            "shuffle, question_column, answer_column, max_concurrent, log_batch_size, "
+            "clear_kb_cache_every_n_batches, score_only, "
             "prediction_column) plus WEMG config keys (e.g. llm.model_name=..., search.strategy=mcts). "
             "Hydra-style +prefix on keys is ignored."
         ),
@@ -119,6 +121,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             log_batch_size = int(log_batch_size)
         except (TypeError, ValueError):
             log_batch_size = None
+    clear_kb_cache_every_n_batches = eval_params.get("clear_kb_cache_every_n_batches")
+    if (
+        clear_kb_cache_every_n_batches is not None
+        and not isinstance(clear_kb_cache_every_n_batches, int)
+    ):
+        try:
+            clear_kb_cache_every_n_batches = int(clear_kb_cache_every_n_batches)
+        except (TypeError, ValueError):
+            clear_kb_cache_every_n_batches = None
     score_only = eval_params.get("score_only", False)
     if not isinstance(score_only, bool):
         score_only = bool(score_only)
@@ -158,6 +169,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 answer_column=str(answer_column),
                 max_concurrent=max_concurrent,
                 log_batch_size=log_batch_size,
+                clear_kb_cache_every_n_batches=clear_kb_cache_every_n_batches,
             )
         print("Done. Metrics:", metrics)
         return 0

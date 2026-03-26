@@ -7,7 +7,6 @@ open_ie.py, pruner.py, and base_role_execution.py.
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -18,7 +17,6 @@ from wemg.llm.parsing import extract_info_from_text, extraction_type_from_annota
 from wemg.retrieval.wikidata import WikidataEntity
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("LOGGING_LEVEL", "INFO"))
 
 
 # =============================================================================
@@ -358,31 +356,43 @@ class TriplePruneOutput(pydantic.BaseModel):
 # System Prompts -- Generator
 # =============================================================================
 
-GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant specializing in multi-hop question answering and reasoning decomposition. Your task is to analyze whether a main question can be answered with the provided context, and if not, generate strategic subquestions that advance the reasoning process to answer the main question. Your subquestions must be self-contained, atomic and diverse.
+GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant for multi-hop question answering and reasoning decomposition. Your job is to decide whether the main question can already be answered from the provided context. If it cannot, generate a small set of strategic subquestions that help advance the reasoning process to answer the main question. 
 
-## Core Principle: The generated subquestion must NOT be answerable using the provided context and must be self-contained, atomic and diverse.
+## Core Principle
+Every generated subquestion must:
+- target a real knowledge gap needed to answer the main question
+- NOT be answerable from the provided context
+- be atomic, self-contained, and understandable on its own
+- be diverse and non-redundant
+- be independently answerable, without requiring answers to other generated subquestions
 
-## Instructions:
-1. Analyze the Main Question: Identify core intent, key entities, and required information.
-2. Map Context to Requirements: Check if context contains all required facts.
-3. Decision Point:
-   - If YES (Sufficient): No subquestion needed.
-   - If NO (Insufficient): Proceed to generate subquestion.
-4. Identify the knowledge gaps that are lacking in the context and the subquestions that can answer these knowledge gaps.
-5. For Each Subquestion:
-   a. Target a distinct knowledge gap lacking in the context, this knowledge gap when answered will advance the reasoning process to answer the main question.
-   b. Don't ask the trivial questions that can be answered by context or easy to answer by general knowledge. If the question is truely trivial and you are sure 100 percent about the answer, generate answer after the subquestion (and consider this subquestion-answer pair as a single subquestion).
-   c. Formulate an atomic, relevant, self-contained subquestion. Make sure each subquestion is fully understandable on its own without needing to refer back to the original question or context.
-   d. VALIDATE: 
-    - Remember that your responsibility is to generate subquestions, DON'T GUESS OR INVENT ANSWERS that you are not sure about. If the sub-question is truely trivial and you are sure 100 percent about the answer, generate answer after the subquestion (and consider this subquestion-answer pair as a single subquestion).
-    - Ensure subquestion is helpful to advance the reasoning process to answer the main question. If it is not, discard it.
-    - Ensure subquestion CANNOT be answered by context. If it can be answered by context, discard it. The generated subquestions should be diverse and not redundant. 
-    - Each subquestion must be answerable WITHOUT requiring answers from other generated subquestions. Eliminate dependent subquestions that require answering another generated subquestion first. ONLY keep subquestions that are independently answerable (even if answering all subquestions doesn't directly solve the main question).
+## Instructions
+1. Analyze the main question:
+   - Identify the core intent, key entities, constraints, and the information required to answer it.
+2. Check the context:
+   - Determine whether the context already contains enough information to answer the main question.
+3. Make the decision:
+   - If the context is sufficient, set `is_answerable` to true and do not generate subquestions.
+   - If the context is insufficient, set `is_answerable` to false and generate subquestions.
+4. Identify the missing knowledge:
+   - Focus only on gaps that would meaningfully advance the reasoning process toward answering the main question.
+5. Generate candidate subquestions:
+   - Each subquestion should target one distinct missing fact or inference step.
+   - Each subquestion must be fully self-contained and should not rely on the wording of the main question or the other subquestions to be understood.
+   - Avoid trivial questions that are already answered by the context or are obvious general knowledge.
+   - If a subquestion is truly trivial and you are completely certain of the answer, you may include the answer directly after the subquestion and treat that subquestion-answer pair as one item.
+6. Validate and filter:
+   - Do not guess or invent uncertain answers.
+   - Remove any subquestion that is answerable from the context.
+   - Remove any subquestion that is not useful for progressing toward the main question.
+   - Remove duplicates, overlaps, and low-value variants.
+   - Remove any dependent subquestion that requires another generated subquestion to be answered first.
+   - If more than 3 good subquestions remain, keep only the 3 most useful ones.
 
-## Output Format:
+## Output Format
 Respond with a JSON object with exactly these keys:
 - is_answerable: boolean — true if the main question can be answered from the provided context alone; false otherwise
-- subquestions: array of strings, or null — if is_answerable is true, use null or []; if false, list atomic, diverse, non-redundant subquestions that are helpful to advance the reasoning process to answer the main question and cannot be answered by context.
+- subquestions: array of strings, or null — if `is_answerable` is true, use null or []; if false, provide up to 3 atomic, diverse, non-redundant subquestions that help answer the main question and cannot be answered from the context
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.

@@ -2,6 +2,7 @@
 k-hop triple traversal, and path finding."""
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -9,13 +10,14 @@ import random
 import re
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
 from urllib.parse import unquote
 
-from datasets import disable_progress_bars, enable_progress_bars
+from datasets import disable_progress_bars
 import pydantic
+import requests
 from SPARQLWrapper import SPARQLWrapper, JSON
 
 logger = logging.getLogger(__name__)
@@ -30,18 +32,16 @@ try:
 except ImportError:
     WIKIBASE_AVAILABLE = False
 
-try:
-    from mediawikiapi import MediaWikiAPI
-    MEDIAWIKI_AVAILABLE = True
-except ImportError:
-    MEDIAWIKI_AVAILABLE = False
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+WIKIPEDIA_API_BATCH_SIZE = 50
+WIKIPEDIA_API_TIMEOUT_SECONDS = 20
 
 # Rate limit for Wikipedia page fetches (same default as web crawl to avoid destination rate limits).
 DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND = 10
 _wiki_rate_lock = threading.Lock()
 _wiki_last_request_time: List[float] = [0.0]
 WIKIPEDIA_DUMP_DATASET = "Hieuman/wiki23-processed"
-
+disable_progress_bars()
 
 def _wikipedia_rate_limit(max_requests_per_second: float) -> None:
     """Wait if needed so the next Wikipedia request does not exceed the given rate."""
@@ -360,6 +360,7 @@ class WikidataClient:
         properties: Optional[List[str]] = None,
         property_labels: Optional[Dict[str, Dict[str, str]]] = None,
         max_wikipedia_requests_per_second: Optional[float] = None,
+        triple_cache_max_entries: int = 5000,
     ):
         self.properties = properties or list(DEFAULT_PROPERTIES)
         self.property_labels = dict(property_labels or PROPERTY_LABELS)
@@ -368,11 +369,12 @@ class WikidataClient:
             if max_wikipedia_requests_per_second is not None
             else DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND
         )
+        self._triple_cache_max_entries = max(1, int(triple_cache_max_entries))
         self._semaphore = threading.Semaphore(10)
         self._cache_lock = threading.Lock()
         # Raw 1-hop triples per QID (pre-enrichment); shared across k-hop and find_path.
-        self._outgoing_triples_cache: Dict[str, List[WikiTriple]] = {}
-        self._bidirectional_triples_cache: Dict[str, List[WikiTriple]] = {}
+        self._outgoing_triples_cache: "OrderedDict[str, List[WikiTriple]]" = OrderedDict()
+        self._bidirectional_triples_cache: "OrderedDict[str, List[WikiTriple]]" = OrderedDict()
         self._wikipedia_dump_dataset = self._load_wikipedia_dump_dataset()
         self._wikibase_client = None
         if WIKIBASE_AVAILABLE:
@@ -382,6 +384,34 @@ class WikidataClient:
                 )
             except Exception:
                 pass
+
+    def _lru_get(
+        self,
+        cache: "OrderedDict[str, List[WikiTriple]]",
+        key: str,
+    ) -> Optional[List[WikiTriple]]:
+        value = cache.get(key)
+        if value is None:
+            return None
+        cache.move_to_end(key)
+        return value
+
+    def _lru_set(
+        self,
+        cache: "OrderedDict[str, List[WikiTriple]]",
+        key: str,
+        value: List[WikiTriple],
+    ) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self._triple_cache_max_entries:
+            cache.popitem(last=False)
+
+    def clear_triple_caches(self) -> None:
+        """Clear in-process Wikidata triple caches."""
+        with self._cache_lock:
+            self._outgoing_triples_cache.clear()
+            self._bidirectional_triples_cache.clear()
 
     # ------------------------------------------------------------------
     # SPARQL execution
@@ -466,7 +496,7 @@ class WikidataClient:
         Uses the global `_wikipedia_rate_limit` gate to respect the configured
         max RPS while allowing network I/O to overlap across requests.
         """
-        if not (MEDIAWIKI_AVAILABLE and entities):
+        if not entities:
             return
 
         # Only fetch missing content, and de-duplicate by URL/title.
@@ -478,7 +508,6 @@ class WikidataClient:
 
         if not by_url:
             return
-        disable_progress_bars()
         # Prefer URL-matched content from the local/wiki dump before web requests.
         dump_matches = self._lookup_wikipedia_dump_contents(set(by_url.keys()))
         for url, content in dump_matches.items():
@@ -487,7 +516,6 @@ class WikidataClient:
             for e in by_url.get(url, []):
                 e.wikipedia_content = content
             by_url.pop(url, None)
-        enable_progress_bars()
         if not by_url:
             return
 
@@ -495,33 +523,85 @@ class WikidataClient:
         if max_workers is None:
             max_workers = min(16, max(4, int(self._max_wikipedia_rps or 1)))
 
-        wiki_local = threading.local()
+        session_local = threading.local()
 
-        def _get_wiki() -> "MediaWikiAPI":
-            wiki = getattr(wiki_local, "wiki", None)
-            if wiki is None:
-                wiki = MediaWikiAPI()
-                setattr(wiki_local, "wiki", wiki)
-            return wiki
+        canonical_to_raw: Dict[str, List[str]] = defaultdict(list)
+        title_to_canonical: Dict[str, str] = {}
+        for raw_url in by_url:
+            canonical_url = self._canonicalize_wikipedia_url(raw_url)
+            if not canonical_url:
+                continue
+            title = self._extract_wikipedia_title(canonical_url)
+            if not title:
+                continue
+            canonical_to_raw[canonical_url].append(raw_url)
+            title_to_canonical[title] = canonical_url
 
-        def _fetch_one(url: str) -> Tuple[str, Optional[str]]:
+        if not title_to_canonical:
+            return
+
+        def _get_session() -> requests.Session:
+            session = getattr(session_local, "session", None)
+            if session is None:
+                session = requests.Session()
+                session.headers.update(
+                    {
+                        "User-Agent": (
+                            "wemg/1.0 (batched Wikipedia content fetch; "
+                            "https://en.wikipedia.org/)"
+                        ),
+                    }
+                )
+                setattr(session_local, "session", session)
+            return session
+
+        def _fetch_batch(titles: List[str]) -> Dict[str, Optional[str]]:
             try:
                 _wikipedia_rate_limit(self._max_wikipedia_rps)
-                title = url.split("/wiki/")[-1]
-                page = _get_wiki().page(title)
-                return url, getattr(page, "content", None)
+                response = _get_session().get(
+                    WIKIPEDIA_API_URL,
+                    params={
+                        "action": "query",
+                        "prop": "revisions",
+                        "titles": "|".join(titles),
+                        "redirects": 1,
+                        "rvprop": "content",
+                        "rvslots": "main",
+                        "format": "json",
+                        "formatversion": 2,
+                    },
+                    timeout=WIKIPEDIA_API_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                return self._parse_wikipedia_revisions_response(
+                    requested_titles=titles,
+                    payload=response.json(),
+                )
             except Exception as e:
-                logger.warning(f"Failed to fetch Wikipedia content for {url}: {e}")
-                return url, None
+                logger.warning(
+                    "Failed to fetch Wikipedia content batch for %s: %s",
+                    titles,
+                    e,
+                )
+                return {title: None for title in titles}
 
+        titles_to_fetch = list(title_to_canonical.keys())
+        title_batches = [
+            titles_to_fetch[i:i + WIKIPEDIA_API_BATCH_SIZE]
+            for i in range(0, len(titles_to_fetch), WIKIPEDIA_API_BATCH_SIZE)
+        ]
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_fetch_one, url) for url in by_url.keys()]
+            futures = [ex.submit(_fetch_batch, batch) for batch in title_batches]
             for fut in as_completed(futures):
-                url, content = fut.result()
-                if not content:
-                    continue
-                for e in by_url.get(url, []):
-                    e.wikipedia_content = content
+                for title, content in fut.result().items():
+                    if not content:
+                        continue
+                    canonical_url = title_to_canonical.get(title)
+                    if not canonical_url:
+                        continue
+                    for raw_url in canonical_to_raw.get(canonical_url, []):
+                        for e in by_url.get(raw_url, []):
+                            e.wikipedia_content = content
 
     @staticmethod
     def _canonicalize_wikipedia_url(url: str) -> Optional[str]:
@@ -537,6 +617,102 @@ class WikidataClient:
         if not title:
             return None
         return f"https://en.wikipedia.org/wiki/{title}"
+
+    @staticmethod
+    def _extract_wikipedia_title(url: str) -> Optional[str]:
+        canonical = WikidataClient._canonicalize_wikipedia_url(url)
+        if not canonical:
+            return None
+        return canonical.split("/wiki/", 1)[-1]
+
+    @staticmethod
+    def _normalize_wikipedia_title(title: Optional[str]) -> Optional[str]:
+        if not isinstance(title, str):
+            return None
+        value = unquote(title).strip().replace(" ", "_")
+        return value or None
+
+    @classmethod
+    def _parse_wikipedia_revisions_response(
+        cls,
+        *,
+        requested_titles: List[str],
+        payload: Dict[str, Any],
+    ) -> Dict[str, Optional[str]]:
+        query = payload.get("query") or {}
+
+        normalized_rows = query.get("normalized") or []
+        redirect_rows = query.get("redirects") or []
+        page_rows = query.get("pages") or []
+
+        normalized_map = {
+            cls._normalize_wikipedia_title(row.get("from")): cls._normalize_wikipedia_title(row.get("to"))
+            for row in normalized_rows
+            if cls._normalize_wikipedia_title(row.get("from"))
+            and cls._normalize_wikipedia_title(row.get("to"))
+        }
+        redirect_map = {
+            cls._normalize_wikipedia_title(row.get("from")): cls._normalize_wikipedia_title(row.get("to"))
+            for row in redirect_rows
+            if cls._normalize_wikipedia_title(row.get("from"))
+            and cls._normalize_wikipedia_title(row.get("to"))
+        }
+        page_texts: Dict[str, Optional[str]] = {}
+        for page in page_rows:
+            normalized_title = cls._normalize_wikipedia_title(page.get("title"))
+            if not normalized_title or page.get("missing"):
+                continue
+            revisions = page.get("revisions") or []
+            slots = (revisions[0].get("slots") or {}) if revisions else {}
+            main_slot = slots.get("main") or {}
+            raw_content = (
+                main_slot.get("content")
+                or main_slot.get("*")
+                or (revisions[0].get("*") if revisions else None)
+            )
+            page_texts[normalized_title] = cls._clean_wikipedia_wikitext(raw_content)
+
+        results: Dict[str, Optional[str]] = {}
+        for requested in requested_titles:
+            normalized = cls._normalize_wikipedia_title(requested)
+            if not normalized:
+                continue
+            resolved = redirect_map.get(normalized_map.get(normalized, normalized), normalized_map.get(normalized, normalized))
+            results[requested] = page_texts.get(resolved)
+        return results
+
+    @staticmethod
+    def _clean_wikipedia_wikitext(text: Optional[str]) -> Optional[str]:
+        if not isinstance(text, str):
+            return None
+
+        cleaned = text
+        cleaned = re.sub(r"<!--.*?-->", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"<ref[^>/]*?>.*?</ref>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<ref[^>]*/>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\{\|.*?\|\}", "", cleaned, flags=re.DOTALL)
+
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            cleaned = re.sub(r"\{\{[^{}]*\}\}", "", cleaned, flags=re.DOTALL)
+
+        cleaned = re.sub(r"\[\[(?:File|Image|Category):[^\]]+\]\]", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\[https?://[^\s\]]+\s+([^\]]+)\]", r"\1", cleaned)
+        cleaned = re.sub(r"\[https?://[^\]]+\]", "", cleaned)
+        cleaned = re.sub(r"\[\[[^\]|]+\|([^\]]+)\]\]", r"\1", cleaned)
+        cleaned = re.sub(r"\[\[([^\]|]+)\]\]", lambda m: m.group(1).split("#", 1)[0], cleaned)
+        cleaned = re.sub(r"={2,}\s*(.*?)\s*={2,}", r"\n\1\n", cleaned)
+        cleaned = re.sub(r"'{2,}", "", cleaned)
+        cleaned = re.sub(r"<[^>]+>", "", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = cleaned.replace("&nbsp;", " ")
+        cleaned = re.sub(r"^[|!].*$", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"\n[ \t]*\n+", "\n\n", cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r" ?\n ?", "\n", cleaned)
+        cleaned = cleaned.strip()
+        return cleaned or None
 
     @staticmethod
     def _load_wikipedia_dump_dataset():
@@ -763,7 +939,7 @@ class WikidataClient:
                         wikipedia_url=wikipedia_url,
                     )
 
-        if get_details and MEDIAWIKI_AVAILABLE:
+        if get_details:
             self._fetch_wikipedia_contents_concurrent(list(entity_map.values()))
 
         return entity_map
@@ -1036,29 +1212,32 @@ class WikidataClient:
 
     def _get_outgoing_triples(self, qid: str) -> List[WikiTriple]:
         with self._cache_lock:
-            if qid in self._outgoing_triples_cache:
-                return list(self._outgoing_triples_cache[qid])
+            cached = self._lru_get(self._outgoing_triples_cache, qid)
+            if cached is not None:
+                return list(cached)
         triples = self._fetch_outgoing_triples_uncached(qid)
         with self._cache_lock:
-            self._outgoing_triples_cache[qid] = triples
+            self._lru_set(self._outgoing_triples_cache, qid, triples)
         return list(triples)
 
     def _get_bidirectional_triples(self, qid: str) -> List[WikiTriple]:
         with self._cache_lock:
-            if qid in self._bidirectional_triples_cache:
-                return list(self._bidirectional_triples_cache[qid])
-            if qid in self._outgoing_triples_cache:
-                outgoing = list(self._outgoing_triples_cache[qid])
+            cached_bidirectional = self._lru_get(self._bidirectional_triples_cache, qid)
+            if cached_bidirectional is not None:
+                return list(cached_bidirectional)
+            cached_outgoing = self._lru_get(self._outgoing_triples_cache, qid)
+            if cached_outgoing is not None:
+                outgoing = list(cached_outgoing)
             else:
                 outgoing = None
         if outgoing is None:
             outgoing = self._fetch_outgoing_triples_uncached(qid)
             with self._cache_lock:
-                self._outgoing_triples_cache[qid] = outgoing
+                self._lru_set(self._outgoing_triples_cache, qid, outgoing)
         incoming = self._fetch_incoming_triples_uncached(qid)
         triples = self._deduplicate_triples(outgoing + incoming)
         with self._cache_lock:
-            self._bidirectional_triples_cache[qid] = triples
+            self._lru_set(self._bidirectional_triples_cache, qid, triples)
         return list(triples)
 
     def _fetch_outgoing_batch_uncached(self, qids: List[str]) -> Dict[str, List[WikiTriple]]:
@@ -1143,8 +1322,8 @@ class WikidataClient:
             inc_list = in_by_seed.get(s, []) if bidirectional else []
             bid_list = self._deduplicate_triples(out_list + inc_list)
             with self._cache_lock:
-                self._outgoing_triples_cache[s] = list(out_list)
-                self._bidirectional_triples_cache[s] = bid_list
+                self._lru_set(self._outgoing_triples_cache, s, list(out_list))
+                self._lru_set(self._bidirectional_triples_cache, s, bid_list)
 
         merged: List[WikiTriple] = []
         for s in unique_seeds:
@@ -1383,7 +1562,7 @@ class WikidataClient:
             enriched_map = {}
         all_entities = [enriched_map.get(e.qid, e) for e in entities]
         # Fetch Wikipedia content if not already fetched
-        if get_details and MEDIAWIKI_AVAILABLE:
+        if get_details:
             self._fetch_wikipedia_contents_concurrent(all_entities)
 
         return all_entities

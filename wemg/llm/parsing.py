@@ -5,7 +5,6 @@ import types
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union, get_args, get_origin
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 def extraction_type_from_annotation(annotation: Any) -> tuple[str, bool]:

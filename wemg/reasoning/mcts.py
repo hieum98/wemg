@@ -53,10 +53,10 @@ def expand(node: MCTSNode, generator: NodeGenerator, is_cot_simulation: bool = F
     
     strategies = {
         NodeType.USER_QUESTION: [_generate_final_answer_nodes, _generate_subqa_nodes],
-        NodeType.SUB_QA_NODE: [_generate_subqa_nodes, _self_correct_nodes, _rephrase_nodes, _strengthen_nodes],
-        NodeType.REPHRASED_QUESTION_NODE: [_generate_subqa_nodes],
-        NodeType.SELF_CORRECTED_NODE: [_generate_subqa_nodes, _strengthen_nodes],
-        NodeType.SYNTHESIS_NODE: [_generate_subqa_nodes],
+        NodeType.SUB_QA_NODE: [_generate_subqa_nodes, _self_correct_nodes], # _rephrase_nodes, _strengthen_nodes
+        # NodeType.REPHRASED_QUESTION_NODE: [_generate_subqa_nodes],
+        NodeType.SELF_CORRECTED_NODE: [_generate_subqa_nodes], # _strengthen_nodes
+        # NodeType.SYNTHESIS_NODE: [_generate_subqa_nodes],
     }
     
     gens = strategies.get(node.node_type, [])

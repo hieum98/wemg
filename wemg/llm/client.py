@@ -43,7 +43,7 @@ class LLMClient:
         self.timeout = generation_kwargs.get("timeout", 300)
         self.temperature = generation_kwargs.get("temperature", 0.7)
         self.num_samples = generation_kwargs.get("n", 1)
-        self.top_p = generation_kwargs.get("top_p", 0.8)
+        self.top_p = generation_kwargs.get("top_p", 0.95)
         self.max_tokens = generation_kwargs.get("max_tokens", 8192)
         self.max_input_tokens = generation_kwargs.get("max_input_tokens", 32768)
         self.top_k = generation_kwargs.get("top_k", 20)

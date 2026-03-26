@@ -249,10 +249,7 @@ class WEMGSystem:
         Wikipedia/Wikidata rate limiting and connection pooling are coordinated
         at the process level.
         """
-        max_rps: Optional[float] = None
-        # When using web search, reuse the same crawl rate for Wikipedia fetches.
-        if self.cfg.retriever.type == "web_search":
-            max_rps = self.cfg.retriever.web_search.max_crawl_requests_per_second
+        max_rps: Optional[float] = self.cfg.retriever.web_search.max_crawl_requests_per_second
         return WikidataClient(max_wikipedia_requests_per_second=max_rps)
     
     def answer(self, question: str, question_id: str = None, golden_answer: Optional[str] = None) -> AnswerResult:
