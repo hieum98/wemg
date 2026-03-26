@@ -313,7 +313,7 @@ class WEMGSystem:
         if self.cfg.output.show_search_tree:
             root.print_tree()
         
-        full_answer, concise_answer = get_answer(root, self.client, interaction_memory)
+        full_answer, concise_answer = get_answer(root, self.client, interaction_memory, working_memory=working_memory)
         return AnswerResult(
             question=question, answer=full_answer, concise_answer=concise_answer,
             search_tree=root if self.cfg.output.include_reasoning else None,

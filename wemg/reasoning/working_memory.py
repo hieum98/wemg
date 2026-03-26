@@ -496,8 +496,8 @@ class WorkingMemory:
         self.graph_memory = nx.DiGraph()
         for triple in enhanced_triples:
             self.add_edge_to_graph_memory(triple)
-        # # Connect the graph memory
-        # self.connect_graph_memory()
+        # Connect the graph memory
+        self.connect_graph_memory()
 
     # -----------------------------------------------------------------
     # Memory Synchronization
@@ -515,7 +515,6 @@ class WorkingMemory:
         from wemg.utils.graph import textualize_graph
 
         if self.graph_memory.number_of_nodes() > 0:
-            self.consolidate_graph_memory(client, question, interaction_memory)
             for comp in nx.weakly_connected_components(self.graph_memory):
                 triples, _ = textualize_graph(comp, self.graph_memory, method="dfs")
                 for triple in triples:
@@ -548,7 +547,7 @@ class WorkingMemory:
             enhanced_triples = self._enhance_triples(triples)
             for triple in enhanced_triples:
                 self.add_edge_to_graph_memory(triple)
-            # self.connect_graph_memory() 
+            self.consolidate_graph_memory(client, question, interaction_memory)
 
 __all__ = [
     "parse_graph_from_text",

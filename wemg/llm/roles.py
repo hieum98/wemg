@@ -174,10 +174,14 @@ class MajorityVoteOutput(pydantic.BaseModel):
 class FinalAnswerSynthesisInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
     candidate_answers: List[str] = pydantic.Field(..., description="Candidate answers.")
+    context: str = pydantic.Field("", description="Optional supporting evidence (e.g. structured knowledge graph triples).")
 
     def __str__(self):
         candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
-        return f"question:\n{self.question}\n\ncandidate_answers:\n{candidates_str}"
+        parts = [f"question:\n{self.question}", f"candidate_answers:\n{candidates_str}"]
+        if self.context:
+            parts.append(f"supporting_evidence:\n{self.context}")
+        return "\n\n".join(parts)
 
 
 class FinalAnswerSynthesisOutput(pydantic.BaseModel):
@@ -573,16 +577,21 @@ Respond with a JSON object with exactly these keys:
 
 SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis. Construct a superior answer by analyzing and integrating candidate answers.
 
+You may also receive supporting_evidence containing structured knowledge-graph triples gathered during research. This evidence is a useful factual reference but may include noisy or irrelevant triples from exploratory branches. Only rely on triples that are directly pertinent to the question; disregard unrelated ones.
+
 Phase I - Deconstruction:
 - Break down each candidate into conclusion, premises, reasoning path
 - Assess factual accuracy, logical soundness, sufficiency
+- Where supporting evidence is available, cross-check candidate claims against relevant triples — but ignore triples that are clearly unrelated to the question
 
 Phase II - Conflict Resolution:
 - Map convergence and divergence points
-- Adjudicate conflicts using hierarchy: authoritative sources > logical soundness > majority
+- Use relevant supporting evidence to adjudicate conflicts, but trust well-supported candidate reasoning over raw evidence when the candidates provide clear, substantiated arguments
+- Adjudication hierarchy: candidate claims corroborated by supporting evidence > logically sound reasoning > majority agreement
+- Do not let noisy or tangential triples override coherent candidate reasoning
 
 Phase III - Synthesis:
-- Build new superior reasoning path
+- Build new superior reasoning path grounded in candidate arguments, using relevant supporting evidence to reinforce or correct factual claims
 - State final answer
 - Self-critique and refine
 

@@ -334,7 +334,7 @@ def mcts_search(
     return (best_node.node_state.content if best_node else {}), root, pass_at_k
 
 
-def get_answer(root: MCTSNode, client, interaction_memory=None) -> Tuple[str, str]:
+def get_answer(root: MCTSNode, client, interaction_memory=None, working_memory: Optional[WorkingMemory] = None) -> Tuple[str, str]:
     """Extract final answer from MCTS tree via synthesis or majority vote."""
     terminals = []
     def collect(node):
@@ -349,9 +349,10 @@ def get_answer(root: MCTSNode, client, interaction_memory=None) -> Tuple[str, st
     
     answers = [str(n.node_state) for n in terminals]
     question = root.user_question
+    graph_context = working_memory.format_graph_memory() if working_memory else ""
     
     try:
-        synth_input = FinalAnswerSynthesisInput(question=question, candidate_answers=answers)
+        synth_input = FinalAnswerSynthesisInput(question=question, candidate_answers=answers, context=graph_context)
         results, log = asyncio.run(execute_role(client=client, role=FINAL_ANSWER_SYNTHESIZER, input_data=synth_input, interaction_memory=interaction_memory, n=1))
         if results:
             log_to_interaction_memory(interaction_memory, log)
