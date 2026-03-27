@@ -44,6 +44,7 @@ def test_wemg_system_answer_mcts_smoke(wemg_config_path, wemg_config, smoke_syst
     system = WEMGSystem(config_path=wemg_config_path, config_overrides=overrides)
     try:
         result = system.answer(_MULTIHOP_MCTS_SMOKE_QUESTION, question_id="pytest_mcts")
+        breakpoint()
         print("\n--- MCTS search tree ---")
         if result.search_tree is not None:
             result.search_tree.print_tree()
@@ -72,6 +73,7 @@ def test_wemg_system_answer_cot_smoke(wemg_config_path, wemg_config, smoke_syste
     system = WEMGSystem(config_path=wemg_config_path, config_overrides=overrides)
     try:
         result = system.answer(_MULTIHOP_COT_SMOKE_QUESTION, question_id="pytest_cot")
+        breakpoint()
         print("\n--- CoT reasoning tree ---")
         if result.search_tree is not None:
             result.search_tree.print_tree()

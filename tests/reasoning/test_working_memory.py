@@ -5,8 +5,18 @@ import pytest
 from tests.conftest import requires_llm_credentials
 from tests.helpers.slow_integration_debug import print_slow_integration_output
 from wemg.llm.roles import SourceType
-from wemg.reasoning.working_memory import WorkingMemory, parse_graph_from_text
+from wemg.reasoning.working_memory import (
+    GlobalKnowledge,
+    MemoryDelta,
+    WorkingMemory,
+    parse_graph_from_text,
+)
 from wemg.retrieval.wikidata import WikidataEntity, WikidataProperty, WikiTriple
+
+
+# =====================================================================
+# Existing unit tests (updated for new API)
+# =====================================================================
 
 
 def test_format_memory_item_and_dedup_textual():
@@ -96,16 +106,17 @@ def test_consolidate_textual_memory_real(wemg_config, live_llm_client, live_wiki
 @pytest.mark.requires_llm
 @pytest.mark.requires_wikidata
 @pytest.mark.slow_integration
-def test_consolidate_graph_memory_real(wemg_config, live_llm_client, live_wikidata_client):
+def test_deduplicate_graph_memory_real(wemg_config, live_llm_client, live_wikidata_client):
+    """Replaced test_consolidate_graph_memory_real — now tests structural dedup."""
     requires_llm_credentials(wemg_config)
     wm = WorkingMemory(max_textual_memory_tokens=2048, wikidata_client=live_wikidata_client)
     berlin = WikidataEntity(qid="Q64", label="Berlin", description="city")
     germany = WikidataEntity(qid="Q183", label="Germany", description="country")
     prop = WikidataProperty(pid="P1376", label="capital of", description=None)
     wm.add_edge_to_graph_memory(WikiTriple(subject=berlin, relation=prop, object=germany))
-    wm.consolidate_graph_memory(live_llm_client, "How is Berlin related to Germany?")
+    wm.deduplicate_graph()
     print_slow_integration_output(
-        "test_consolidate_graph_memory_real",
+        "test_deduplicate_graph_memory_real",
         working_memory_after=wm,
     )
     assert wm.graph_memory.number_of_nodes() >= 0
@@ -114,15 +125,184 @@ def test_consolidate_graph_memory_real(wemg_config, live_llm_client, live_wikida
 @pytest.mark.requires_llm
 @pytest.mark.slow_integration
 def test_synchronize_memory_real(wemg_config, live_llm_client, live_wikidata_client):
+    """Tests the new one-directional synchronize_memory (text -> graph only)."""
     requires_llm_credentials(wemg_config)
-    wm = WorkingMemory(max_textual_memory_tokens=2048, wikidata_client=live_wikidata_client)
-    berlin = WikidataEntity(qid="Q64", label="Berlin", description="city")
-    germany = WikidataEntity(qid="Q183", label="Germany", description="country")
-    prop = WikidataProperty(pid="P1376", label="capital of", description=None)
-    wm.add_edge_to_graph_memory(WikiTriple(subject=berlin, relation=prop, object=germany))
+    wm = WorkingMemory(
+        max_textual_memory_tokens=2048, wikidata_client=live_wikidata_client,
+        sync_text_threshold=1,
+    )
+    wm.add_textual_memory("Berlin is the capital of Germany.", source=SourceType.RETRIEVAL)
     wm.synchronize_memory(live_llm_client, "What is the capital of Germany?")
     print_slow_integration_output(
         "test_synchronize_memory_real",
         working_memory_after=wm,
     )
     assert wm.graph_memory.number_of_nodes() >= 0
+
+
+# =====================================================================
+# New unit tests for redesigned features
+# =====================================================================
+
+
+def test_snapshot_isolates_local_state():
+    """Mutations on a snapshot must not leak back to the original."""
+    wm = WorkingMemory(wikidata_client=None)
+    wm.add_textual_memory("fact A", source=SourceType.RETRIEVAL)
+    snap = wm.snapshot()
+
+    snap.add_textual_memory("fact B", source=SourceType.RETRIEVAL)
+    snap.add_node_to_graph_memory(WikidataEntity(qid="Q1", label="E1", description="d"))
+
+    assert len(wm.textual_memory) == 1
+    assert wm.graph_memory.number_of_nodes() == 0
+    assert len(snap.textual_memory) == 2
+    assert snap.graph_memory.number_of_nodes() == 1
+
+
+def test_snapshot_shares_global_knowledge():
+    """Snapshot and original should reference the same GlobalKnowledge."""
+    gk = GlobalKnowledge()
+    gk.confirmed_facts.append("global fact")
+    wm = WorkingMemory(wikidata_client=None, global_knowledge=gk)
+    snap = wm.snapshot()
+    assert snap.global_knowledge is gk
+
+
+def test_get_delta_captures_additions():
+    """get_delta returns text and entities added since snapshot creation."""
+    wm = WorkingMemory(wikidata_client=None)
+    wm.add_textual_memory("pre-existing", source=SourceType.RETRIEVAL)
+    snap = wm.snapshot()
+
+    snap.add_textual_memory("new fact", source=SourceType.RETRIEVAL)
+    snap.entity_dict["Q999"] = WikidataEntity(qid="Q999", label="X", description="d")
+
+    delta = snap.get_delta()
+    assert len(delta.new_textual_items) == 1
+    assert "new fact" in delta.new_textual_items[0]
+    assert "Q999" in delta.new_entities
+
+
+def test_global_knowledge_absorb_gated():
+    """Absorption with reward below threshold should be rejected."""
+    gk = GlobalKnowledge()
+    delta = MemoryDelta(new_textual_items=["fact X"])
+    gk.absorb(delta, reward=0.1, min_reward=0.5)
+    assert len(gk.confirmed_facts) == 0
+
+    gk.absorb(delta, reward=0.6, min_reward=0.5)
+    assert len(gk.confirmed_facts) == 1
+    assert "fact X" in gk.confirmed_facts[0]
+
+
+def test_global_knowledge_absorb_deduplicates():
+    """Absorbing the same fact twice should not duplicate it."""
+    gk = GlobalKnowledge()
+    delta = MemoryDelta(new_textual_items=["fact Y"])
+    gk.absorb(delta, reward=1.0)
+    gk.absorb(delta, reward=1.0)
+    assert gk.confirmed_facts.count("fact Y") == 1
+
+
+def test_deduplicate_graph_merges_same_qid():
+    """Nodes with the same QID entered via different surface forms are merged."""
+    from wemg.llm.roles import Entity as OpenIEEntity
+
+    wm = WorkingMemory(wikidata_client=None)
+    e1 = OpenIEEntity(id="Q64", name="Berlin", description="city")
+    e2 = OpenIEEntity(id="Q64", name="Berlin (city)", description="city in Germany")
+    e3 = OpenIEEntity(id="Q183", name="Germany", description="country")
+
+    wm.graph_memory.add_node("Q64", data=e1)
+    wm.graph_memory.add_node("Q64_dup", data=OpenIEEntity(id="Q64", name="Berlin (city)", description=""))
+    wm.graph_memory.add_node("Q183", data=e3)
+    wm.graph_memory.add_edge("Q64_dup", "Q183", relation={"capital of"})
+
+    assert wm.graph_memory.number_of_nodes() == 3
+    wm.deduplicate_graph()
+    assert wm.graph_memory.number_of_nodes() == 2
+    assert wm.graph_memory.has_edge("Q64", "Q183")
+
+
+def test_conditional_sync_skips_when_clean():
+    """should_synchronize returns False when nothing has changed."""
+    wm = WorkingMemory(wikidata_client=None, sync_text_threshold=5)
+    assert wm.should_synchronize() is False
+
+    wm.add_textual_memory("a", source=SourceType.RETRIEVAL)
+    assert wm._dirty is True
+    assert wm.should_synchronize() is False
+
+    for i in range(5):
+        wm.add_textual_memory(f"item {i}", source=SourceType.RETRIEVAL)
+    assert wm.should_synchronize() is True
+
+
+def test_sync_one_directional_no_graph_to_text():
+    """Graph content should NOT be injected into textual_memory during sync."""
+    wm = WorkingMemory(wikidata_client=None, sync_text_threshold=1)
+    e1 = WikidataEntity(qid="Q64", label="Berlin", description="city")
+    e2 = WikidataEntity(qid="Q183", label="Germany", description="country")
+    prop = WikidataProperty(pid="P1376", label="capital of", description=None)
+    wm.add_node_to_graph_memory(e1)
+    wm.add_node_to_graph_memory(e2)
+    wm.graph_memory.add_edge("Q64", "Q183", relation={"capital of"})
+
+    text_before = list(wm.textual_memory)
+    assert len(text_before) == 0
+
+
+def test_format_merges_global_and_local():
+    """format_textual_memory should include both global and local facts."""
+    gk = GlobalKnowledge()
+    gk.confirmed_facts = ["global fact 1", "global fact 2"]
+    wm = WorkingMemory(wikidata_client=None, global_knowledge=gk)
+    wm.add_textual_memory("local fact", source=SourceType.RETRIEVAL)
+
+    text = wm.format_textual_memory()
+    assert "global fact 1" in text
+    assert "global fact 2" in text
+    assert "local fact" in text
+
+
+def test_edge_provenance_stored():
+    """add_edge_to_graph_memory should store provenance metadata on edges."""
+    wm = WorkingMemory(wikidata_client=None)
+    berlin = WikidataEntity(qid="Q64", label="Berlin", description="city")
+    germany = WikidataEntity(qid="Q183", label="Germany", description="country")
+    prop = WikidataProperty(pid="P1376", label="capital of", description=None)
+    wm.add_edge_to_graph_memory(
+        WikiTriple(subject=berlin, relation=prop, object=germany),
+        source_step=3, timestamp=1000.0, reward=0.8,
+    )
+    edge = wm.graph_memory.edges["Q64", "Q183"]
+    assert edge["provenance"]["source_step"] == 3
+    assert edge["provenance"]["timestamp"] == 1000.0
+    assert edge["provenance"]["reward"] == 0.8
+
+
+def test_dirty_tracking_on_add():
+    """Adding textual memory should set dirty flag and increment counter."""
+    wm = WorkingMemory(wikidata_client=None)
+    assert wm._dirty is False
+    assert wm._items_since_last_sync == 0
+
+    wm.add_textual_memory("fact", source=SourceType.RETRIEVAL)
+    assert wm._dirty is True
+    assert wm._items_since_last_sync == 1
+
+    wm.add_textual_memory("fact", source=SourceType.RETRIEVAL)
+    assert wm._items_since_last_sync == 1
+
+
+def test_memory_delta_dataclass():
+    """MemoryDelta should be constructable with defaults."""
+    delta = MemoryDelta()
+    assert delta.new_textual_items == []
+    assert delta.new_triples == []
+    assert delta.new_entities == {}
+
+    delta2 = MemoryDelta(new_textual_items=["x"], new_entities={"Q1": WikidataEntity(qid="Q1", label="A")})
+    assert len(delta2.new_textual_items) == 1
+    assert "Q1" in delta2.new_entities

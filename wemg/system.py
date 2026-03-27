@@ -1,5 +1,6 @@
 """WEMG System - main orchestrator for question answering."""
 
+import asyncio
 import logging
 import os
 import re
@@ -10,8 +11,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import networkx as nx
-
 from wemg.config import WEMGConfig
 from wemg.llm.client import LLMClient
 from wemg.retrieval.web_search import WebSearchTool
@@ -20,10 +19,7 @@ from wemg.retrieval.reranker import Reranker
 from wemg.retrieval.wikidata import WikidataClient
 from wemg.reasoning.cot import cot_search, cot_get_answer
 from wemg.reasoning.mcts import mcts_search, get_answer
-from wemg.reasoning.memory import WorkingMemory, InteractionMemory
-from wemg.reasoning.nodes import ReasoningNode
-from wemg.utils.graph import textualize_graph, visualize_graph
-
+from wemg.reasoning.memory import GlobalKnowledge, WorkingMemory, InteractionMemory
 logger = logging.getLogger(__name__)
 
 
@@ -81,6 +77,7 @@ class AnswerResult:
     search_tree: Optional[Any] = None
     metadata: Optional[Dict[str, Any]] = None
     working_memory: Optional[WorkingMemory] = None
+    global_knowledge: Optional[GlobalKnowledge] = None
 
 
 class WEMGSystem:
@@ -201,10 +198,23 @@ class WEMGSystem:
         )
         return Reranker(client=reranker_client, top_k=r.top_k, instruction=r.instruction)
 
-    def _create_working_memory(self) -> WorkingMemory:
+    def _create_working_memory(self, global_knowledge: Optional[GlobalKnowledge] = None) -> WorkingMemory:
+        wm_cfg = self.cfg.memory.working_memory
         return WorkingMemory(
-            max_textual_memory_tokens=self.cfg.memory.working_memory.max_textual_memory_tokens,
+            max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
             wikidata_client=self.wikidata_client,
+            sync_text_threshold=wm_cfg.sync_text_threshold,
+            sync_graph_node_threshold=wm_cfg.sync_graph_node_threshold,
+            global_knowledge=global_knowledge,
+        )
+
+    def _create_global_knowledge(self) -> GlobalKnowledge:
+        wm_cfg = self.cfg.memory.working_memory
+        return GlobalKnowledge(
+            wikidata_client=self.wikidata_client,
+            max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
+            sync_text_threshold=wm_cfg.sync_text_threshold,
+            sync_graph_node_threshold=wm_cfg.sync_graph_node_threshold,
         )
     
     def _create_interaction_memory(self, collection_name: str = None) -> Optional[InteractionMemory]:
@@ -255,8 +265,6 @@ class WEMGSystem:
     def answer(self, question: str, question_id: str = None, golden_answer: Optional[str] = None) -> AnswerResult:
         self._initialize()
         
-        working_memory = self._create_working_memory()
-        
         if self.cfg.memory.interaction_memory.scope == "dataset" and self.interaction_memory:
             interaction_memory = self.interaction_memory
         else:
@@ -266,14 +274,17 @@ class WEMGSystem:
         strategy = self.cfg.search.strategy
         
         if strategy == "cot":
-            return self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer)
+            working_memory = self._create_working_memory()
+            return asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
         elif strategy == "mcts":
-            return self._answer_with_mcts(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer)
+            gk = self._create_global_knowledge()
+            working_memory = self._create_working_memory(global_knowledge=gk)
+            return asyncio.run(self._answer_with_mcts(question, question_id, working_memory, gk, interaction_memory, node_gen_kwargs, golden_answer))
         raise ValueError(f"Unknown strategy: {strategy}")
     
-    def _answer_with_cot(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer):
+    async def _answer_with_cot(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer):
         max_depth = self.cfg.search.cot.max_depth
-        terminal_content, reasoning_path, pass_at_k = cot_search(
+        terminal_content, reasoning_path, pass_at_k = await cot_search(
             question=question, client=self.client, retriever=self.retriever,
             wikidata_client=self.wikidata_client, reranker=self.reranker,
             working_memory=working_memory, interaction_memory=interaction_memory,
@@ -291,34 +302,39 @@ class WEMGSystem:
             working_memory=working_memory,
         )
     
-    def _answer_with_mcts(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer):
+    async def _answer_with_mcts(self, question, question_id, working_memory, global_knowledge, interaction_memory, kwargs, golden_answer):
         mcts_cfg = self.cfg.search.mcts
         et = mcts_cfg.early_termination
+        wm_cfg = self.cfg.memory.working_memory
         
-        best_content, root, pass_at_k = mcts_search(
+        best_content, root, pass_at_k = await mcts_search(
             question=question, client=self.client, retriever=self.retriever,
             wikidata_client=self.wikidata_client, reranker=self.reranker,
             working_memory=working_memory, interaction_memory=interaction_memory,
+            global_knowledge=global_knowledge,
             num_iterations=mcts_cfg.num_iterations, max_tree_depth=mcts_cfg.max_tree_depth,
-            max_simulation_depth=mcts_cfg.max_simulation_depth, exploration_weight=mcts_cfg.exploration_weight,
+            exploration_weight=mcts_cfg.exploration_weight,
             golden_answer=golden_answer if mcts_cfg.use_golden_answer_for_reward else None,
             correct_answers=golden_answer,
             early_termination_enabled=et.enabled, min_iterations=et.min_iterations,
             high_confidence_threshold=et.high_confidence_threshold,
             convergence_patience=et.convergence_patience,
             semantic_sufficiency_count=et.semantic_sufficiency_count,
+            absorption_min_reward=wm_cfg.absorption_min_reward,
+            min_graph_nodes_for_consensus=mcts_cfg.min_graph_nodes_for_consensus,
             **kwargs,
         )
         
         if self.cfg.output.show_search_tree:
             root.print_tree()
         
-        full_answer, concise_answer = get_answer(root, self.client, interaction_memory, working_memory=working_memory)
+        full_answer, concise_answer = await get_answer(root, self.client, interaction_memory, working_memory=working_memory)
         return AnswerResult(
             question=question, answer=full_answer, concise_answer=concise_answer,
             search_tree=root if self.cfg.output.include_reasoning else None,
             metadata={"question_id": question_id, "strategy": "mcts", "pass_at_k": pass_at_k},
             working_memory=working_memory,
+            global_knowledge=global_knowledge,
         )
     
     def answer_batch(

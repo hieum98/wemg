@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import math
 import random
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -15,10 +14,19 @@ from wemg.llm.roles import (
 )
 from wemg.reasoning.nodes import MCTSNode, NodeType, NodeState
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
-from wemg.reasoning.memory import WorkingMemory, InteractionMemory, log_to_interaction_memory
+from wemg.reasoning.memory import GlobalKnowledge, WorkingMemory, log_to_interaction_memory
 from wemg.utils.text import format_context
 
 logger = logging.getLogger(__name__)
+
+_NODE_TYPE_PRIOR = {
+    # Encourage deeper exploration before committing to terminal answers.
+    NodeType.SUB_QA_NODE: 0.60,
+    NodeType.SELF_CORRECTED_NODE: 0.50,
+    NodeType.SYNTHESIS_NODE: 0.45,
+    NodeType.FINAL_ANSWER: 0.30,
+    NodeType.REPHRASED_QUESTION_NODE: 0.40,
+}
 
 
 def select(root: MCTSNode, exploration_weight: float = 2.0) -> List[MCTSNode]:
@@ -34,36 +42,28 @@ def select(root: MCTSNode, exploration_weight: float = 2.0) -> List[MCTSNode]:
         node = node.children[uct_scores.index(max(uct_scores))]
 
 
-def expand(node: MCTSNode, generator: NodeGenerator, is_cot_simulation: bool = False) -> Tuple[List[MCTSNode], bool]:
+async def expand(node: MCTSNode, generator: NodeGenerator) -> Tuple[List[MCTSNode], bool]:
     """Expand node by generating children. Returns (children, has_semantic_signal)."""
     if node.is_terminal():
         return [], False
     
     if node.depth > node.max_depth:
-        nodes, result, _ = asyncio.run(_generate_final_answer_nodes(node, generator))
+        nodes, result, _ = await _generate_final_answer_nodes(node, generator)
         generator.update_working_memory(result)
         log_to_interaction_memory(generator.interaction_memory, result.log_data)
         return nodes, False
     
-    if is_cot_simulation:
-        nodes, result, has_signal = asyncio.run(_generate_subqa_nodes(node, generator))
-        generator.update_working_memory(result)
-        log_to_interaction_memory(generator.interaction_memory, result.log_data)
-        return nodes, has_signal
-    
     strategies = {
         NodeType.USER_QUESTION: [_generate_final_answer_nodes, _generate_subqa_nodes],
-        NodeType.SUB_QA_NODE: [_generate_subqa_nodes, _self_correct_nodes], # _rephrase_nodes, _strengthen_nodes
-        # NodeType.REPHRASED_QUESTION_NODE: [_generate_subqa_nodes],
-        NodeType.SELF_CORRECTED_NODE: [_generate_subqa_nodes], # _strengthen_nodes
-        # NodeType.SYNTHESIS_NODE: [_generate_subqa_nodes],
+        NodeType.SUB_QA_NODE: [_generate_subqa_nodes, _self_correct_nodes],
+        NodeType.SELF_CORRECTED_NODE: [_generate_subqa_nodes],
     }
     
     gens = strategies.get(node.node_type, [])
     if not gens:
         return [], False
     
-    results = asyncio.run(_gather_expand_generators(node, generator, gens))
+    results = await _gather_expand_generators(node, generator, gens)
     
     all_nodes = []
     has_semantic_signal = False
@@ -72,7 +72,7 @@ def expand(node: MCTSNode, generator: NodeGenerator, is_cot_simulation: bool = F
         all_nodes.extend(nodes)
         generator.update_working_memory(result)
         all_logs.append(result.log_data)
-        if has_signal: # If any child node has a semantic signal (answerable or not), consider the question as answered
+        if has_signal:
             has_semantic_signal = True
     
     log_to_interaction_memory(generator.interaction_memory, merge_logs(*all_logs))
@@ -96,7 +96,12 @@ async def _generate_final_answer_nodes(node: MCTSNode, gen: NodeGenerator) -> Tu
             "concise_answer": answer.concise_answer,
             "reasoning": answer.reasoning,
         })
-        nodes.append(MCTSNode(node_state=state, parent=node, max_depth=node.max_depth))
+        nodes.append(MCTSNode(
+            node_state=state,
+            parent=node,
+            max_depth=node.max_depth,
+            prior=_NODE_TYPE_PRIOR.get(NodeType.FINAL_ANSWER, 1.0),
+        ))
     return nodes, result, False
 
 async def _generate_subqa_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[MCTSNode], GenerationResult, bool]:
@@ -123,21 +128,17 @@ async def _generate_subqa_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[Lis
                 'user_question': node.user_question, 'sub_question': sq,
                 'sub_answer': answer.answer, 'reasoning': answer.reasoning,
             })
-            nodes.append(MCTSNode(node_state=state, parent=node, max_depth=node.max_depth))
+            nodes.append(MCTSNode(
+                node_state=state,
+                parent=node,
+                max_depth=node.max_depth,
+                prior=_NODE_TYPE_PRIOR.get(NodeType.SUB_QA_NODE, 1.0),
+            ))
     
     if last_result is None:
         last_result = GenerationResult()
     last_result.log_data = merge_logs(*all_logs)
     return nodes, last_result, False
-
-async def _rephrase_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[MCTSNode], GenerationResult, bool]:
-    question = node.node_state.content.get('sub_question', node.user_question)
-    rephrased, log = await gen.generate_rephrase(question)
-    nodes = [MCTSNode(
-        node_state=NodeState(node_type=NodeType.REPHRASED_QUESTION_NODE, content={'user_question': node.user_question, 'sub_question': rq}),
-        parent=node, max_depth=node.max_depth
-    ) for rq in rephrased]
-    return nodes, GenerationResult(log_data=log), False
 
 async def _self_correct_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[MCTSNode], GenerationResult, bool]:
     sub_q = node.node_state.content.get('sub_question')
@@ -149,23 +150,11 @@ async def _self_correct_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[
         node_state=NodeState(node_type=NodeType.SELF_CORRECTED_NODE, content={
             'user_question': node.user_question, 'sub_question': sub_q, 'sub_answer': c.refined_answer
         }),
-        parent=node, max_depth=node.max_depth
+        parent=node,
+        max_depth=node.max_depth,
+        prior=_NODE_TYPE_PRIOR.get(NodeType.SELF_CORRECTED_NODE, 1.0),
     ) for c in result.answers]
     return nodes, result, False
-
-async def _strengthen_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[MCTSNode], GenerationResult, bool]:
-    result = await gen.generate_synthesis(node.user_question)
-    nodes = []
-    has_signal = False
-    for output in result.answers:
-        if output.is_answerable:
-            state = NodeState(node_type=NodeType.FINAL_ANSWER, content={"user_question": node.user_question, "final_answer": output.step_conclusion})
-            has_signal = True
-        else:
-            state = NodeState(node_type=NodeType.SYNTHESIS_NODE, content={'user_question': node.user_question, 'synthesized_reasoning': output.step_conclusion})
-        nodes.append(MCTSNode(node_state=state, parent=node, max_depth=node.max_depth))
-    return nodes, result, has_signal
-
 
 def _add_child_to_memory(child: MCTSNode, working_memory: WorkingMemory):
     """Add child node content to working memory."""
@@ -175,61 +164,93 @@ def _add_child_to_memory(child: MCTSNode, working_memory: WorkingMemory):
         working_memory.add_textual_memory(content, source=source)
 
 
-def simulate(node: MCTSNode, generator: NodeGenerator, max_simulation_depth: int = 5) -> Tuple[MCTSNode, bool]:
-    """Simulate rollout from node to terminal."""
-    current = node
-    any_signal = False
-    for _ in range(max_simulation_depth):
-        if current.is_terminal():
-            break
-        children, has_signal = expand(current, generator, is_cot_simulation=True)
-        any_signal = any_signal or has_signal
-        if not children:
-            break
-        current = random.choice(children)
-    return current, any_signal
+async def _force_terminal_node(
+    node: MCTSNode, generator: NodeGenerator,
+) -> Tuple[Optional[MCTSNode], GenerationResult]:
+    """Generate a FINAL_ANSWER from current memory only (no retrieval).
+
+    Used as a lightweight replacement for full simulation rollouts.
+    """
+    result = await generator.generate_answer(node.user_question, should_explore=False)
+    if not result.answers:
+        return None, result
+    answer = result.answers[0]
+    state = NodeState(node_type=NodeType.FINAL_ANSWER, content={
+        "user_question": node.user_question,
+        "final_answer": answer.answer,
+        "concise_answer": answer.concise_answer,
+        "reasoning": answer.reasoning,
+    })
+    child = MCTSNode(node_state=state, parent=node, max_depth=node.max_depth)
+    return child, result
 
 
-def evaluate(node: MCTSNode, client, working_memory: WorkingMemory, golden_answer: Optional[str] = None) -> float:
+async def evaluate(
+    node: MCTSNode,
+    client,
+    working_memory: WorkingMemory,
+    golden_answer: Optional[str] = None,
+    min_graph_nodes_for_consensus: int = 3,
+) -> float:
     """Evaluate terminal node. Returns reward in [-1, 1].
-    
-    Reward = average of (answer_evaluation_reward, consensus_reward)
+
+    Always runs answer-quality evaluation (1 LLM call).
+    Runs consensus evaluation only when graph memory has at least
+    ``min_graph_nodes_for_consensus`` nodes; in that case the node's own
+    answer is compared against a freshly generated graph-memory answer.
     """
     if node.node_type != NodeType.FINAL_ANSWER:
         return -1.0
-    
+
     question = node.user_question
-    textual_memory = working_memory.format_textual_memory()
-    graph_memory = working_memory.format_graph_memory()
-    
-    textual_qa = AnswerGenerationInput(question=question, context=format_context(memory=textual_memory))
-    graph_qa = AnswerGenerationInput(question=question, context=format_context(memory=graph_memory))
-    
-    try:
-        answers, _ = asyncio.run(execute_role(client=client, role=ANSWER_GENERATOR, input_data=[textual_qa, graph_qa], n=1))
-        textual_answer = f"Answer: {answers[0][0].answer}\nReasoning: {answers[0][0].reasoning}"
-        graph_answer = f"Answer: {answers[1][0].answer}\nReasoning: {answers[1][0].reasoning}"
-        consensus_input = ConsensusEvaluationInput(question=question, candidate_answers=[textual_answer, graph_answer])
-        consensus_results, _ = asyncio.run(execute_role(client=client, role=CONSENSUS_EVALUATOR, input_data=consensus_input, n=1))
-        consensus_reward = (consensus_results[0].rating - 5) / 5.0
-    except Exception:
-        consensus_reward = 0.0
-    
+    node_answer = node.node_state.content.get('final_answer', '')
+
     eval_input = AnswerEvaluationInput(
         user_question=question,
-        system_answer=node.node_state.content.get('final_answer', ''),
-        correct_answer=golden_answer or node.golden_answer or "Not available"
+        system_answer=node_answer,
+        correct_answer=golden_answer or node.golden_answer or "Not available",
     )
     try:
-        eval_results, _ = asyncio.run(execute_role(client=client, role=EVALUATOR, input_data=eval_input, n=1))
+        eval_results, _ = await execute_role(
+            client=client, role=EVALUATOR, input_data=eval_input, n=1,
+        )
         answer_reward = (eval_results[0].rating - 5) / 5.0
     except Exception:
         answer_reward = 0.0
-    
+
+    graph_node_count = working_memory.graph_memory.number_of_nodes()
+    if graph_node_count < min_graph_nodes_for_consensus:
+        return answer_reward
+
+    graph_memory_text = working_memory.format_graph_memory()
+    graph_qa = AnswerGenerationInput(
+        question=question,
+        context=format_context(memory=graph_memory_text),
+    )
+    try:
+        graph_answers, _ = await execute_role(
+            client=client, role=ANSWER_GENERATOR, input_data=graph_qa, n=1,
+        )
+        graph_answer = (
+            f"Answer: {graph_answers[0].answer}\n"
+            f"Reasoning: {graph_answers[0].reasoning}"
+        )
+        consensus_input = ConsensusEvaluationInput(
+            question=question,
+            candidate_answers=[node_answer, graph_answer],
+        )
+        consensus_results, _ = await execute_role(
+            client=client, role=CONSENSUS_EVALUATOR,
+            input_data=consensus_input, n=1,
+        )
+        consensus_reward = (consensus_results[0].rating - 5) / 5.0
+    except Exception:
+        consensus_reward = 0.0
+
     return (answer_reward + consensus_reward) / 2.0
 
 
-def mcts_search(
+async def mcts_search(
     question: str,
     client,
     retriever,
@@ -237,10 +258,10 @@ def mcts_search(
     reranker=None,
     working_memory: WorkingMemory = None,
     interaction_memory=None,
+    global_knowledge: Optional[GlobalKnowledge] = None,
     num_iterations: int = 10,
     exploration_weight: float = 2.0,
     max_tree_depth: int = 10,
-    max_simulation_depth: int = 5,
     golden_answer: Optional[str] = None,
     early_termination_enabled: bool = True,
     min_iterations: int = 3,
@@ -248,9 +269,21 @@ def mcts_search(
     convergence_patience: int = 3,
     semantic_sufficiency_count: int = 2,
     correct_answers: Optional[Union[str, List[str]]] = None,
+    absorption_min_reward: float = 0.0,
+    global_consolidation_every: int = 3,
+    min_graph_nodes_for_consensus: int = 3,
     **kwargs,
 ) -> Tuple[Dict, MCTSNode, Optional[int]]:
-    """Run MCTS search. Returns (best_content, root_node, pass_at_k)."""
+    """Run MCTS search with branch-isolated working memory.
+
+    Each iteration operates on a snapshot of ``working_memory``.  Discoveries
+    are promoted to ``global_knowledge`` only when the branch reward exceeds
+    ``absorption_min_reward``.
+
+    Simulation has been replaced by a lightweight force-terminal step that
+    generates a FINAL_ANSWER from memory only (no retrieval) when the
+    expanded child is not already terminal.
+    """
     root = MCTSNode(
         node_state=NodeState(node_type=NodeType.USER_QUESTION, content={'user_question': question}),
         max_depth=max_tree_depth,
@@ -279,32 +312,48 @@ def mcts_search(
             return node.node_state.content.get('concise_answer') or node.node_state.content.get('final_answer', '')
         return None
     
-    for iteration in range(num_iterations):    
+    for iteration in range(num_iterations):
+        branch_memory = working_memory.snapshot()
+        generator.working_memory = branch_memory
+
         path = select(root, exploration_weight)
         selected = path[-1]
         
         has_signal = False
         if not selected.is_terminal():
-            children, has_signal = expand(selected, generator, is_cot_simulation=False)
+            children, has_signal = await expand(selected, generator)
             if children:
-                selected = random.choice(children)
+                ucb_scores = [c.upper_confidence_bound(exploration_weight) for c in children]
+                selected = children[ucb_scores.index(max(ucb_scores))]
                 for child in children:
-                    _add_child_to_memory(child, working_memory)
+                    _add_child_to_memory(child, branch_memory)
                 if has_signal:
                     semantic_signals += 1
-        
+
         if not selected.is_terminal():
-            terminal, sim_signal = simulate(selected, generator, max_simulation_depth)
-            if sim_signal:
-                semantic_signals += 1
+            terminal, force_result = await _force_terminal_node(selected, generator)
+            if terminal is not None:
+                generator.update_working_memory(force_result)
+                _add_child_to_memory(terminal, branch_memory)
+                log_to_interaction_memory(generator.interaction_memory, force_result.log_data)
+            else:
+                terminal = selected
         else:
             terminal = selected
         
-        reward = evaluate(terminal, client, working_memory, golden_answer)
+        reward = await evaluate(
+            terminal, client, branch_memory, golden_answer,
+            min_graph_nodes_for_consensus=min_graph_nodes_for_consensus,
+        )
         terminal.backpropagate(reward)
-        
-        working_memory.synchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
-        
+
+        if global_knowledge is not None:
+            global_knowledge.absorb(branch_memory.get_delta(), reward, min_reward=absorption_min_reward)
+            if (iteration + 1) % global_consolidation_every == 0:
+                await global_knowledge.aconsolidate_if_needed(client, question, interaction_memory, **kwargs)
+
+        generator.working_memory = working_memory
+
         if terminal.is_terminal():
             if pass_at_k is None and correct_answers:
                 answer = extract_answer(terminal)
@@ -334,7 +383,7 @@ def mcts_search(
     return (best_node.node_state.content if best_node else {}), root, pass_at_k
 
 
-def get_answer(root: MCTSNode, client, interaction_memory=None, working_memory: Optional[WorkingMemory] = None) -> Tuple[str, str]:
+async def get_answer(root: MCTSNode, client, interaction_memory=None, working_memory: Optional[WorkingMemory] = None) -> Tuple[str, str]:
     """Extract final answer from MCTS tree via synthesis or majority vote."""
     terminals = []
     def collect(node):
@@ -349,11 +398,16 @@ def get_answer(root: MCTSNode, client, interaction_memory=None, working_memory: 
     
     answers = [str(n.node_state) for n in terminals]
     question = root.user_question
-    graph_context = working_memory.format_graph_memory() if working_memory else ""
+    if working_memory:
+        textual = working_memory.format_textual_memory()
+        graph = working_memory.format_graph_memory()
+        context = f"{textual}\n\n{graph}".strip()
+    else:
+        context = ""
     
     try:
-        synth_input = FinalAnswerSynthesisInput(question=question, candidate_answers=answers, context=graph_context)
-        results, log = asyncio.run(execute_role(client=client, role=FINAL_ANSWER_SYNTHESIZER, input_data=synth_input, interaction_memory=interaction_memory, n=1))
+        synth_input = FinalAnswerSynthesisInput(question=question, candidate_answers=answers, context=context)
+        results, log = await execute_role(client=client, role=FINAL_ANSWER_SYNTHESIZER, input_data=synth_input, interaction_memory=interaction_memory, n=1)
         if results:
             log_to_interaction_memory(interaction_memory, log)
             return f"Final Answer: {results[0].final_answer}\nReasoning: {results[0].reasoning}", results[0].concise_answer
@@ -361,7 +415,7 @@ def get_answer(root: MCTSNode, client, interaction_memory=None, working_memory: 
         logger.warning(f"Synthesis failed: {e}")
     
     vote_input = MajorityVoteInput(question=question, answers=answers)
-    results, log = asyncio.run(execute_role(client=client, role=MAJORITY_VOTER, input_data=vote_input, interaction_memory=interaction_memory, n=1))
+    results, log = await execute_role(client=client, role=MAJORITY_VOTER, input_data=vote_input, interaction_memory=interaction_memory, n=1)
     if results:
         log_to_interaction_memory(interaction_memory, log)
         return f"Final Answer: {results[0].final_answer}\nReasoning: {results[0].reasoning}", results[0].concise_answer

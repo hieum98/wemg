@@ -1,6 +1,5 @@
 """Chain-of-Thought reasoning."""
 
-import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -19,7 +18,7 @@ def _add_child_to_memory(child: CoTNode, working_memory: WorkingMemory):
         working_memory.add_textual_memory(content, source=source)
 
 
-def generate_next_step(
+async def generate_next_step(
     current: CoTNode,
     generator: NodeGenerator,
     working_memory: WorkingMemory,
@@ -27,9 +26,9 @@ def generate_next_step(
 ) -> Optional[CoTNode]:
     """Generate the next CoT reasoning step."""
     if current.depth > current.max_depth:
-        node, result = asyncio.run(_generate_final_answer(current, generator))
+        node, result = await _generate_final_answer(current, generator)
     else:
-        node, result = asyncio.run(_generate_subqa(current, generator))
+        node, result = await _generate_subqa(current, generator)
     
     if node and result:
         generator.update_working_memory(result)
@@ -81,7 +80,7 @@ async def _generate_subqa(current: CoTNode, gen: NodeGenerator) -> Tuple[Optiona
     return node, result
 
 
-def cot_search(
+async def cot_search(
     question: str,
     client,
     retriever,
@@ -114,10 +113,10 @@ def cot_search(
         return any(a and a.lower() in predicted.lower() for a in answers)
     
     while not current.is_terminal():        
-        next_node = generate_next_step(current, generator, working_memory, interaction_memory)
+        next_node = await generate_next_step(current, generator, working_memory, interaction_memory)
         if next_node is None:
             break
-        working_memory.synchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
+        await working_memory.asynchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
         
         current = next_node
         reasoning_path.append(current)

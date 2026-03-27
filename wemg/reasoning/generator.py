@@ -208,7 +208,7 @@ class NodeGenerator:
         
         return GenerationResult(answers=outputs, log_data=reasoning_log)
     
-    def update_working_memory(self, result: GenerationResult) -> None:
+    def update_working_memory(self, result: GenerationResult, *, source_step: int = None) -> None:
         """Update working memory with generation results."""
         for item in result.information_items:
             self.working_memory.add_textual_memory(item, source=SourceType.RETRIEVAL)
@@ -218,7 +218,7 @@ class NodeGenerator:
         for entity in result.retrieved_entities:
             self.working_memory.add_node_to_graph_memory(entity)
         for triple in result.retrieved_triples:
-            self.working_memory.add_edge_to_graph_memory(triple)
+            self.working_memory.add_edge_to_graph_memory(triple, source_step=source_step)
     
     # =========================================================================
     # Retrieval pipeline
@@ -254,11 +254,11 @@ class NodeGenerator:
             entities.extend(e)
             kb_log = merge_logs(kb_log, l)
         entities = list(set(entities))
-        # Get details for all entities
         assert self.wikidata_client is not None and isinstance(self.wikidata_client, WikidataClient), "WikidataClient must be provided"
         all_entities = [self.working_memory.entity_dict.get(e.qid) if self.working_memory.entity_dict.get(e.qid) else e 
                         for e in entities]
         all_entities = self.wikidata_client.enrich_entities(all_entities, get_details=True)
+
         kb_documents = []
         for entity in all_entities:
             if hasattr(entity, 'wikipedia_content') and entity.wikipedia_content:
@@ -316,7 +316,6 @@ class NodeGenerator:
                 reranker=self.reranker,
             )
 
-        # collect known question entities
         question_entities = [self.working_memory.entity_dict.get(qid) for qid in entity_dict.values()
                              if self.working_memory.entity_dict.get(qid)]
         question_entities = set(question_entities + entities)
@@ -324,14 +323,13 @@ class NodeGenerator:
         qids = [e.qid for e in question_entities]
         if not qids:
             return [], [], link_log
-        # retrieve triples from Wikidata
         triples = await self.wikidata_client.aget_k_hop_triples(
             qids, k=n_hops, bidirectional=True, enrich=True
         )
         if isinstance(triples, list) and triples and isinstance(triples[0], list):
             triples = sum(triples, [])
         triples = list(set(triples)) if triples else []
-        all_entities = entities # keep all entities from the question
+        all_entities = entities
         if triples:
             triples, prune_log = await self._prune_triples(question, triples)
             all_entities = list(set(all_entities + self._collect_entities_from_triples(triples)))

@@ -187,6 +187,20 @@ pytest wemg/test/ -m "integration"
 
 ## Performance
 
+### Profiling
+
+```bash
+# Load environment variables from .env file
+set -a
+source .env
+set +a
+
+# Run evaluation and profile the execution
+python -m cProfile -o results/profiling/cprofile/profile.prof wemg.evaluation.evaluate \
+    +dataset_name_or_path=<dataset_name_or_path> \
+    +output_path=results/profiling/<dataset_name_or_path>
+```
+
 ### Current Performance
 
 - MCTS iteration: ~185s (5 iterations)
@@ -197,7 +211,7 @@ pytest wemg/test/ -m "integration"
 
 1. **Increase Concurrency**: Set `llm.concurrency` to 8-16 for better parallelization
 2. **Enable Caching**: Ensure Redis cache is enabled in config
-3. **Reduce Simulation Depth**: Lower `search.mcts.max_simulation_depth` for faster iterations
+3. **Tune Consensus Evaluation**: Set `search.mcts.min_graph_nodes_for_consensus` to control when graph-based consensus kicks in
 4. **Use Dataset-level Memory**: Set `memory.interaction_memory.scope=dataset` for shared memory
 
 
@@ -239,10 +253,10 @@ MIT License - see LICENSE file for details
 If you use WEMG in your research, please cite:
 
 ```bibtex
-@software{wemg2024,
+@software{wemg2026,
   title={WEMG: When Embedding Model Meet Graph RAG},
   author={Man, Hieu},
-  year={2024}
+  year={2026}
 }
 ```
 

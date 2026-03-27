@@ -55,9 +55,9 @@ search:
   mcts:
     num_iterations: 30
     max_tree_depth: 10
-    max_simulation_depth: 5
     exploration_weight: 2.5
     use_golden_answer_for_reward: false
+    min_graph_nodes_for_consensus: 3
     early_termination:
       enabled: true
       min_iterations: 5
@@ -69,7 +69,7 @@ search:
 
 node_generation:
   n: 1
-  n_subquestions: 3
+  n_subquestions: 1
   top_k_websearch: 5
   top_k_entities: 5
   n_hops: 1
@@ -83,6 +83,9 @@ node_generation:
 memory:
   working_memory:
     max_textual_memory_tokens: 16384
+    sync_text_threshold: 10          # consolidate text after N new items
+    sync_graph_node_threshold: 5    # structural QID dedup after N graph nodes
+    absorption_min_reward: 0.0       # min branch reward to promote delta into GlobalKnowledge
   interaction_memory:
     enabled: false
     scope: "question"

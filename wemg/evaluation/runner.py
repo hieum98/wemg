@@ -66,18 +66,33 @@ def _save_question_artifacts(
         out["search_tree_path"] = str(tree_path)
 
     working_memory = getattr(result, "working_memory", None)
-    if working_memory is not None:
+    global_knowledge = getattr(result, "global_knowledge", None)
+
+    textual_items = list(getattr(working_memory, "textual_memory", []) or []) if working_memory else []
+    if global_knowledge is not None:
+        for gf in getattr(global_knowledge, "confirmed_facts", []):
+            if gf not in textual_items:
+                textual_items.insert(0, gf)
+
+    if textual_items:
         textual_path = q_dir / "working_memory_textual.json"
         with open(textual_path, "w", encoding="utf-8") as f:
-            json.dump(list(getattr(working_memory, "textual_memory", []) or []), f, indent=2, ensure_ascii=False)
+            json.dump(textual_items, f, indent=2, ensure_ascii=False)
         out["textual_memory_path"] = str(textual_path)
 
-        graph = getattr(working_memory, "graph_memory", None)
-        if graph is not None:
-            graph_path = q_dir / "working_memory_graph.pkl"
-            with open(graph_path, "wb") as f:
-                pickle.dump(graph, f)
-            out["graph_memory_path"] = str(graph_path)
+    graph = getattr(working_memory, "graph_memory", None)
+    if global_knowledge is not None:
+        import networkx as _nx
+        gk_graph = getattr(global_knowledge, "graph", None)
+        if gk_graph is not None and graph is not None:
+            graph = _nx.compose(gk_graph, graph)
+        elif gk_graph is not None:
+            graph = gk_graph
+    if graph is not None:
+        graph_path = q_dir / "working_memory_graph.pkl"
+        with open(graph_path, "wb") as f:
+            pickle.dump(graph, f)
+        out["graph_memory_path"] = str(graph_path)
 
     return out
 

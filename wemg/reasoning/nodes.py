@@ -187,19 +187,41 @@ class ReasoningNode(NodeMixin):
 class MCTSNode(ReasoningNode):
     """Reasoning node with MCTS-specific value/visits and UCT."""
     
-    def __init__(self, node_state: NodeState, parent: Optional['MCTSNode'] = None, max_depth: int = 10):
+    def __init__(
+        self,
+        node_state: NodeState,
+        parent: Optional["MCTSNode"] = None,
+        max_depth: int = 10,
+        prior: float = 1.0,
+    ):
         super().__init__(node_state=node_state, parent=parent, max_depth=max_depth)
         self.value: float = 0.0
         self.visits: int = 0
+        self.prior: float = float(prior)
     
     def upper_confidence_bound(self, exploration_weight: float = 2.0) -> float:
+        """PUCT-style UCB score (uses node prior).
+
+        This avoids the "all unvisited children are inf" tie that classic UCT has,
+        and allows expansion-time heuristics to guide the first simulations.
+        """
         if self.parent is None:
             raise ValueError("Cannot compute UCT for root node")
-        if self.visits == 0:
-            return float('inf')
-        average_reward = self.value / self.visits
-        exploration_term = math.sqrt(math.log(self.parent.visits) / self.visits)
-        return average_reward + exploration_weight * exploration_term
+
+        parent_visits = self.parent.visits
+
+        # Q(s, a)
+        average_reward = (self.value / self.visits) if self.visits > 0 else 0.0
+
+        # U(s, a) = c * P(s, a) * sqrt(N(parent)) / (1 + N(child))
+        exploration_term = (
+            exploration_weight
+            * self.prior
+            * math.sqrt(parent_visits + 1.0)
+            / (1.0 + self.visits)
+        )
+
+        return average_reward + exploration_term
     
     def backpropagate(self, reward: float) -> None:
         node = self

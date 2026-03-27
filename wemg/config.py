@@ -85,9 +85,9 @@ class MCTSEarlyTerminationConfig(BaseModel):
 class MCTSConfig(BaseModel):
     num_iterations: int = 30
     max_tree_depth: int = 10
-    max_simulation_depth: int = 5
     exploration_weight: float = 2.5
     use_golden_answer_for_reward: bool = False
+    min_graph_nodes_for_consensus: int = 3
     early_termination: MCTSEarlyTerminationConfig = MCTSEarlyTerminationConfig()
 
 
@@ -115,10 +115,11 @@ class NodeGenerationConfig(BaseModel):
     triple_pruning_top_k: int = 64
 
 
-
-
 class WorkingMemoryConfig(BaseModel):
     max_textual_memory_tokens: int = 16384
+    sync_text_threshold: int = 5
+    sync_graph_node_threshold: int = 5
+    absorption_min_reward: float = 0.0
 
 
 class InteractionMemoryConfig(BaseModel):

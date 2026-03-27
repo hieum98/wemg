@@ -420,7 +420,6 @@ def smoke_system_overrides() -> List[str]:
     return [
         "search.mcts.num_iterations=1",
         "search.mcts.max_tree_depth=2",
-        "search.mcts.max_simulation_depth=1",
         "search.mcts.early_termination.enabled=false",
         "search.cot.max_depth=2",
         "node_generation.n_subquestions=2",

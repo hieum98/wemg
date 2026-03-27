@@ -2,12 +2,16 @@
 
 This module contains:
 - Graph parsing helper (`parse_graph_from_text`)
+- `GlobalKnowledge` shared append-only store for MCTS
+- `MemoryDelta` lightweight diff from a branch snapshot
 - `WorkingMemory` class for textual + graph memory
 """
 
 import asyncio
-import copy
 import logging
+import time as _time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -26,6 +30,286 @@ from wemg.retrieval.wikidata import (
 from .interaction_memory import InteractionMemory, log_to_interaction_memory
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# MemoryDelta
+# =============================================================================
+
+
+@dataclass
+class MemoryDelta:
+    """Lightweight record of what one reasoning branch discovered."""
+
+    new_textual_items: List[str] = field(default_factory=list)
+    new_triples: List[WikiTriple] = field(default_factory=list)
+    new_entities: Dict[str, WikidataEntity] = field(default_factory=dict)
+
+
+# =============================================================================
+# GlobalKnowledge
+# =============================================================================
+
+
+class GlobalKnowledge:
+    """Shared, append-only knowledge store used across MCTS branches.
+
+    Facts are promoted here from branch snapshots only when the branch
+    achieves a reward above ``absorption_min_reward``.  The store is
+    periodically consolidated (text via LLM, graph via structural QID merge)
+    to control size.
+    """
+
+    def __init__(
+        self,
+        wikidata_client: Optional[WikidataClient] = None,
+        max_textual_memory_tokens: int = 16384,
+        sync_text_threshold: int = 10,
+        sync_graph_node_threshold: int = 50,
+    ):
+        self.confirmed_facts: List[str] = []
+        self.graph: nx.DiGraph = nx.DiGraph()
+        self.entity_dict: Dict[str, WikidataEntity] = {}
+        self._wikidata_client = wikidata_client
+        self._max_textual_memory_tokens = max_textual_memory_tokens
+        self._sync_text_threshold = sync_text_threshold
+        self._sync_graph_node_threshold = sync_graph_node_threshold
+        self._items_since_last_consolidation: int = 0
+        self._text_item_ids_processed: Set[int] = set()
+
+    # ---- absorption ----
+
+    def absorb(self, delta: MemoryDelta, reward: float, min_reward: float = 0.0) -> None:
+        """Merge a branch delta into global knowledge if *reward* qualifies."""
+        if reward < min_reward:
+            return
+        for fact in delta.new_textual_items:
+            if fact not in self.confirmed_facts:
+                self.confirmed_facts.append(fact)
+                self._items_since_last_consolidation += 1
+        self.entity_dict.update(delta.new_entities)
+        for triple in delta.new_triples:
+            self._add_triple(triple, reward=reward)
+
+    def _add_triple(self, triple: WikiTriple, *, reward: float = None) -> None:
+        """Add a WikiTriple to the global graph with provenance."""
+        from wemg.utils.graph import get_node_id
+        from wemg.llm.roles import Entity as OpenIEEntity
+
+        for entity in (triple.subject, triple.object):
+            if isinstance(entity, WikidataEntity) and entity.qid and entity.label:
+                node_data = OpenIEEntity(id=entity.qid, name=entity.label, description=entity.description)
+                node_id = get_node_id(node_data)
+                if not self.graph.has_node(node_id):
+                    self.graph.add_node(node_id, data=node_data)
+                if entity.qid not in self.entity_dict:
+                    self.entity_dict[entity.qid] = entity
+
+        if not isinstance(triple.subject, WikidataEntity) or not isinstance(triple.object, WikidataEntity):
+            return
+        s_data = OpenIEEntity(id=triple.subject.qid, name=triple.subject.label, description=triple.subject.description)
+        o_data = OpenIEEntity(id=triple.object.qid, name=triple.object.label, description=triple.object.description)
+        s_id = get_node_id(s_data)
+        o_id = get_node_id(o_data)
+        rel_label = triple.relation.label if hasattr(triple.relation, "label") else str(triple.relation)
+        if not rel_label:
+            return
+
+        provenance: Dict[str, Any] = {"timestamp": _time.time()}
+        if reward is not None:
+            provenance["reward"] = reward
+
+        if not self.graph.has_edge(s_id, o_id):
+            self.graph.add_edge(s_id, o_id, relation={rel_label}, provenance=provenance)
+        else:
+            edge = self.graph.edges[s_id, o_id]
+            edge.setdefault("relation", set()).add(rel_label)
+            edge["provenance"] = provenance
+
+    # ---- consolidation ----
+
+    async def aconsolidate_if_needed(
+        self,
+        client,
+        question: str,
+        interaction_memory: Optional[InteractionMemory] = None,
+        **kwargs,
+    ) -> None:
+        """Consolidate text (LLM) and graph (structural) when thresholds are exceeded."""
+        if self._items_since_last_consolidation >= self._sync_text_threshold and self.confirmed_facts:
+            await self._aconsolidate_text(client, question, interaction_memory)
+            self._items_since_last_consolidation = 0
+
+        await self._aextract_unprocessed_text_to_graph(client, interaction_memory, **kwargs)
+
+        if self.graph.number_of_nodes() > self._sync_graph_node_threshold:
+            self.deduplicate_graph()
+
+    def consolidate_if_needed(
+        self,
+        client,
+        question: str,
+        interaction_memory: Optional[InteractionMemory] = None,
+        **kwargs,
+    ) -> None:
+        """Sync wrapper for ``aconsolidate_if_needed``."""
+        asyncio.run(self.aconsolidate_if_needed(client, question, interaction_memory, **kwargs))
+
+    async def _aconsolidate_text(
+        self, client, question: str, interaction_memory: Optional[InteractionMemory] = None,
+    ) -> None:
+        """Run LLM text consolidation on confirmed_facts."""
+        from wemg.llm.roles import SourceType, MEMORY_CONSOLIDATOR, MemoryConsolidationInput, execute_role
+
+        raw = "\n".join(f"- {f.strip()}" for f in self.confirmed_facts)
+        if not raw.strip():
+            return
+        consolidation_input = MemoryConsolidationInput(question=question, memory=raw)
+        response, log = await execute_role(
+            client=client, role=MEMORY_CONSOLIDATOR,
+            input_data=consolidation_input, interaction_memory=interaction_memory,
+            n=1, max_tokens=self._max_textual_memory_tokens,
+        )
+        log_to_interaction_memory(interaction_memory, log)
+        if not response:
+            return
+        output = response[0]
+        self.confirmed_facts = []
+        self._text_item_ids_processed = set()
+        for item in output.consolidated_memory:
+            if item.provenance == SourceType.SYSTEM_PREDICTION.value:
+                prov = SourceType.SYSTEM_PREDICTION
+            elif item.provenance == SourceType.RETRIEVAL.value:
+                prov = SourceType.RETRIEVAL
+            else:
+                prov = SourceType.SYSTEM_PREDICTION
+            from wemg.reasoning.working_memory import WorkingMemory
+            formatted = WorkingMemory.format_memory_item(item.content, prov)
+            if formatted not in self.confirmed_facts:
+                self.confirmed_facts.append(formatted)
+
+    async def _aextract_unprocessed_text_to_graph(
+        self, client, interaction_memory: Optional[InteractionMemory] = None, **kwargs,
+    ) -> None:
+        """One-directional: extract triples from unprocessed confirmed_facts into graph."""
+        unprocessed = [
+            (i, text) for i, text in enumerate(self.confirmed_facts)
+            if i not in self._text_item_ids_processed
+        ]
+        if not unprocessed:
+            return
+        new_text = "\n".join(f"- {text.strip()}" for _, text in unprocessed)
+        known_entities = filter_entities_relevant_to_text(
+            list(self.entity_dict.values()), new_text,
+        )
+        triples, log = await parse_graph_from_text(
+            client, new_text, interaction_memory=interaction_memory, known_entities=known_entities,
+        )
+        log_to_interaction_memory(interaction_memory, log)
+        for triple in triples:
+            if hasattr(triple, "subject_id") and hasattr(triple, "object_id"):
+                self._add_triple_from_relation(triple)
+        self._text_item_ids_processed.update(i for i, _ in unprocessed)
+
+    def _add_triple_from_relation(self, relation: Relation) -> None:
+        """Convert an LLM-extracted Relation into graph edges via entity lookup."""
+        from wemg.utils.graph import get_node_id
+        from wemg.llm.roles import Entity as OpenIEEntity
+
+        resolved = {}
+        for attr, name_or_id, name_fallback in [
+            ("subject", relation.subject_id, relation.subject),
+            ("object", relation.object_id, relation.object),
+        ]:
+            key = name_or_id or name_fallback
+            if not key:
+                return
+            entity = self.entity_dict.get(key)
+            if entity is None and self._wikidata_client:
+                results = self._wikidata_client.search_entities(key, num_results=1, get_details=False)
+                if results and isinstance(results[0], WikidataEntity) and results[0].qid:
+                    entity = results[0]
+                    self.entity_dict[entity.qid] = entity
+            if entity is None:
+                return
+            resolved[attr] = entity
+
+        s_entity = resolved["subject"]
+        o_entity = resolved["object"]
+        rel_label = str(relation.relation) if relation.relation else None
+        if not rel_label:
+            return
+
+        s_data = OpenIEEntity(id=s_entity.qid, name=s_entity.label, description=s_entity.description)
+        o_data = OpenIEEntity(id=o_entity.qid, name=o_entity.label, description=o_entity.description)
+        s_id = get_node_id(s_data)
+        o_id = get_node_id(o_data)
+
+        if not self.graph.has_node(s_id):
+            self.graph.add_node(s_id, data=s_data)
+        if not self.graph.has_node(o_id):
+            self.graph.add_node(o_id, data=o_data)
+
+        if not self.graph.has_edge(s_id, o_id):
+            self.graph.add_edge(s_id, o_id, relation={rel_label})
+        else:
+            self.graph.edges[s_id, o_id].setdefault("relation", set()).add(rel_label)
+
+    # ---- graph dedup ----
+
+    def deduplicate_graph(self) -> None:
+        """Merge nodes sharing the same QID. Does NOT merge parallel edges."""
+        qid_groups: Dict[str, List[str]] = defaultdict(list)
+        for node_id, data in self.graph.nodes(data=True):
+            qid = getattr(data.get("data"), "id", None)
+            if qid:
+                qid_groups[qid].append(node_id)
+        for qid, node_ids in qid_groups.items():
+            if len(node_ids) > 1:
+                canonical = node_ids[0]
+                for dup in node_ids[1:]:
+                    if not self.graph.has_node(dup):
+                        continue
+                    for pred in list(self.graph.predecessors(dup)):
+                        if pred == canonical:
+                            continue
+                        edata = self.graph.edges[pred, dup]
+                        if self.graph.has_edge(pred, canonical):
+                            self.graph.edges[pred, canonical].setdefault("relation", set()).update(edata.get("relation", set()))
+                        else:
+                            self.graph.add_edge(pred, canonical, **edata)
+                    for succ in list(self.graph.successors(dup)):
+                        if succ == canonical:
+                            continue
+                        edata = self.graph.edges[dup, succ]
+                        if self.graph.has_edge(canonical, succ):
+                            self.graph.edges[canonical, succ].setdefault("relation", set()).update(edata.get("relation", set()))
+                        else:
+                            self.graph.add_edge(canonical, succ, **edata)
+                    self.graph.remove_node(dup)
+
+    # ---- formatting ----
+
+    def format_textual_memory(self) -> str:
+        """Format confirmed facts as text."""
+        return "\n".join(f"- {f.strip()}" for f in self.confirmed_facts)
+
+    def format_graph_memory(self) -> str:
+        """Format global graph as text."""
+        from wemg.llm.roles import SourceType
+        from wemg.utils.graph import textualize_graph
+
+        components = list(nx.weakly_connected_components(self.graph))
+        cluster_texts = []
+        for comp in components:
+            triples, _ = textualize_graph(comp, self.graph, method="dfs")
+            formatted = [
+                WorkingMemory.format_memory_item(t, SourceType.SYSTEM_PREDICTION) for t in triples
+            ]
+            cluster_texts.append("\n".join(f"- {t}" for t in formatted))
+        return "**Information**\n".join(
+            [f"{i}. {text}" for i, text in enumerate(cluster_texts, 1)]
+        )
 
 
 # =============================================================================
@@ -70,7 +354,12 @@ async def _gather_awaitables(tasks):
 
 
 class WorkingMemory:
-    """Manages working memory including textual facts and knowledge graph."""
+    """Manages working memory including textual facts and knowledge graph.
+
+    When ``global_knowledge`` is provided (MCTS mode), formatters merge global
+    confirmed facts / graph with local additions.  When ``None`` (CoT mode,
+    tests), the instance is standalone.
+    """
 
     def __init__(
         self,
@@ -78,13 +367,78 @@ class WorkingMemory:
         graph_memory: Optional[nx.DiGraph] = None,
         max_textual_memory_tokens: int = 16384,
         wikidata_client=None,
+        sync_text_threshold: int = 10,
+        sync_graph_node_threshold: int = 50,
+        global_knowledge: Optional[GlobalKnowledge] = None,
     ):
         self.textual_memory: List[str] = textual_memory or []
         self.graph_memory: nx.DiGraph = graph_memory or nx.DiGraph()
         self.max_textual_memory_tokens = max_textual_memory_tokens
         self._wikidata_client: Optional[WikidataClient] = wikidata_client
+        self._sync_text_threshold = sync_text_threshold
+        self._sync_graph_node_threshold = sync_graph_node_threshold
+        self.global_knowledge: Optional[GlobalKnowledge] = global_knowledge
 
         self.entity_dict: Dict[str, WikidataEntity] = {}
+
+        self._dirty: bool = False
+        self._items_since_last_sync: int = 0
+        self._text_item_ids_processed: Set[int] = set()
+        self._snapshot_text_len: int = len(self.textual_memory)
+        self._snapshot_entity_keys: Set[str] = set()
+        self._snapshot_edge_set: Set[Tuple[str, str]] = set(self.graph_memory.edges())
+
+    # -----------------------------------------------------------------
+    # Snapshot / delta (for MCTS branch isolation)
+    # -----------------------------------------------------------------
+
+    def snapshot(self) -> "WorkingMemory":
+        """Create a cheap path-local copy. Global knowledge is shared by reference."""
+        wm = WorkingMemory(
+            textual_memory=list(self.textual_memory),
+            graph_memory=self.graph_memory.copy(),
+            max_textual_memory_tokens=self.max_textual_memory_tokens,
+            wikidata_client=self._wikidata_client,
+            sync_text_threshold=self._sync_text_threshold,
+            sync_graph_node_threshold=self._sync_graph_node_threshold,
+            global_knowledge=self.global_knowledge,
+        )
+        wm.entity_dict = dict(self.entity_dict)
+        wm._text_item_ids_processed = set(self._text_item_ids_processed)
+        wm._snapshot_text_len = len(wm.textual_memory)
+        wm._snapshot_entity_keys = set(wm.entity_dict.keys())
+        wm._snapshot_edge_set = set(wm.graph_memory.edges())
+        return wm
+
+    def get_delta(self) -> MemoryDelta:
+        """Return what was added to local state since the last snapshot."""
+        new_text = self.textual_memory[self._snapshot_text_len:]
+        new_entities = {
+            k: v for k, v in self.entity_dict.items()
+            if k not in self._snapshot_entity_keys
+        }
+        new_triples: List[WikiTriple] = []
+        for u, v in self.graph_memory.edges():
+            if (u, v) in self._snapshot_edge_set:
+                continue
+            u_data = self.graph_memory.nodes[u].get("data")
+            v_data = self.graph_memory.nodes[v].get("data")
+            edge = self.graph_memory.edges[u, v]
+            rel_labels = edge.get("relation", set())
+            for rel_label in rel_labels:
+                s_entity = self.entity_dict.get(getattr(u_data, "id", None))
+                o_entity = self.entity_dict.get(getattr(v_data, "id", None))
+                if s_entity and o_entity:
+                    new_triples.append(WikiTriple(
+                        subject=s_entity,
+                        relation=WikidataProperty(pid="", label=rel_label, description=None),
+                        object=o_entity,
+                    ))
+        return MemoryDelta(
+            new_textual_items=new_text,
+            new_triples=new_triples,
+            new_entities=new_entities,
+        )
 
     # -----------------------------------------------------------------
     # Textual Memory Operations
@@ -113,9 +467,17 @@ class WorkingMemory:
         formatted = self.format_memory_item(text, source)
         if formatted not in self.textual_memory:
             self.textual_memory.append(formatted)
+            self._dirty = True
+            self._items_since_last_sync += 1
 
     def format_textual_memory(self) -> str:
-        return "\n".join(f"- {text.strip()}" for text in self.textual_memory)
+        all_items = list(self.textual_memory)
+        if self.global_knowledge is not None:
+            global_facts = self.global_knowledge.confirmed_facts
+            for gf in global_facts:
+                if gf not in all_items:
+                    all_items.insert(0, gf)
+        return "\n".join(f"- {text.strip()}" for text in all_items)
 
     def consolidate_textual_memory(
         self,
@@ -196,7 +558,7 @@ class WorkingMemory:
         if isinstance(node, OpenIEEntity):
             if node.id and self.entity_dict.get(node.id, None):
                 node = self.entity_dict[node.id]
-            elif node.name: # Known entity name but don't have id or this is not a known entity, retrieve the entity from Wikidata using the WikidataClient
+            elif node.name:
                 assert self._wikidata_client is not None, "WikidataClient must be provided"
                 entity_name = node.id if node.id else node.name
                 result = self._wikidata_client.search_entities(entity_name, num_results=1, get_details=False)
@@ -214,12 +576,11 @@ class WorkingMemory:
                 if node.qid not in self.entity_dict:
                     self.entity_dict[node.qid] = node
 
-            elif node.label: # Scalar value (like dates, numbers, etc.)
+            elif node.label:
                 node_data = OpenIEEntity(id=None, name=node.label, description=node.description)
-            else: # Known enity id but don't have label or description
+            else:
                 if self.entity_dict.get(node.qid, None):
                     node = self.entity_dict[node.qid]
-                # Retrieve the entity from Wikidata using the WikidataClient and its qid
                 assert self._wikidata_client is not None, "WikidataClient must be provided"
                 if self._wikidata_client._is_entity_enriched(node):
                     node_data = OpenIEEntity(id=node.qid, name=node.label, description=node.description)
@@ -239,8 +600,15 @@ class WorkingMemory:
             self.graph_memory.add_node(node_id, data=node_data)
         return node_data
 
-    def add_edge_to_graph_memory(self, triple) -> None:
-        """Add a triple to graph memory."""
+    def add_edge_to_graph_memory(
+        self,
+        triple,
+        *,
+        source_step: Optional[int] = None,
+        timestamp: Optional[float] = None,
+        reward: Optional[float] = None,
+    ) -> None:
+        """Add a triple to graph memory with optional provenance metadata."""
         from wemg.utils.graph import get_node_id
         from wemg.llm.roles import Relation as OpenIERelation, Entity as OpenIEEntity
         from wemg.retrieval.wikidata import WikiTriple
@@ -274,22 +642,40 @@ class WorkingMemory:
 
         logger.info(f"Adding edge to graph memory: {str(triple)}")
 
+        provenance = {}
+        if source_step is not None:
+            provenance["source_step"] = source_step
+        if timestamp is not None:
+            provenance["timestamp"] = timestamp
+        if reward is not None:
+            provenance["reward"] = reward
+
         if not self.graph_memory.has_edge(subject_id, object_id):
-            self.graph_memory.add_edge(subject_id, object_id, relation={relation_label})
+            edge_data: Dict[str, Any] = {"relation": {relation_label}}
+            if provenance:
+                edge_data["provenance"] = provenance
+            self.graph_memory.add_edge(subject_id, object_id, **edge_data)
         else:
-            rel_set = self.graph_memory.edges[subject_id, object_id].setdefault("relation", set())
+            edge = self.graph_memory.edges[subject_id, object_id]
+            rel_set = edge.setdefault("relation", set())
             rel_set.add(relation_label)
+            if provenance:
+                edge["provenance"] = provenance
     
     def format_graph_memory(self) -> str:
-        """Format graph memory as a single string."""
+        """Format graph memory as a single string, merging global + local."""
         from wemg.llm.roles import SourceType
         from wemg.utils.graph import textualize_graph
 
-        components = list(nx.weakly_connected_components(self.graph_memory))
+        combined = self.graph_memory
+        if self.global_knowledge is not None and self.global_knowledge.graph.number_of_nodes() > 0:
+            combined = nx.compose(self.global_knowledge.graph, self.graph_memory)
+
+        components = list(nx.weakly_connected_components(combined))
 
         cluster_texts = []
         for comp in components:
-            triples, _ = textualize_graph(comp, self.graph_memory, method="dfs")
+            triples, _ = textualize_graph(comp, combined, method="dfs")
             formatted = [
                 self.format_memory_item(t, SourceType.SYSTEM_PREDICTION) for t in triples
             ]
@@ -299,60 +685,6 @@ class WorkingMemory:
             [f"{i}. {text}" for i, text in enumerate(cluster_texts, 1)]
         )
         return cluster_text
-
-    def connect_graph_memory(self, max_hops: int = 1) -> bool:
-        """Connect disconnected components in graph memory using Wikidata paths."""
-        from wemg.retrieval.wikidata import WikidataPathBetweenEntities
-        from wemg.utils.graph import get_densest_node
-
-        if self.graph_memory.number_of_nodes() <= 1:
-            return True
-
-        components = list(nx.weakly_connected_components(self.graph_memory))
-        if len(components) <= 1:
-            logger.info("Graph memory is already connected")
-            return True
-
-        logger.info(f"Found {len(components)} disconnected components")
-
-        densest_nodes = [
-            get_densest_node(comp, self.graph_memory, lambda x: hasattr(x, "qid") and x.qid)
-            for comp in components
-        ]
-        densest_qids: List[Optional[str]] = []
-        for node_id in densest_nodes:
-            if node_id is None:
-                densest_qids.append(None)
-            else:
-                data = self.graph_memory.nodes[node_id].get("data")
-                if data is not None and hasattr(data, "qid") and data.qid:
-                    densest_qids.append(data.qid)
-                else:
-                    densest_qids.append(None)
-
-        assert self._wikidata_client is not None, "WikidataClient must be provided"
-        valid_pairs = [
-            i for i in range(len(densest_qids) - 1)
-            if densest_qids[i] is not None and densest_qids[i + 1] is not None
-        ]
-        tasks = [
-            self._wikidata_client.afind_path(densest_qids[i], densest_qids[i + 1], max_hops=max_hops)
-            for i in valid_pairs
-        ]
-        paths = asyncio.run(_gather_awaitables(tasks))
-        for i, path in zip(valid_pairs, paths):
-            if path and isinstance(path, WikidataPathBetweenEntities) and path.path:
-                for triple in path.path:
-                    self.add_edge_to_graph_memory(triple)
-            else:
-                logger.warning(f"No path found between {densest_qids[i]} and {densest_qids[i + 1]}")
-
-        new_components = list(nx.weakly_connected_components(self.graph_memory))
-        is_connected = len(new_components) == 1
-        logger.info(
-            f"Graph {'now connected' if is_connected else f'has {len(new_components)} components'}"
-        )
-        return is_connected
 
     def _enhance_triples(self, triples: List[Relation]) -> List[WikiTriple]:
         """Enhance triples with entity and property information."""
@@ -454,54 +786,136 @@ class WorkingMemory:
         }
 
     # -----------------------------------------------------------------
-    # Graph Consolidation
+    # Graph Deduplication (structural, no LLM)
     # -----------------------------------------------------------------
 
-    def consolidate_graph_memory(
+    def _merge_nodes(self, canonical_id: str, duplicate_ids: List[str]) -> None:
+        """Merge duplicate graph nodes into the canonical node, re-wiring edges."""
+        for dup_id in duplicate_ids:
+            if not self.graph_memory.has_node(dup_id):
+                continue
+            for pred in list(self.graph_memory.predecessors(dup_id)):
+                edge_data = self.graph_memory.edges[pred, dup_id]
+                if pred == canonical_id:
+                    continue
+                if self.graph_memory.has_edge(pred, canonical_id):
+                    existing = self.graph_memory.edges[pred, canonical_id]
+                    existing.setdefault("relation", set()).update(edge_data.get("relation", set()))
+                else:
+                    self.graph_memory.add_edge(pred, canonical_id, **edge_data)
+            for succ in list(self.graph_memory.successors(dup_id)):
+                edge_data = self.graph_memory.edges[dup_id, succ]
+                if succ == canonical_id:
+                    continue
+                if self.graph_memory.has_edge(canonical_id, succ):
+                    existing = self.graph_memory.edges[canonical_id, succ]
+                    existing.setdefault("relation", set()).update(edge_data.get("relation", set()))
+                else:
+                    self.graph_memory.add_edge(canonical_id, succ, **edge_data)
+            self.graph_memory.remove_node(dup_id)
+
+    def deduplicate_graph(self) -> None:
+        """Merge nodes sharing the same QID. Does NOT merge parallel edges."""
+        qid_groups: Dict[str, List[str]] = defaultdict(list)
+        for node_id, data in self.graph_memory.nodes(data=True):
+            qid = getattr(data.get("data"), "id", None)
+            if qid:
+                qid_groups[qid].append(node_id)
+        for qid, node_ids in qid_groups.items():
+            if len(node_ids) > 1:
+                self._merge_nodes(node_ids[0], node_ids[1:])
+
+    # -----------------------------------------------------------------
+    # Memory Synchronization (one-directional: text -> graph)
+    # -----------------------------------------------------------------
+
+    def should_synchronize(self) -> bool:
+        """Return True when enough new information has accumulated to justify sync."""
+        return self._dirty and self._items_since_last_sync >= self._sync_text_threshold
+
+    async def _aconsolidate_textual_memory(
+        self,
+        client,
+        question: str,
+        interaction_memory: Optional[InteractionMemory] = None,
+    ) -> None:
+        """Async text consolidation — safe to call from within a running loop."""
+        from wemg.llm.roles import SourceType
+
+        raw_memory = self.format_textual_memory()
+        output, log = await self._run_consolidation(
+            client=client,
+            question=question,
+            raw_memory=raw_memory,
+            interaction_memory=interaction_memory,
+        )
+        self.textual_memory = []
+        for item in output.consolidated_memory:
+            if item.provenance == SourceType.SYSTEM_PREDICTION.value:
+                provenance = SourceType.SYSTEM_PREDICTION
+            elif item.provenance == SourceType.RETRIEVAL.value:
+                provenance = SourceType.RETRIEVAL
+            else:
+                logger.warning(f"Invalid provenance: {item.provenance}")
+                provenance = SourceType.SYSTEM_PREDICTION
+            logger.info(f"Adding item to textual memory: {item} with provenance: {provenance}")
+            self.add_textual_memory(item.content, source=provenance)
+        log_to_interaction_memory(interaction_memory, log)
+
+    async def asynchronize_memory(
         self,
         client,
         question: str,
         interaction_memory: Optional[InteractionMemory] = None,
         **kwargs,
     ) -> None:
-        """Consolidate graph memory by processing each component."""
-        from wemg.llm.roles import SourceType
-        from wemg.utils.graph import textualize_graph
+        """Async one-directional synchronization: text -> graph.
 
-        textualized_graph = self.format_graph_memory()
-        if not textualized_graph:
+        Entity linking and graph parsing run in parallel via asyncio.gather.
+        """
+        if not self.should_synchronize():
             return
-        
-        consolidated_output, consolidation_log = asyncio.run(self._run_consolidation(
-            client=client,
-            question=question,
-            raw_memory=textualized_graph,
-            interaction_memory=interaction_memory,
-        ))
-        consolidated = [
-            self.format_memory_item(item.content, item.provenance)
-            for item in consolidated_output.consolidated_memory
+
+        if self._items_since_last_sync >= self._sync_text_threshold:
+            await self._aconsolidate_textual_memory(client, question, interaction_memory)
+
+        unprocessed = [
+            (i, text) for i, text in enumerate(self.textual_memory)
+            if i not in self._text_item_ids_processed
         ]
-        consolidated_text = "\n".join(f"- {t}" for t in consolidated)
-        known_entities = filter_entities_relevant_to_text(
-            list(self.entity_dict.values()),
-            consolidated_text,
-        )
-        triples, parse_log = asyncio.run(parse_graph_from_text(client, consolidated_text, interaction_memory=interaction_memory, known_entities=known_entities))
-        log = merge_logs(consolidation_log, parse_log)
-        log_to_interaction_memory(interaction_memory, log)
-        enhanced_triples = self._enhance_triples(triples)
+        if unprocessed:
+            new_text = "\n".join(f"- {text.strip()}" for _, text in unprocessed)
+            known_snapshot = filter_entities_relevant_to_text(
+                [e for e in self.entity_dict.values() if isinstance(e, WikidataEntity)],
+                new_text,
+            )
+            link_kw = self._entity_link_kwargs_from_call(kwargs)
 
-        # Update the graph memory with the enhanced triples
-        self.graph_memory = nx.DiGraph()
-        for triple in enhanced_triples:
-            self.add_edge_to_graph_memory(triple)
-        # Connect the graph memory
-        self.connect_graph_memory()
+            link_result, parse_result = await asyncio.gather(
+                self._link_entities_async(
+                    client, new_text, known_snapshot, interaction_memory, **link_kw,
+                ),
+                parse_graph_from_text(
+                    client, new_text,
+                    interaction_memory=interaction_memory,
+                    known_entities=list(known_snapshot) if known_snapshot else None,
+                ),
+            )
+            linked_entities, link_log = link_result
+            triples, parse_log = parse_result
 
-    # -----------------------------------------------------------------
-    # Memory Synchronization
-    # -----------------------------------------------------------------
+            self._merge_linked_entities_into_cache(linked_entities)
+            log_to_interaction_memory(interaction_memory, merge_logs(link_log, parse_log))
+            enhanced_triples = self._enhance_triples(triples)
+            for triple in enhanced_triples:
+                self.add_edge_to_graph_memory(triple)
+            self._text_item_ids_processed.update(i for i, _ in unprocessed)
+
+        if self.graph_memory.number_of_nodes() > self._sync_graph_node_threshold:
+            self.deduplicate_graph()
+
+        self._dirty = False
+        self._items_since_last_sync = 0
 
     def synchronize_memory(
         self,
@@ -510,47 +924,14 @@ class WorkingMemory:
         interaction_memory: Optional[InteractionMemory] = None,
         **kwargs,
     ) -> None:
-        """Synchronize graph and textual memory bidirectionally."""
-        from wemg.llm.roles import SourceType
-        from wemg.utils.graph import textualize_graph
+        """Sync wrapper for ``asynchronize_memory``."""
+        asyncio.run(self.asynchronize_memory(client, question, interaction_memory, **kwargs))
 
-        if self.graph_memory.number_of_nodes() > 0:
-            for comp in nx.weakly_connected_components(self.graph_memory):
-                triples, _ = textualize_graph(comp, self.graph_memory, method="dfs")
-                for triple in triples:
-                    self.add_textual_memory(triple, source=SourceType.SYSTEM_PREDICTION)
-        self.consolidate_textual_memory(client, question, interaction_memory)
-
-        if self.textual_memory:
-            textual_memory = self.format_textual_memory()
-            known_snapshot = filter_entities_relevant_to_text(
-                [e for e in self.entity_dict.values() if isinstance(e, WikidataEntity)],
-                textual_memory,
-            )
-            link_kw = self._entity_link_kwargs_from_call(kwargs)
-            linked_entities, link_log = asyncio.run(
-                self._link_entities_async(
-                    client,
-                    textual_memory,
-                    known_snapshot,
-                    interaction_memory,
-                    **link_kw,
-                )
-            )
-            self._merge_linked_entities_into_cache(linked_entities)
-            known_entities = filter_entities_relevant_to_text(
-                list(self.entity_dict.values()),
-                textual_memory,
-            )
-            triples, parse_log = asyncio.run(parse_graph_from_text(client, textual_memory, interaction_memory=interaction_memory, known_entities=known_entities))
-            log_to_interaction_memory(interaction_memory, merge_logs(link_log, parse_log))
-            enhanced_triples = self._enhance_triples(triples)
-            for triple in enhanced_triples:
-                self.add_edge_to_graph_memory(triple)
-            self.consolidate_graph_memory(client, question, interaction_memory)
 
 __all__ = [
     "parse_graph_from_text",
+    "GlobalKnowledge",
+    "MemoryDelta",
     "WorkingMemory",
 ]
 
