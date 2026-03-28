@@ -60,12 +60,27 @@ def working_memory_snapshot(wm: Any) -> Any:
     if wm is None:
         return None
     try:
+        import networkx as nx
+
+        # Build the same composed graph that format_graph_memory() uses so that
+        # node/edge counts and entity keys match what is rendered in graph_memory.
+        gk = getattr(wm, "global_knowledge", None)
+        gk_graph = getattr(gk, "graph", None)
+        if gk_graph is not None and gk_graph.number_of_nodes() > 0:
+            effective_graph = nx.compose(gk_graph, wm.graph_memory)
+        else:
+            effective_graph = wm.graph_memory
+
+        combined_entity_dict = dict(wm.entity_dict)
+        if gk is not None:
+            combined_entity_dict.update(getattr(gk, "entity_dict", {}))
+
         return {
             "textual_memory": wm.format_textual_memory(),
             "graph_memory": wm.format_graph_memory(),
-            "entity_dict_keys": sorted(wm.entity_dict.keys()),
-            "graph_nodes": wm.graph_memory.number_of_nodes(),
-            "graph_edges": wm.graph_memory.number_of_edges(),
+            "entity_dict_keys": sorted(combined_entity_dict.keys()),
+            "graph_nodes": effective_graph.number_of_nodes(),
+            "graph_edges": effective_graph.number_of_edges(),
         }
     except Exception as exc:  # noqa: BLE001 — best-effort debug dump only
         return {"error_serializing_working_memory": repr(exc)}

@@ -10,7 +10,7 @@ class LLMGenerationConfig(BaseModel):
     timeout: int = 300
     temperature: float = 0.8
     n: int = 1
-    top_p: float = 0.8
+    top_p: float = 0.95
     max_tokens: int = 32768
     max_input_tokens: int = 65536
     top_k: int = 20
@@ -43,6 +43,8 @@ class WebSearchConfig(BaseModel):
     top_k: int = 5
     crawl_full_text: bool = True
     max_crawl_requests_per_second: float = 2.0
+    query_cache_ttl: Optional[int] = 3600  # seconds; None disables query caching, 0 = no expiry
+    url_cache_ttl: Optional[int] = 3600    # seconds; None disables URL caching, 0 = no expiry
 
 
 class EmbedderConfig(BaseModel):
@@ -88,6 +90,7 @@ class MCTSConfig(BaseModel):
     exploration_weight: float = 2.5
     use_golden_answer_for_reward: bool = False
     min_graph_nodes_for_consensus: int = 3
+    consensus_weight: float = 0.7
     early_termination: MCTSEarlyTerminationConfig = MCTSEarlyTerminationConfig()
 
 
@@ -117,13 +120,12 @@ class NodeGenerationConfig(BaseModel):
 
 class WorkingMemoryConfig(BaseModel):
     max_textual_memory_tokens: int = 16384
-    sync_text_threshold: int = 5
-    sync_graph_node_threshold: int = 5
     absorption_min_reward: float = 0.0
+    absorption_top_k: int = 3
 
 
 class InteractionMemoryConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     scope: Literal["question", "dataset"] = "question"
     log_dir: str = "./logs"
     save_to_file: bool = False

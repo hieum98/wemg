@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import time
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
 import pydantic
@@ -17,6 +17,33 @@ logger = logging.getLogger(__name__)
 
 # Max requests per second when crawling pages; stay under this to avoid destination rate limits.
 DEFAULT_MAX_CRAWL_REQUESTS_PER_SECOND = 2.0
+
+
+class _InMemoryCache:
+    """Thread-safe in-memory cache with optional TTL."""
+
+    def __init__(self) -> None:
+        self._store: Dict[str, Tuple[Any, Optional[float]]] = {}  # key -> (value, expire_at)
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            value, expire_at = entry
+            if expire_at is not None and time.monotonic() >= expire_at:
+                del self._store[key]
+                return None
+            return value
+
+    def set(self, key: str, value: Any, ttl: Optional[int]) -> None:
+        expire_at = (time.monotonic() + ttl) if ttl is not None else None
+        with self._lock:
+            self._store[key] = (value, expire_at)
+
+    def __len__(self) -> int:
+        return len(self._store)
 
 
 class WebSearchResult(pydantic.BaseModel):
@@ -156,12 +183,23 @@ def crawl_pages(
 
 
 class WebSearchTool:
-    """Web search with Serper API, DuckDuckGo fallback, and page crawling."""
+    """Web search with Serper API, DuckDuckGo fallback, and page crawling.
+
+    Args:
+        api_key: Serper API key (falls back to SERPER_API_KEY env var).
+        max_crawl_requests_per_second: Rate limit for page crawling.
+        query_cache_ttl: Seconds to cache search results per query. ``None`` disables
+            query caching; ``0`` caches forever.
+        url_cache_ttl: Seconds to cache crawled page content per URL. ``None`` disables
+            URL caching; ``0`` caches forever.
+    """
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         max_crawl_requests_per_second: Optional[float] = None,
+        query_cache_ttl: Optional[int] = 3600,
+        url_cache_ttl: Optional[int] = 3600,
     ):
         self.api_key = api_key or os.getenv("SERPER_API_KEY", "")
         self.max_crawl_requests_per_second = (
@@ -169,29 +207,76 @@ class WebSearchTool:
             if max_crawl_requests_per_second is not None
             else DEFAULT_MAX_CRAWL_REQUESTS_PER_SECOND
         )
+        # None means caching disabled; convert 0 -> None for _InMemoryCache (no expiry).
+        self._query_cache: Optional[_InMemoryCache] = _InMemoryCache() if query_cache_ttl is not None else None
+        self._query_ttl: Optional[int] = query_cache_ttl if query_cache_ttl != 0 else None
+        self._url_cache: Optional[_InMemoryCache] = _InMemoryCache() if url_cache_ttl is not None else None
+        self._url_ttl: Optional[int] = url_cache_ttl if url_cache_ttl != 0 else None
+
+    def _cached_search(self, query: str) -> Optional[List[WebSearchResult]]:
+        if self._query_cache is None:
+            return None
+        raw = self._query_cache.get(query)
+        if raw is None:
+            return None
+        logger.debug("Query cache hit: %r", query)
+        return [WebSearchResult(**r) for r in raw]
+
+    def _cache_search(self, query: str, results: List[WebSearchResult]) -> None:
+        if self._query_cache is not None:
+            self._query_cache.set(query, [r.model_dump() for r in results], self._query_ttl)
+
+    def _cached_crawl(self, url: str) -> Optional[str]:
+        if self._url_cache is None:
+            return None
+        cached = self._url_cache.get(url)
+        if cached is None:
+            return None
+        logger.debug("URL cache hit: %s", url)
+        return cached
+
+    def _cache_crawl(self, url: str, content: str) -> None:
+        if self._url_cache is not None:
+            self._url_cache.set(url, content, self._url_ttl)
 
     def search(self, query: str, top_k: int = 5, crawl_full_text: bool = True) -> WebSearchOutput:
         """Synchronous search."""
-        try:
-            results, kg = _serper_search(query, self.api_key)
-        except Exception as e:
-            logger.warning(f"Serper API failed: {e}. Falling back to DDGS.")
+        cached_results = self._cached_search(query)
+        if cached_results is not None:
+            top_results = cached_results[:top_k]
+        else:
             try:
-                results, kg = _ddgs_search(query)
-            except Exception as e2:
-                logger.error(f"DDGS also failed: {e2}. Returning empty results.")
-                return WebSearchOutput(query=query)
+                results, kg = _serper_search(query, self.api_key)
+            except Exception as e:
+                logger.warning(f"Serper API failed: {e}. Falling back to DDGS.")
+                try:
+                    results, kg = _ddgs_search(query)
+                except Exception as e2:
+                    logger.error(f"DDGS also failed: {e2}. Returning empty results.")
+                    return WebSearchOutput(query=query)
+            self._cache_search(query, results)
+            top_results = results[:top_k]
 
-        top_results = results[:top_k]
         if crawl_full_text:
-            urls = [r.link for r in top_results]
-            full_texts = crawl_pages(
-                urls,
-                max_requests_per_second=self.max_crawl_requests_per_second,
-            )
-            for result, text in zip(top_results, full_texts):
-                if text:
-                    result.full_text = text
+            uncached_indices = []
+            uncached_urls = []
+            for i, result in enumerate(top_results):
+                cached_text = self._cached_crawl(result.link)
+                if cached_text is not None:
+                    result.full_text = cached_text
+                else:
+                    uncached_indices.append(i)
+                    uncached_urls.append(result.link)
+
+            if uncached_urls:
+                full_texts = crawl_pages(
+                    uncached_urls,
+                    max_requests_per_second=self.max_crawl_requests_per_second,
+                )
+                for idx, url, text in zip(uncached_indices, uncached_urls, full_texts):
+                    if text:
+                        top_results[idx].full_text = text
+                        self._cache_crawl(url, text)
 
         return WebSearchOutput(query=query, results=top_results, is_success=True)
 

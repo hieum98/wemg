@@ -29,14 +29,16 @@ def truncate_text_to_max_tokens(
 
 def format_context(
     memory: str = None,
+    graph_memory: str = None,
     retrieval_info: List[str] = None,
     reasoning_trace: str = None,
 ) -> str:
-    """Format context string from memory, retrieval info, and reasoning trace.
+    """Format context string from memory, graph memory, retrieval info, and reasoning trace.
 
     Combines:
     - memory text directly
     - retrieval_info as "- [Retrieval]: {content}" lines
+    - graph_memory as a structured knowledge section
     - reasoning_trace as a separate section
     Joins non-empty sections with "\\n---------------\\n"
     """
@@ -49,7 +51,8 @@ def format_context(
     fact_context = "\n".join(p for p in fact_parts if p)
     fact_context = "**Information** \n" + fact_context if fact_context else ""
 
+    graph_context = f"**Structured Knowledge (Graph)**\n{graph_memory}" if graph_memory else ""
     reasoning_context = f"**Reasoning Trace** \n{reasoning_trace}" if reasoning_trace else ""
 
-    sections = [fact_context, reasoning_context]
+    sections = [fact_context, graph_context, reasoning_context]
     return "\n---------------\n".join(s for s in sections if s)

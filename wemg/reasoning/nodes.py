@@ -2,7 +2,7 @@
 
 import math
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 import pydantic
 from anytree import NodeMixin, RenderTree
 
@@ -234,3 +234,37 @@ class MCTSNode(ReasoningNode):
 class CoTNode(ReasoningNode):
     """Reasoning node for Chain-of-Thought (no MCTS-specific fields needed)."""
     pass
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers used by both mcts.py and cot.py
+# ---------------------------------------------------------------------------
+
+def check_correctness(predicted: str, answers: Union[str, List[str]]) -> bool:
+    """Return True if any answer string appears (case-insensitive) in predicted."""
+    if not predicted or not answers:
+        return False
+    if isinstance(answers, str):
+        answers = [answers]
+    predicted_lower = predicted.lower()
+    return any(a and a.lower() in predicted_lower for a in answers)
+
+
+def make_final_answer_state(user_question: str, answer) -> NodeState:
+    """Build a FINAL_ANSWER NodeState from an answer object."""
+    return NodeState(node_type=NodeType.FINAL_ANSWER, content={
+        "user_question": user_question,
+        "final_answer": answer.answer,
+        "concise_answer": answer.concise_answer,
+        "reasoning": answer.reasoning,
+    })
+
+
+def make_subqa_state(user_question: str, sub_question: str, answer) -> NodeState:
+    """Build a SUB_QA_NODE NodeState from a sub-question and its answer object."""
+    return NodeState(node_type=NodeType.SUB_QA_NODE, content={
+        "user_question": user_question,
+        "sub_question": sub_question,
+        "sub_answer": answer.answer,
+        "reasoning": answer.reasoning,
+    })

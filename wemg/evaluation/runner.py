@@ -5,6 +5,7 @@ import json
 import logging
 import pickle
 import hashlib
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,11 +69,14 @@ def _save_question_artifacts(
     working_memory = getattr(result, "working_memory", None)
     global_knowledge = getattr(result, "global_knowledge", None)
 
-    textual_items = list(getattr(working_memory, "textual_memory", []) or []) if working_memory else []
+    # MCTS: global_knowledge absorbs all branch discoveries — use it as the source of truth.
+    # CoT: no global_knowledge, so fall back to working_memory directly.
     if global_knowledge is not None:
-        for gf in getattr(global_knowledge, "confirmed_facts", []):
-            if gf not in textual_items:
-                textual_items.insert(0, gf)
+        textual_items = list(getattr(global_knowledge, "confirmed_facts", []) or [])
+        graph = getattr(global_knowledge, "graph", None)
+    else:
+        textual_items = list(getattr(working_memory, "textual_memory", []) or []) if working_memory else []
+        graph = getattr(working_memory, "graph_memory", None) if working_memory else None
 
     if textual_items:
         textual_path = q_dir / "working_memory_textual.json"
@@ -80,14 +84,6 @@ def _save_question_artifacts(
             json.dump(textual_items, f, indent=2, ensure_ascii=False)
         out["textual_memory_path"] = str(textual_path)
 
-    graph = getattr(working_memory, "graph_memory", None)
-    if global_knowledge is not None:
-        import networkx as _nx
-        gk_graph = getattr(global_knowledge, "graph", None)
-        if gk_graph is not None and graph is not None:
-            graph = _nx.compose(gk_graph, graph)
-        elif gk_graph is not None:
-            graph = gk_graph
     if graph is not None:
         graph_path = q_dir / "working_memory_graph.pkl"
         with open(graph_path, "wb") as f:
@@ -280,18 +276,38 @@ class DatasetEvaluator:
                 mw = max_concurrent
                 if mw is not None:
                     mw = max(1, min(mw, len(batch)))
+                chunk_index = (chunk_start // chunk_size) + 1
+                logger.info(
+                    "PROFSTEP eval stage=chunk_start chunk=%d/%d size=%d max_workers=%s",
+                    chunk_index,
+                    (total_pending + chunk_size - 1) // chunk_size,
+                    len(batch),
+                    str(mw),
+                )
+                t_chunk = time.perf_counter()
                 results = self.system.answer_batch(
                     questions,
                     question_ids=qids,
                     golden_answers=golds,
                     max_workers=mw,
                 )
+                logger.info(
+                    "PROFSTEP eval stage=answer_batch_done chunk=%d elapsed_ms=%.1f",
+                    chunk_index,
+                    (time.perf_counter() - t_chunk) * 1000.0,
+                )
+                t_log = time.perf_counter()
                 entries = process_answer_results(batch, results)
                 append_logs(entries)
+                logger.info(
+                    "PROFSTEP eval stage=append_logs_done chunk=%d elapsed_ms=%.1f entries=%d",
+                    chunk_index,
+                    (time.perf_counter() - t_log) * 1000.0,
+                    len(entries),
+                )
 
                 # Bound process memory in long-running eval by clearing Wikidata
                 # triple caches periodically between chunks.
-                chunk_index = (chunk_start // chunk_size) + 1
                 if cache_clear_every > 0 and (chunk_index % cache_clear_every == 0):
                     wikidata_client = getattr(self.system, "wikidata_client", None)
                     if wikidata_client is not None and hasattr(

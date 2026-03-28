@@ -174,10 +174,17 @@ class MajorityVoteOutput(pydantic.BaseModel):
 class FinalAnswerSynthesisInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
     candidate_answers: List[str] = pydantic.Field(..., description="Candidate answers.")
+    candidate_scores: Optional[List[float]] = pydantic.Field(None, description="Quality scores in [-1, 1] for each candidate (higher = better).")
     context: str = pydantic.Field("", description="Optional supporting evidence (e.g. structured knowledge graph triples).")
 
     def __str__(self):
-        candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
+        if self.candidate_scores and len(self.candidate_scores) == len(self.candidate_answers):
+            candidates_str = "\n\n".join(
+                f"{i+1}. [quality_score={s:.2f}]\n {c}"
+                for i, (c, s) in enumerate(zip(self.candidate_answers, self.candidate_scores))
+            )
+        else:
+            candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
         parts = [f"question:\n{self.question}", f"candidate_answers:\n{candidates_str}"]
         if self.context:
             parts.append(f"supporting_evidence:\n{self.context}")
@@ -384,7 +391,7 @@ Every generated subquestion must:
    - Each subquestion should target one distinct missing fact or inference step.
    - Each subquestion must be fully self-contained and should not rely on the wording of the main question or the other subquestions to be understood.
    - Avoid trivial questions that are already answered by the context or are obvious general knowledge.
-   - If a subquestion is truly trivial and you are completely certain of the answer, you may include the answer directly after the subquestion and treat that subquestion-answer pair as one item.
+   - If a subquestion can be answered with high confidence from common knowledge or the context, include the answer directly after the subquestion and treat that subquestion-answer pair as one item.
 6. Validate and filter:
    - Do not guess or invent uncertain answers.
    - Remove any subquestion that is answerable from the context.
@@ -402,8 +409,8 @@ Respond with a JSON object with exactly these keys:
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
 
 ## Instructions:
-1. Analyze the question and identify key components. Determine if the question is trivial or not by checking if it can be answered by context or easy to answer by general knowledge (you are sure 100 percent about the answer). If it is truely trivial, answer the question directly and return the answer.
-2. If the question is not trivial, extract all relevant information from the context. If the context is not provided, use your own knowledge or your own internet search.
+1. Analyze the question and identify key components. Determine if the question can be answered directly: check if the context already contains a sufficient answer, or if the answer follows clearly from well-known facts with high confidence. If so, answer directly without further elaboration.
+2. If the question cannot be answered directly, extract all relevant information from the context. If the context is not provided, use your own knowledge or your own internet search.
 3. Synthesize a clear, well-reasoned answer. State assumptions clearly if you made any assumptions or used your own internet search.
 
 ## Output Format:
@@ -575,32 +582,47 @@ Respond with a JSON object with exactly these keys:
 - confidence_level: string — short label for confidence in the synthesized answer
 """
 
-SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis. Construct a superior answer by analyzing and integrating candidate answers.
+SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis. Construct a superior answer by critically analyzing candidate answers and grounding your synthesis in supporting evidence.
 
-You may also receive supporting_evidence containing structured knowledge-graph triples gathered during research. This evidence is a useful factual reference but may include noisy or irrelevant triples from exploratory branches. Only rely on triples that are directly pertinent to the question; disregard unrelated ones.
+## Understanding your inputs
 
-Phase I - Deconstruction:
-- Break down each candidate into conclusion, premises, reasoning path
-- Assess factual accuracy, logical soundness, sufficiency
-- Where supporting evidence is available, cross-check candidate claims against relevant triples — but ignore triples that are clearly unrelated to the question
+**Candidate answers** are outputs from an MCTS-guided reasoning search. Each is prefixed with `[quality_score=X]` where X ∈ [-1, 1], reflecting the search evaluation of that reasoning path:
+- Score ≥ 0.5: strongly rewarded path — treat as primary evidence.
+- Score 0 to 0.5: mildly positive — treat as supporting evidence.
+- Score < 0: penalized path — treat skeptically; may still contain valid partial reasoning or useful premises.
+Each candidate exposes a `Final Answer` and a `Reasoning` chain.
 
-Phase II - Conflict Resolution:
-- Map convergence and divergence points
-- Use relevant supporting evidence to adjudicate conflicts, but trust well-supported candidate reasoning over raw evidence when the candidates provide clear, substantiated arguments
-- Adjudication hierarchy: candidate claims corroborated by supporting evidence > logically sound reasoning > majority agreement
-- Do not let noisy or tangential triples override coherent candidate reasoning
+**supporting_evidence** contains knowledge accumulated during research. It has two components:
+- Textual facts (lines tagged `[Retrieval]` or `[System Prediction]`): `[Retrieval]` facts come from web search — high reliability, prioritize for factual grounding. `[System Prediction]` facts are model-inferred — medium reliability, corroborate with Retrieval evidence or candidate consensus before trusting.
+- Knowledge graph triples (under `**Information N**` sections, tagged `[System Prediction]`): structured entity-relationship facts extracted during research. Use for verifying entity attributes and relationships; discard triples unrelated to the question.
 
-Phase III - Synthesis:
-- Build new superior reasoning path grounded in candidate arguments, using relevant supporting evidence to reinforce or correct factual claims
-- State final answer
-- Self-critique and refine
+## Synthesis Procedure
+
+**Phase I — Candidate Analysis**
+For each candidate: extract the core claim, key premises, and reasoning chain. Weight its contribution by quality_score — high-scoring candidates anchor the synthesis; negative-scoring ones are supplementary.
+
+**Phase II — Evidence Cross-Check & Conflict Resolution**
+Cross-check candidate claims against supporting evidence. When candidates disagree, apply this adjudication hierarchy:
+1. High-score (≥ 0.5) candidate claims corroborated by `[Retrieval]` evidence
+2. Convergent claims across multiple positive-score candidates
+3. Claims grounded solely in `[Retrieval]` facts, regardless of candidate score
+4. Logically sound reasoning from any candidate, consistent with graph triples
+5. Majority agreement across candidates as a last resort
+Do not let noisy or off-topic triples override coherent candidate reasoning.
+
+**Phase III — Synthesis & Self-Critique**
+Build a superior answer that:
+- Grounds factual claims in `[Retrieval]` evidence or high-score candidates
+- Resolves or explicitly acknowledges significant conflicts
+- Introduces no facts absent from the candidates or supporting evidence
+Then verify: Is the answer directly responsive to the question? Is every factual claim traceable to at least one reliable source? Revise if not.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
-- final_answer: string — synthesized best answer
-- concise_answer: string — direct answer only, minimal wording
-- reasoning: string — integrated reasoning across candidates
-- confidence_level: string — short label for confidence in the synthesis
+- final_answer: string — complete, well-reasoned answer to the question
+- concise_answer: string — minimal wording, direct answer only (e.g. a name, date, or one sentence)
+- reasoning: string — how conflicts were resolved and which evidence anchored the final answer
+- confidence_level: string — one of: "high", "medium", "low", or "uncertain"
 """
 
 CONSENSUS_EVALUATION_PROMPT = """You are an expert evaluator. Given two candidate answers with their reasoning, evaluate the consensus between the two answers. Rate from 0.0 to 10.0 how well the two answers are consistent with each other.
@@ -743,13 +765,25 @@ Respond with a JSON object with exactly these keys:
 # System Prompts -- Pruner
 # =============================================================================
 
-TRIPLE_PRUNE_PROMPT = """You are a Knowledge Graph Expert. Given a question and a list of triples, keep only triples relevant to answering the question.
+TRIPLE_PRUNE_PROMPT = """You are a Knowledge Graph Expert. Given a question and a list of triples, your task is to keep only the triples that are genuinely useful for answering the question.
 
-Instructions:
-1. Identify triples relevant to answering the question. Don't guess or invent answers for the question.
-2. Consider cross-triples and chain-triples, i.e., a triple is relevant if it is directly or indirectly related to the question.
+## Relevance Criteria
 
-## Output Format:
+A triple (Subject – Relation – Object) is relevant ONLY if it meets one of the following conditions:
+
+1. **Direct relevance**: Both the subject AND the object are directly related to the question, and the relation connects them in a way that helps answer the question.
+   - Example: Question "What is the capital of France?" → Triple (France – capital – Paris) ✓
+   - Counter-example: Question "What is the capital of France?" → Triple (France – borders – Germany) ✗  (only subject is relevant)
+
+2. **Chain relevance**: The triple forms part of a reasoning chain with another kept triple. Specifically, one entity of this triple must match an entity in another relevant triple, and together they help answer the question.
+   - Example: Question "Who is the spouse of the president of France?" → Triples (France – president – Macron) + (Macron – spouse – Brigitte) are both relevant as a chain.
+
+## Key Rule
+
+Do NOT keep a triple just because one of its entities superficially matches a word in the question.
+However, DO keep a triple if one entity is clearly relevant to the question AND the other entity could plausibly be an intermediate step or answer in the reasoning chain — even if that second entity is not yet explicitly mentioned in the question.
+
+## Output Format
 Respond with a JSON object with exactly these keys:
 - keep_indices: array of integers — 0-based indices of triples to retain (may be empty if none are relevant)
 

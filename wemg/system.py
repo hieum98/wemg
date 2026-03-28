@@ -6,6 +6,7 @@ import os
 import re
 import hashlib
 import uuid
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -167,6 +168,8 @@ class WEMGSystem:
             tool = WebSearchTool(
                 api_key=self.cfg.retriever.web_search.api_key,
                 max_crawl_requests_per_second=self.cfg.retriever.web_search.max_crawl_requests_per_second,
+                query_cache_ttl=self.cfg.retriever.web_search.query_cache_ttl,
+                url_cache_ttl=self.cfg.retriever.web_search.url_cache_ttl,
             )
             return tool
         elif self.cfg.retriever.type == "corpus":
@@ -203,8 +206,6 @@ class WEMGSystem:
         return WorkingMemory(
             max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
             wikidata_client=self.wikidata_client,
-            sync_text_threshold=wm_cfg.sync_text_threshold,
-            sync_graph_node_threshold=wm_cfg.sync_graph_node_threshold,
             global_knowledge=global_knowledge,
         )
 
@@ -213,8 +214,6 @@ class WEMGSystem:
         return GlobalKnowledge(
             wikidata_client=self.wikidata_client,
             max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
-            sync_text_threshold=wm_cfg.sync_text_threshold,
-            sync_graph_node_threshold=wm_cfg.sync_graph_node_threshold,
         )
     
     def _create_interaction_memory(self, collection_name: str = None) -> Optional[InteractionMemory]:
@@ -264,6 +263,12 @@ class WEMGSystem:
     
     def answer(self, question: str, question_id: str = None, golden_answer: Optional[str] = None) -> AnswerResult:
         self._initialize()
+        t_answer = time.perf_counter()
+        logger.info(
+            "PROFSTEP system stage=answer_start question_id=%s question=%s",
+            str(question_id),
+            question[:120].replace("\n", " "),
+        )
         
         if self.cfg.memory.interaction_memory.scope == "dataset" and self.interaction_memory:
             interaction_memory = self.interaction_memory
@@ -275,11 +280,25 @@ class WEMGSystem:
         
         if strategy == "cot":
             working_memory = self._create_working_memory()
-            return asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            result = asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            logger.info(
+                "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
+                strategy,
+                (time.perf_counter() - t_answer) * 1000.0,
+                str(question_id),
+            )
+            return result
         elif strategy == "mcts":
             gk = self._create_global_knowledge()
             working_memory = self._create_working_memory(global_knowledge=gk)
-            return asyncio.run(self._answer_with_mcts(question, question_id, working_memory, gk, interaction_memory, node_gen_kwargs, golden_answer))
+            result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, gk, interaction_memory, node_gen_kwargs, golden_answer))
+            logger.info(
+                "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
+                strategy,
+                (time.perf_counter() - t_answer) * 1000.0,
+                str(question_id),
+            )
+            return result
         raise ValueError(f"Unknown strategy: {strategy}")
     
     async def _answer_with_cot(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer):
@@ -306,7 +325,8 @@ class WEMGSystem:
         mcts_cfg = self.cfg.search.mcts
         et = mcts_cfg.early_termination
         wm_cfg = self.cfg.memory.working_memory
-        
+        t_mcts = time.perf_counter()
+        logger.info("PROFSTEP system stage=mcts_search_start question_id=%s", str(question_id))
         best_content, root, pass_at_k = await mcts_search(
             question=question, client=self.client, retriever=self.retriever,
             wikidata_client=self.wikidata_client, reranker=self.reranker,
@@ -321,14 +341,28 @@ class WEMGSystem:
             convergence_patience=et.convergence_patience,
             semantic_sufficiency_count=et.semantic_sufficiency_count,
             absorption_min_reward=wm_cfg.absorption_min_reward,
+            absorption_top_k=wm_cfg.absorption_top_k,
             min_graph_nodes_for_consensus=mcts_cfg.min_graph_nodes_for_consensus,
+            consensus_weight=mcts_cfg.consensus_weight,
             **kwargs,
+        )
+        logger.info(
+            "PROFSTEP system stage=mcts_search_done question_id=%s elapsed_ms=%.1f pass_at_k=%s",
+            str(question_id),
+            (time.perf_counter() - t_mcts) * 1000.0,
+            str(pass_at_k),
         )
         
         if self.cfg.output.show_search_tree:
             root.print_tree()
-        
-        full_answer, concise_answer = await get_answer(root, self.client, interaction_memory, working_memory=working_memory)
+        t_final = time.perf_counter()
+        logger.info("PROFSTEP system stage=get_answer_start question_id=%s", str(question_id))
+        full_answer, concise_answer = await get_answer(root, self.client, interaction_memory, working_memory=working_memory, global_knowledge=global_knowledge)
+        logger.info(
+            "PROFSTEP system stage=get_answer_done question_id=%s elapsed_ms=%.1f",
+            str(question_id),
+            (time.perf_counter() - t_final) * 1000.0,
+        )
         return AnswerResult(
             question=question, answer=full_answer, concise_answer=concise_answer,
             search_tree=root if self.cfg.output.include_reasoning else None,

@@ -32,6 +32,8 @@ retriever:
     top_k: 5
     crawl_full_text: true
     max_crawl_requests_per_second: 2
+    query_cache_ttl: 3600  # seconds; null to disable, 0 for no expiry
+    url_cache_ttl: 3600    # seconds; null to disable, 0 for no expiry
   corpus:
     embedder:
       model_name: "Qwen3-Embedding-4B"
@@ -53,23 +55,24 @@ reranker:
 search:
   strategy: "mcts"
   mcts:
-    num_iterations: 30
+    num_iterations: 15
     max_tree_depth: 10
     exploration_weight: 2.5
     use_golden_answer_for_reward: false
     min_graph_nodes_for_consensus: 3
+    consensus_weight: 0.7        # weight for consensus reward when graph is available (answer_weight = 1 - this)
     early_termination:
       enabled: true
-      min_iterations: 5
+      min_iterations: 3
       high_confidence_threshold: 0.9
-      convergence_patience: 5
+      convergence_patience: 3
       semantic_sufficiency_count: 3
   cot:
     max_depth: 10
 
 node_generation:
   n: 1
-  n_subquestions: 1
+  n_subquestions: 3
   top_k_websearch: 5
   top_k_entities: 5
   n_hops: 1
@@ -83,9 +86,8 @@ node_generation:
 memory:
   working_memory:
     max_textual_memory_tokens: 16384
-    sync_text_threshold: 10          # consolidate text after N new items
-    sync_graph_node_threshold: 5    # structural QID dedup after N graph nodes
     absorption_min_reward: 0.0       # min branch reward to promote delta into GlobalKnowledge
+    absorption_top_k: 3              # fallback: absorb top-k branches by reward if nothing was absorbed
   interaction_memory:
     enabled: false
     scope: "question"

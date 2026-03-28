@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
@@ -73,6 +74,21 @@ class NodeGenerator:
         self.working_memory = working_memory
         self.interaction_memory = interaction_memory
         self.kwargs = kwargs
+
+    def _build_context(
+        self,
+        retrieval_info: List[str] = None,
+        reasoning_trace: str = None,
+    ) -> str:
+        """Build LLM context from textual memory, graph memory, and retrieval."""
+        memory = self.working_memory.format_textual_memory()
+        graph_mem = self.working_memory.format_graph_memory()
+        return format_context(
+            memory=memory,
+            graph_memory=graph_mem or None,
+            retrieval_info=retrieval_info,
+            reasoning_trace=reasoning_trace,
+        )
     
     async def generate_answer(self, question: str, should_explore: bool = True) -> GenerationResult:
         """Generate answer via retrieval + extraction + LLM answer generation.
@@ -80,7 +96,7 @@ class NodeGenerator:
         Pipeline:
         1. If should_explore: run explore() to get web results + Wikidata triples
         2. Extract relevant info from web results using Extractor role
-        3. Build context from memory + extracted info + KB triples
+        3. Build context from textual memory + graph memory + extracted info + KB triples
         4. Generate answer using AnswerGenerator role
         """
         if should_explore:
@@ -109,8 +125,7 @@ class NodeGenerator:
         
         info_from_kb = [str(t) for t in retrieved_triples]
         all_info = info_from_web + info_from_kb
-        memory = self.working_memory.format_textual_memory()
-        context = format_context(memory=memory, retrieval_info=all_info)
+        context = self._build_context(retrieval_info=all_info)
         
         qa_input = AnswerGenerationInput(question=question, context=context)
         answers, qa_log = await execute_role(
@@ -128,8 +143,7 @@ class NodeGenerator:
     
     async def generate_subquestion(self, user_question: str) -> Tuple[List[str], bool, Dict]:
         """Generate subquestions. Returns (subquestions, should_direct_answer, log_data)."""
-        memory = self.working_memory.format_textual_memory()
-        context = format_context(memory=memory)
+        context = self._build_context()
         subq_input = SubquestionGenerationInput(question=user_question, context=context)
         n_subq = self.kwargs.get('n_subquestions', 3)
         subquestions, log = await execute_role(
@@ -150,8 +164,7 @@ class NodeGenerator:
     
     async def generate_rephrase(self, question: str) -> Tuple[List[str], Dict]:
         """Generate rephrased questions. Returns (rephrased_questions, log_data)."""
-        memory = self.working_memory.format_textual_memory()
-        context = format_context(memory=memory)
+        context = self._build_context()
         input_data = QuestionRephraserInput(context=context, original_question=question)
         rephrased, log = await execute_role(
             client=self.client, role=QUESTION_REPHRASER, input_data=input_data,
@@ -179,8 +192,7 @@ class NodeGenerator:
             extractor_log = {}
         
         all_info = info + [str(t) for t in triples]
-        memory = self.working_memory.format_textual_memory()
-        context = format_context(memory=memory, retrieval_info=all_info)
+        context = self._build_context(retrieval_info=all_info)
         
         correction_input = SelfCorrectionInput(question=sub_question, proposed_answer=sub_answer, context=context)
         corrections, qa_log = await execute_role(
@@ -197,8 +209,7 @@ class NodeGenerator:
     
     async def generate_synthesis(self, user_question: str) -> GenerationResult:
         """Generate reasoning synthesis."""
-        memory = self.working_memory.format_textual_memory()
-        context = format_context(memory=memory)
+        context = self._build_context()
         
         synth_input = ReasoningSynthesizeInput(question=user_question, context=context)
         outputs, reasoning_log = await execute_role(
@@ -233,17 +244,37 @@ class NodeGenerator:
         4. Prune triples and entities
         5. Return (documents, triples, entities, log_data)
         """
+        q_short = question[:120].replace("\n", " ")
+        t_explore_start = time.perf_counter()
+        logger.info("PROFSTEP explore stage=start question=%s", q_short)
+
+        t0 = time.perf_counter()
         query_input = QueryGeneratorInput(input_text=question)
         responses, query_log = await execute_role(
             client=self.client, role=QUERY_GENERATOR, input_data=query_input,
             interaction_memory=self.interaction_memory, n=1
         )
         queries = responses[0].queries if responses else [question]
+        queries = list(set(queries))
+        logger.info(
+            "PROFSTEP explore stage=query_generator elapsed_ms=%.1f queries=%d question=%s",
+            (time.perf_counter() - t0) * 1000.0,
+            len(queries),
+            q_short,
+        )
 
+        t0 = time.perf_counter()
         tasks = [self._retrieve_from_web(q) for q in queries]
         web_results = await asyncio.gather(*tasks)
         documents = list(set(sum(web_results, [])))
+        logger.info(
+            "PROFSTEP explore stage=web_retrieval elapsed_ms=%.1f docs=%d question=%s",
+            (time.perf_counter() - t0) * 1000.0,
+            len(documents),
+            q_short,
+        )
         
+        t0 = time.perf_counter()
         tasks = [self._retrieve_from_kb(q) for q in queries]
         results = await asyncio.gather(*tasks)
         triples = []
@@ -253,11 +284,26 @@ class NodeGenerator:
             triples.extend(t)
             entities.extend(e)
             kb_log = merge_logs(kb_log, l)
+        logger.info(
+            "PROFSTEP explore stage=kb_retrieval elapsed_ms=%.1f triples=%d entities=%d question=%s",
+            (time.perf_counter() - t0) * 1000.0,
+            len(triples),
+            len(entities),
+            q_short,
+        )
+
         entities = list(set(entities))
         assert self.wikidata_client is not None and isinstance(self.wikidata_client, WikidataClient), "WikidataClient must be provided"
         all_entities = [self.working_memory.entity_dict.get(e.qid) if self.working_memory.entity_dict.get(e.qid) else e 
                         for e in entities]
-        all_entities = self.wikidata_client.enrich_entities(all_entities, get_details=True)
+        t0 = time.perf_counter()
+        all_entities = await self.wikidata_client.aenrich_entities(all_entities, get_details=True)
+        logger.info(
+            "PROFSTEP explore stage=enrich_entities elapsed_ms=%.1f entities=%d question=%s",
+            (time.perf_counter() - t0) * 1000.0,
+            len(all_entities),
+            q_short,
+        )
 
         kb_documents = []
         for entity in all_entities:
@@ -265,12 +311,28 @@ class NodeGenerator:
                 kb_documents.append(entity.wikipedia_content)
         kb_documents = list(set(kb_documents))
 
+        t0 = time.perf_counter()
         if self.reranker and self.kwargs.get("rerank_kb_documents", True) and kb_documents:
             top_kb = self.reranker.rerank(question, kb_documents)
         else:
             top_kb = kb_documents
+        logger.info(
+            "PROFSTEP explore stage=rerank_kb_documents elapsed_ms=%.1f kb_docs=%d top_docs=%d question=%s",
+            (time.perf_counter() - t0) * 1000.0,
+            len(kb_documents),
+            len(top_kb),
+            q_short,
+        )
         documents = list(set(documents + top_kb))
         all_log = merge_logs(query_log, kb_log)
+        logger.info(
+            "PROFSTEP explore stage=done elapsed_ms=%.1f docs=%d triples=%d entities=%d question=%s",
+            (time.perf_counter() - t_explore_start) * 1000.0,
+            len(documents),
+            len(triples),
+            len(all_entities),
+            q_short,
+        )
         return documents, triples, all_entities, all_log
     
     async def _retrieve_from_web(self, query: str) -> List[str]:
@@ -291,7 +353,12 @@ class NodeGenerator:
             return []
     
     async def _retrieve_from_kb(self, question: str) -> Tuple[List[WikiTriple], List, Dict]:
-        """Retrieve triples from Wikidata knowledge base."""
+        """Retrieve triples from Wikidata knowledge base.
+
+        Graph-aware enhancements:
+        - Expands the query QID set with underexplored graph neighbours.
+        - Filters out triples already present in the graph before pruning.
+        """
         entity_linking_method = self.kwargs.get('entity_linking_method', 'llm')
         top_k_entities = self.kwargs.get('top_k_entities', 1)
         n_hops = self.kwargs.get('n_hops', 1)
@@ -323,18 +390,41 @@ class NodeGenerator:
         qids = [e.qid for e in question_entities]
         if not qids:
             return [], [], link_log
+
+        neighbor_qids = self.working_memory.get_underexplored_neighbor_qids(qids)
+        all_qids = list(dict.fromkeys(qids + neighbor_qids))
+
         triples = await self.wikidata_client.aget_k_hop_triples(
-            qids, k=n_hops, bidirectional=True, enrich=True
+            all_qids, k=n_hops, bidirectional=True, enrich=True
         )
         if isinstance(triples, list) and triples and isinstance(triples[0], list):
             triples = sum(triples, [])
         triples = list(set(triples)) if triples else []
+
+        triples = self._filter_known_triples(triples)
+
         all_entities = entities
         if triples:
             triples, prune_log = await self._prune_triples(question, triples)
             all_entities = list(set(all_entities + self._collect_entities_from_triples(triples)))
             link_log = merge_logs(link_log, prune_log)
         return triples, all_entities, link_log
+
+    def _filter_known_triples(self, triples: List[WikiTriple]) -> List[WikiTriple]:
+        """Remove triples whose (subject, relation, object) edge already exists in the graph."""
+        filtered: List[WikiTriple] = []
+        for triple in triples:
+            s_qid = getattr(triple.subject, "qid", None)
+            o_qid = getattr(triple.object, "qid", None)
+            rel = (
+                triple.relation.label
+                if hasattr(triple.relation, "label")
+                else str(triple.relation)
+            )
+            if s_qid and o_qid and rel and self.working_memory.is_triple_known(s_qid, rel, o_qid):
+                continue
+            filtered.append(triple)
+        return filtered
 
     def _stage_a_prune_triples(self, question: str, triples: List[WikiTriple]) -> List[WikiTriple]:
         """Stage A: reranker score filtering with delta and top-k cap."""

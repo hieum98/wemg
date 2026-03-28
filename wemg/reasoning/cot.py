@@ -4,7 +4,10 @@ import logging
 from typing import Dict, List, Optional, Tuple, Union
 
 from wemg.llm.roles import SourceType
-from wemg.reasoning.nodes import CoTNode, NodeType, NodeState
+from wemg.reasoning.nodes import (
+    CoTNode, NodeType, NodeState,
+    check_correctness, make_final_answer_state, make_subqa_state,
+)
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
 from wemg.reasoning.memory import WorkingMemory, InteractionMemory, log_to_interaction_memory
 
@@ -43,14 +46,12 @@ async def _generate_final_answer(current: CoTNode, gen: NodeGenerator) -> Tuple[
     result = await gen.generate_answer(current.user_question, should_explore=should_explore)
     if not result.answers:
         return None, result
-    answer = result.answers[0]
-    state = NodeState(node_type=NodeType.FINAL_ANSWER, content={
-        "user_question": current.user_question,
-        "final_answer": answer.answer,
-        "concise_answer": answer.concise_answer,
-        "reasoning": answer.reasoning,
-    })
-    return CoTNode(node_state=state, parent=current, max_depth=current.max_depth), result
+    node = CoTNode(
+        node_state=make_final_answer_state(current.user_question, result.answers[0]),
+        parent=current,
+        max_depth=current.max_depth,
+    )
+    return node, result
 
 
 async def _generate_subqa(current: CoTNode, gen: NodeGenerator) -> Tuple[Optional[CoTNode], GenerationResult]:
@@ -68,14 +69,11 @@ async def _generate_subqa(current: CoTNode, gen: NodeGenerator) -> Tuple[Optiona
     if not result.answers:
         return None, result
     
-    answer = result.answers[0]
-    state = NodeState(node_type=NodeType.SUB_QA_NODE, content={
-        'user_question': current.user_question,
-        'sub_question': subquestion,
-        'sub_answer': answer.answer,
-        'reasoning': answer.reasoning,
-    })
-    node = CoTNode(node_state=state, parent=current, max_depth=current.max_depth)
+    node = CoTNode(
+        node_state=make_subqa_state(current.user_question, subquestion, result.answers[0]),
+        parent=current,
+        max_depth=current.max_depth,
+    )
     result.log_data = merge_logs(subq_log, result.log_data)
     return node, result
 
@@ -104,14 +102,7 @@ async def cot_search(
     current = root
     reasoning_path = [root]
     pass_at_k = None
-    
-    def check_correctness(predicted, answers):
-        if not predicted or not answers:
-            return False
-        if isinstance(answers, str):
-            answers = [answers]
-        return any(a and a.lower() in predicted.lower() for a in answers)
-    
+
     while not current.is_terminal():        
         next_node = await generate_next_step(current, generator, working_memory, interaction_memory)
         if next_node is None:
@@ -124,6 +115,8 @@ async def cot_search(
             answer = current.node_state.content.get('concise_answer') or current.node_state.content.get('final_answer', '')
             if answer and check_correctness(answer, correct_answers):
                 pass_at_k = len(reasoning_path) - 1
+    if working_memory is not None:
+        await working_memory.afinalize(client, question, interaction_memory, **kwargs)
     terminal_content = current.node_state.content if current.is_terminal() else None
     return terminal_content, reasoning_path, pass_at_k
 

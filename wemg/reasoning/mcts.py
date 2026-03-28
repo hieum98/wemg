@@ -12,7 +12,10 @@ from wemg.llm.roles import (
     AnswerGenerationInput, AnswerEvaluationInput,
     ConsensusEvaluationInput, FinalAnswerSynthesisInput, MajorityVoteInput,
 )
-from wemg.reasoning.nodes import MCTSNode, NodeType, NodeState
+from wemg.reasoning.nodes import (
+    MCTSNode, NodeType, NodeState,
+    check_correctness, make_final_answer_state, make_subqa_state,
+)
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
 from wemg.reasoning.memory import GlobalKnowledge, WorkingMemory, log_to_interaction_memory
 from wemg.utils.text import format_context
@@ -39,7 +42,9 @@ def select(root: MCTSNode, exploration_weight: float = 2.0) -> List[MCTSNode]:
             return path
         path.append(node)
         uct_scores = [c.upper_confidence_bound(exploration_weight) for c in node.children]
-        node = node.children[uct_scores.index(max(uct_scores))]
+        max_score = max(uct_scores)
+        best = [c for c, s in zip(node.children, uct_scores) if s == max_score]
+        node = random.choice(best)
 
 
 async def expand(node: MCTSNode, generator: NodeGenerator) -> Tuple[List[MCTSNode], bool]:
@@ -88,20 +93,15 @@ async def _gather_expand_generators(
 async def _generate_final_answer_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[MCTSNode], GenerationResult, bool]:
     should_explore = node.depth < 2
     result = await gen.generate_answer(node.user_question, should_explore=should_explore)
-    nodes = []
-    for answer in result.answers:
-        state = NodeState(node_type=NodeType.FINAL_ANSWER, content={
-            "user_question": node.user_question,
-            "final_answer": answer.answer,
-            "concise_answer": answer.concise_answer,
-            "reasoning": answer.reasoning,
-        })
-        nodes.append(MCTSNode(
-            node_state=state,
+    nodes = [
+        MCTSNode(
+            node_state=make_final_answer_state(node.user_question, answer),
             parent=node,
             max_depth=node.max_depth,
             prior=_NODE_TYPE_PRIOR.get(NodeType.FINAL_ANSWER, 1.0),
-        ))
+        )
+        for answer in result.answers
+    ]
     return nodes, result, False
 
 async def _generate_subqa_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[MCTSNode], GenerationResult, bool]:
@@ -124,12 +124,8 @@ async def _generate_subqa_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[Lis
         last_result = result
         all_logs.append(result.log_data)
         for answer in result.answers:
-            state = NodeState(node_type=NodeType.SUB_QA_NODE, content={
-                'user_question': node.user_question, 'sub_question': sq,
-                'sub_answer': answer.answer, 'reasoning': answer.reasoning,
-            })
             nodes.append(MCTSNode(
-                node_state=state,
+                node_state=make_subqa_state(node.user_question, sq, answer),
                 parent=node,
                 max_depth=node.max_depth,
                 prior=_NODE_TYPE_PRIOR.get(NodeType.SUB_QA_NODE, 1.0),
@@ -174,14 +170,11 @@ async def _force_terminal_node(
     result = await generator.generate_answer(node.user_question, should_explore=False)
     if not result.answers:
         return None, result
-    answer = result.answers[0]
-    state = NodeState(node_type=NodeType.FINAL_ANSWER, content={
-        "user_question": node.user_question,
-        "final_answer": answer.answer,
-        "concise_answer": answer.concise_answer,
-        "reasoning": answer.reasoning,
-    })
-    child = MCTSNode(node_state=state, parent=node, max_depth=node.max_depth)
+    child = MCTSNode(
+        node_state=make_final_answer_state(node.user_question, result.answers[0]),
+        parent=node,
+        max_depth=node.max_depth,
+    )
     return child, result
 
 
@@ -191,6 +184,7 @@ async def evaluate(
     working_memory: WorkingMemory,
     golden_answer: Optional[str] = None,
     min_graph_nodes_for_consensus: int = 3,
+    consensus_weight: float = 0.7,
 ) -> float:
     """Evaluate terminal node. Returns reward in [-1, 1].
 
@@ -198,6 +192,14 @@ async def evaluate(
     Runs consensus evaluation only when graph memory has at least
     ``min_graph_nodes_for_consensus`` nodes; in that case the node's own
     answer is compared against a freshly generated graph-memory answer.
+
+    When consensus is available the final reward is a weighted blend:
+      ``(1 - consensus_weight) * answer_reward + consensus_weight * consensus_reward``
+
+    The consensus signal is self-supervised (text vs. graph agreement) and
+    does not rely on parametric knowledge, so it is weighted more heavily by
+    default (0.7).  When a golden answer is provided the EVALUATOR signal is
+    already strong; callers may lower ``consensus_weight`` accordingly.
     """
     if node.node_type != NodeType.FINAL_ANSWER:
         return -1.0
@@ -247,7 +249,8 @@ async def evaluate(
     except Exception:
         consensus_reward = 0.0
 
-    return (answer_reward + consensus_reward) / 2.0
+    answer_weight = 1.0 - consensus_weight
+    return answer_weight * answer_reward + consensus_weight * consensus_reward
 
 
 async def mcts_search(
@@ -270,8 +273,10 @@ async def mcts_search(
     semantic_sufficiency_count: int = 2,
     correct_answers: Optional[Union[str, List[str]]] = None,
     absorption_min_reward: float = 0.0,
+    absorption_top_k: int = 3,
     global_consolidation_every: int = 3,
     min_graph_nodes_for_consensus: int = 3,
+    consensus_weight: float = 0.7,
     **kwargs,
 ) -> Tuple[Dict, MCTSNode, Optional[int]]:
     """Run MCTS search with branch-isolated working memory.
@@ -294,19 +299,14 @@ async def mcts_search(
     
     best_node = None
     best_reward = -float('inf')
+    all_branch_deltas: List[Tuple] = []  # (MemoryDelta, reward) for top-k fallback
+    absorbed_any = False
+    last_consolidated_iteration = -1
     semantic_signals = 0
     no_improvement = 0
     termination_reason = None
     pass_at_k = None
-    
-    def check_correctness(predicted, answers):
-        if not predicted or not answers:
-            return False
-        if isinstance(answers, str):
-            answers = [answers]
-        predicted_lower = predicted.lower()
-        return any(a and a.lower() in predicted_lower for a in answers)
-    
+
     def extract_answer(node):
         if node.node_type == NodeType.FINAL_ANSWER:
             return node.node_state.content.get('concise_answer') or node.node_state.content.get('final_answer', '')
@@ -321,10 +321,21 @@ async def mcts_search(
         
         has_signal = False
         if not selected.is_terminal():
-            children, has_signal = await expand(selected, generator)
+            expand_target = selected
+        elif selected.visits > 0 and len(path) >= 2:
+            # Already-visited terminal: re-expand parent to generate new sibling
+            # branches instead of re-evaluating the same node again.
+            expand_target = path[-2]
+        else:
+            expand_target = None  # brand-new terminal (visits == 0), evaluate normally
+
+        if expand_target is not None:
+            children, has_signal = await expand(expand_target, generator)
             if children:
                 ucb_scores = [c.upper_confidence_bound(exploration_weight) for c in children]
-                selected = children[ucb_scores.index(max(ucb_scores))]
+                max_score = max(ucb_scores)
+                best = [c for c, s in zip(children, ucb_scores) if s == max_score]
+                selected = random.choice(best)
                 for child in children:
                     _add_child_to_memory(child, branch_memory)
                 if has_signal:
@@ -340,17 +351,26 @@ async def mcts_search(
                 terminal = selected
         else:
             terminal = selected
-        
+
+        await branch_memory.asynchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
+
+        is_new_terminal = terminal.visits == 0
         reward = await evaluate(
             terminal, client, branch_memory, golden_answer,
             min_graph_nodes_for_consensus=min_graph_nodes_for_consensus,
+            consensus_weight=consensus_weight,
         )
         terminal.backpropagate(reward)
 
         if global_knowledge is not None:
-            global_knowledge.absorb(branch_memory.get_delta(), reward, min_reward=absorption_min_reward)
+            delta = branch_memory.get_delta()
+            if global_knowledge.absorb(delta, reward, min_reward=absorption_min_reward):
+                absorbed_any = True
+            if delta.new_textual_items or delta.new_triples:
+                all_branch_deltas.append((delta, reward))
             if (iteration + 1) % global_consolidation_every == 0:
                 await global_knowledge.aconsolidate_if_needed(client, question, interaction_memory, **kwargs)
+                last_consolidated_iteration = iteration
 
         generator.working_memory = working_memory
 
@@ -363,7 +383,9 @@ async def mcts_search(
                 best_reward = reward
                 best_node = terminal
                 no_improvement = 0
-            else:
+            elif is_new_terminal:
+                # Only count genuine new explorations as no-improvement;
+                # re-evaluating an already-visited terminal is just MCTS sampling noise.
                 no_improvement += 1
         
         if early_termination_enabled and iteration + 1 >= min_iterations:
@@ -379,12 +401,39 @@ async def mcts_search(
     
     if termination_reason:
         logger.info(f"MCTS terminated at iteration {iteration + 1}: {termination_reason}")
-    
+
+    if global_knowledge is not None:
+        # Fallback: if absorption_min_reward was too strict and nothing got in,
+        # unconditionally absorb the top-k branches by reward so synthesis has context.
+        if not absorbed_any and all_branch_deltas:
+            top_k = sorted(all_branch_deltas, key=lambda x: x[1], reverse=True)[:absorption_top_k]
+            for delta, reward in top_k:
+                global_knowledge.absorb(delta, reward, min_reward=-float('inf'))
+            last_consolidated_iteration = -1  # force final consolidation below
+        # Final consolidation: run if the last iteration didn't already trigger it.
+        if last_consolidated_iteration != iteration:
+            await global_knowledge.aconsolidate_if_needed(client, question, interaction_memory, **kwargs)
+        await global_knowledge.afinalize(client, question, interaction_memory, **kwargs)
+
+    if working_memory is not None:
+        await working_memory.afinalize(client, question, interaction_memory, **kwargs)
+
     return (best_node.node_state.content if best_node else {}), root, pass_at_k
 
 
-async def get_answer(root: MCTSNode, client, interaction_memory=None, working_memory: Optional[WorkingMemory] = None) -> Tuple[str, str]:
-    """Extract final answer from MCTS tree via synthesis or majority vote."""
+async def get_answer(
+    root: MCTSNode,
+    client,
+    interaction_memory=None,
+    working_memory: Optional[WorkingMemory] = None,
+    global_knowledge: Optional[GlobalKnowledge] = None,
+) -> Tuple[str, str]:
+    """Extract final answer from MCTS tree via synthesis or majority vote.
+
+    Uses ``global_knowledge`` as synthesis context when available, since it
+    accumulates reward-filtered discoveries across all MCTS iterations.
+    Falls back to ``working_memory`` when ``global_knowledge`` is not provided.
+    """
     terminals = []
     def collect(node):
         if node.is_terminal():
@@ -392,32 +441,34 @@ async def get_answer(root: MCTSNode, client, interaction_memory=None, working_me
         for child in node.children:
             collect(child)
     collect(root)
-    
+
     if not terminals:
         return "No final answer found.", "No answer"
-    
+
     answers = [str(n.node_state) for n in terminals]
+    scores = [n.value / n.visits if n.visits > 0 else 0.0 for n in terminals]
     question = root.user_question
-    if working_memory:
-        textual = working_memory.format_textual_memory()
-        graph = working_memory.format_graph_memory()
+    memory_source = global_knowledge if global_knowledge is not None else working_memory
+    if memory_source:
+        textual = memory_source.format_textual_memory()
+        graph = memory_source.format_graph_memory()
         context = f"{textual}\n\n{graph}".strip()
     else:
         context = ""
-    
+
     try:
-        synth_input = FinalAnswerSynthesisInput(question=question, candidate_answers=answers, context=context)
+        synth_input = FinalAnswerSynthesisInput(question=question, candidate_answers=answers, candidate_scores=scores, context=context)
         results, log = await execute_role(client=client, role=FINAL_ANSWER_SYNTHESIZER, input_data=synth_input, interaction_memory=interaction_memory, n=1)
         if results:
             log_to_interaction_memory(interaction_memory, log)
             return f"Final Answer: {results[0].final_answer}\nReasoning: {results[0].reasoning}", results[0].concise_answer
     except Exception as e:
         logger.warning(f"Synthesis failed: {e}")
-    
+
     vote_input = MajorityVoteInput(question=question, answers=answers)
     results, log = await execute_role(client=client, role=MAJORITY_VOTER, input_data=vote_input, interaction_memory=interaction_memory, n=1)
     if results:
         log_to_interaction_memory(interaction_memory, log)
         return f"Final Answer: {results[0].final_answer}\nReasoning: {results[0].reasoning}", results[0].concise_answer
-    
+
     return "Unable to determine final answer.", "Unable to determine"

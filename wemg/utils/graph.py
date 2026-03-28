@@ -1,6 +1,8 @@
 """Graph utilities for textualization and visualization."""
 
 import os
+import json
+from pathlib import Path
 from collections import deque
 from typing import Any, Callable, List, Optional, Set, Tuple, Union
 
@@ -192,6 +194,221 @@ def _bfs_textualize(
     return all_triples
 
 
+def _normalize_relation_labels(relation: Any) -> List[str]:
+    """Return relation labels as a sorted list of strings."""
+    if relation is None:
+        return []
+    if isinstance(relation, (set, list, tuple)):
+        labels = [
+            item.label if hasattr(item, "label") else str(item)
+            for item in relation
+            if item is not None
+        ]
+        return sorted([label for label in labels if label])
+    if hasattr(relation, "label"):
+        return [str(relation.label)]
+    return [str(relation)]
+
+
+def _get_graph_output_filepath(base_path: str, fig_title: str, extension: str) -> str:
+    """Resolve output file path for graph visualizations."""
+    import time
+
+    safe_title = "".join(c for c in fig_title if c.isalnum() or c in (" ", "-", "_")).rstrip()
+    safe_title = safe_title.replace(" ", "_").lower() or "graph"
+    timestamp = int(time.time())
+    filename = f"graph_{safe_title}_{timestamp}.{extension.lstrip('.')}"
+
+    base_path = str(base_path).replace("\\", "/")
+
+    if base_path.endswith("/"):
+        os.makedirs(base_path, exist_ok=True)
+        return os.path.join(base_path, filename)
+    if os.path.isdir(base_path):
+        return os.path.join(base_path, filename)
+    if os.path.dirname(base_path) and os.path.dirname(base_path) != ".":
+        dir_path = os.path.dirname(base_path)
+        os.makedirs(dir_path, exist_ok=True)
+        if os.path.splitext(base_path)[1]:
+            return base_path
+        os.makedirs(base_path, exist_ok=True)
+        return os.path.join(base_path, filename)
+    if base_path.endswith((".png", ".jpg", ".jpeg", ".pdf", ".html")):
+        os.makedirs("./tmp", exist_ok=True)
+        return os.path.join("./tmp", base_path)
+    os.makedirs(base_path, exist_ok=True)
+    return os.path.join(base_path, filename)
+
+
+def visualize_graph_interactive(
+    graph: nx.DiGraph,
+    title: str = "Graph Memory",
+    save_path: Optional[Union[str, Path]] = None,
+    notebook: bool = True,
+    *,
+    physics: bool = True,
+    max_nodes: Optional[int] = None,
+    neat_layout: bool = True,
+) -> Optional[str]:
+    """Visualize graph memory as interactive HTML (drag/zoom/node-size slider)."""
+    if len(graph.nodes) == 0:
+        print(f"{title}: Empty graph (no nodes)")
+        return None
+
+    try:
+        from pyvis.network import Network
+    except ImportError:
+        print("Warning: pyvis is not available. Install pyvis to use interactive graph visualization.")
+        return None
+
+    selected_graph = graph
+    if max_nodes is not None and max_nodes > 0 and len(graph.nodes) > max_nodes:
+        ranked_nodes = sorted(
+            graph.nodes(),
+            key=lambda n: graph.in_degree(n) + graph.out_degree(n),
+            reverse=True,
+        )[:max_nodes]
+        selected_graph = graph.subgraph(ranked_nodes).copy()
+
+    net = Network(
+        height="750px",
+        width="100%",
+        directed=True,
+        notebook=notebook,
+        cdn_resources="in_line",
+    )
+    options = {
+        "interaction": {
+            "dragNodes": True,
+            "dragView": True,
+            "zoomView": True,
+            "hover": True,
+            "navigationButtons": True,
+            "keyboard": {"enabled": True},
+        },
+        "physics": {
+            "enabled": bool(physics),
+            "solver": "forceAtlas2Based",
+            "forceAtlas2Based": {
+                "gravitationalConstant": -90,
+                "centralGravity": 0.01,
+                "springLength": 140,
+                "springConstant": 0.05,
+                "damping": 0.75,
+                "avoidOverlap": 1.0,
+            },
+            "minVelocity": 0.75,
+            "stabilization": {"enabled": True, "iterations": 900, "updateInterval": 25},
+        },
+        "edges": {
+            "arrows": {"to": {"enabled": True, "scaleFactor": 0.6}},
+            "smooth": {"enabled": True, "type": "dynamic"},
+            "color": {"opacity": 0.6},
+            "font": {"size": 11, "strokeWidth": 0},
+        },
+        "nodes": {"font": {"size": 13}, "shape": "dot"},
+    }
+    if neat_layout:
+        options["layout"] = {"improvedLayout": True, "randomSeed": 17}
+    net.set_options(json.dumps(options))
+
+    for node in selected_graph.nodes():
+        node_data = selected_graph.nodes[node].get("data")
+        node_id = str(node)
+        if node_data is None:
+            label = node_id[:40]
+            title_text = node_id
+        else:
+            label = getattr(node_data, "label", None) or getattr(node_data, "name", None) or node_id
+            title_text = str(node_data)
+        degree = selected_graph.in_degree(node) + selected_graph.out_degree(node)
+        size = max(14, min(60, 14 + int(degree * 2)))
+        color = "#4e79a7" if degree >= 6 else "#76b7b2" if degree >= 3 else "#bab0ab"
+        net.add_node(node_id, label=str(label)[:45], title=title_text, size=size, color=color)
+
+    for source, target, data in selected_graph.edges(data=True):
+        labels = _normalize_relation_labels(data.get("relation"))
+        edge_label = ", ".join(labels[:2]) if labels else ""
+        edge_title = "<br>".join(labels) if labels else ""
+        net.add_edge(str(source), str(target), label=edge_label, title=edge_title)
+
+    output_path = (
+        _get_graph_output_filepath(str(save_path), title, "html")
+        if save_path is not None
+        else _get_graph_output_filepath("./tmp", title, "html")
+    )
+    net.save_graph(output_path)
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        html = f.read()
+    inject = """
+<div style="margin: 8px 0; font-family: sans-serif;">
+  <label for="nodeSizeScale"><strong>Node size</strong></label>
+  <input id="nodeSizeScale" type="range" min="0.5" max="3" step="0.1" value="1.0" style="width: 260px; margin-left: 8px;" />
+  <span id="nodeSizeValue">1.0x</span>
+  <button id="freezeLayoutBtn" style="margin-left: 14px;">Freeze layout</button>
+  <button id="relaxLayoutBtn" style="margin-left: 6px;">Relax layout</button>
+  <span style="margin-left: 10px; color: #666;">Tip: drag nodes, then freeze</span>
+</div>
+<script>
+(function() {
+  const slider = document.getElementById("nodeSizeScale");
+  const valueEl = document.getElementById("nodeSizeValue");
+  const freezeBtn = document.getElementById("freezeLayoutBtn");
+  const relaxBtn = document.getElementById("relaxLayoutBtn");
+  if (!slider || !window.nodes) return;
+  const baseSizes = {};
+  window.nodes.forEach(function(node) {
+    baseSizes[node.id] = node.size || 20;
+  });
+  function applyScale(scale) {
+    const updates = [];
+    window.nodes.forEach(function(node) {
+      const base = baseSizes[node.id] || 20;
+      updates.push({id: node.id, size: Math.max(8, base * scale)});
+    });
+    window.nodes.update(updates);
+    valueEl.textContent = scale.toFixed(1) + "x";
+  }
+  slider.addEventListener("input", function() {
+    applyScale(parseFloat(slider.value));
+  });
+  applyScale(parseFloat(slider.value));
+
+  if (window.network) {
+    // Let physics settle once, then auto-freeze so labels stay readable.
+    window.network.once("stabilizationIterationsDone", function() {
+      window.network.setOptions({physics: {enabled: false}});
+      if (freezeBtn) freezeBtn.textContent = "Layout frozen";
+    });
+
+    if (freezeBtn) {
+      freezeBtn.addEventListener("click", function() {
+        window.network.setOptions({physics: {enabled: false}});
+        freezeBtn.textContent = "Layout frozen";
+      });
+    }
+    if (relaxBtn) {
+      relaxBtn.addEventListener("click", function() {
+        window.network.setOptions({physics: {enabled: true}});
+        window.network.stabilize(200);
+        if (freezeBtn) freezeBtn.textContent = "Freeze layout";
+      });
+    }
+  }
+})();
+</script>
+"""
+    marker = '<div id="mynetwork" class="card-body"></div>'
+    if marker in html:
+        html = html.replace(marker, inject + "\n" + marker, 1)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+    print(f"Interactive graph visualization saved to {os.path.abspath(output_path)}")
+    return output_path
+
+
 def visualize_graph(
     graph: nx.DiGraph,
     title: str = "Graph Memory",
@@ -264,38 +481,13 @@ def visualize_graph(
     plt.axis("off")
     plt.tight_layout()
 
-    def _get_filepath(base_path: str, fig_title: str) -> str:
-        import time
-        safe_title = "".join(c for c in fig_title if c.isalnum() or c in (" ", "-", "_")).rstrip()
-        safe_title = safe_title.replace(" ", "_").lower()
-        timestamp = int(time.time())
-        filename = f"graph_{safe_title}_{timestamp}.png"
-
-        base_path = base_path.replace("\\", "/")
-
-        if base_path.endswith("/"):
-            os.makedirs(base_path, exist_ok=True)
-            return os.path.join(base_path, filename)
-        elif os.path.isdir(base_path):
-            return os.path.join(base_path, filename)
-        elif os.path.dirname(base_path) and os.path.dirname(base_path) != ".":
-            dir_path = os.path.dirname(base_path)
-            os.makedirs(dir_path, exist_ok=True)
-            return base_path
-        elif base_path.endswith((".png", ".jpg", ".pdf")):
-            os.makedirs("./tmp", exist_ok=True)
-            return os.path.join("./tmp", base_path)
-        else:
-            os.makedirs(base_path, exist_ok=True)
-            return os.path.join(base_path, filename)
-
     if save_path:
-        filepath = _get_filepath(save_path, title)
+        filepath = _get_graph_output_filepath(save_path, title, "png")
         plt.savefig(filepath, dpi=150, bbox_inches="tight")
         print(f"Graph visualization saved to {os.path.abspath(filepath)}")
     else:
         if use_agg:
-            filepath = _get_filepath("./tmp", title)
+            filepath = _get_graph_output_filepath("./tmp", title, "png")
             plt.savefig(filepath, dpi=150, bbox_inches="tight")
             print(f"Graph visualization saved to {os.path.abspath(filepath)} (no display available)")
         else:
@@ -303,7 +495,7 @@ def visualize_graph(
                 plt.show()
             except Exception as e:
                 print(f"Could not display graph interactively: {e}")
-                filepath = _get_filepath("./tmp", title)
+                filepath = _get_graph_output_filepath("./tmp", title, "png")
                 plt.savefig(filepath, dpi=150, bbox_inches="tight")
                 print(f"Graph visualization saved to {os.path.abspath(filepath)} (fallback)")
 

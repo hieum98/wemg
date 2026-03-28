@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import pickle
+import webbrowser
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import networkx as nx
 
-from wemg.utils.graph import visualize_graph
+from wemg.utils.graph import visualize_graph, visualize_graph_interactive
 
 
 def _read_jsonl_entries(log_path: Path) -> list[dict[str, Any]]:
@@ -152,4 +153,43 @@ def visualize_graph_memory(
         title=title,
         save_path=str(save_path) if save_path is not None else None,
     )
+
+
+def visualize_graph_memory_interactive(
+    graph_or_path: Union[nx.DiGraph, str, Path],
+    *,
+    title: str = "Graph Memory",
+    save_path: Optional[Union[str, Path]] = None,
+    open_in_browser: bool = False,
+    notebook_mode: bool = True,
+    physics: bool = True,
+    max_nodes: Optional[int] = None,
+    neat_layout: bool = True,
+) -> Optional[str]:
+    """Notebook/browser helper: render graph memory as interactive HTML."""
+    graph = (
+        load_graph_memory(graph_or_path)
+        if isinstance(graph_or_path, (str, Path))
+        else graph_or_path
+    )
+    html_path = visualize_graph_interactive(
+        graph,
+        title=title,
+        save_path=str(save_path) if save_path is not None else None,
+        notebook=notebook_mode,
+        physics=physics,
+        max_nodes=max_nodes,
+        neat_layout=neat_layout,
+    )
+    if html_path and open_in_browser:
+        webbrowser.open(f"file://{Path(html_path).resolve()}")
+    if html_path and notebook_mode:
+        try:
+            from IPython.display import IFrame, display
+
+            display(IFrame(src=str(Path(html_path).resolve()), width="100%", height=780))
+        except Exception:
+            # Keep notebook helper resilient in non-IPython environments.
+            pass
+    return html_path
 

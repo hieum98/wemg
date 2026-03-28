@@ -375,7 +375,9 @@ class WikidataClient:
         # Raw 1-hop triples per QID (pre-enrichment); shared across k-hop and find_path.
         self._outgoing_triples_cache: "OrderedDict[str, List[WikiTriple]]" = OrderedDict()
         self._bidirectional_triples_cache: "OrderedDict[str, List[WikiTriple]]" = OrderedDict()
-        self._wikipedia_dump_dataset = self._load_wikipedia_dump_dataset()
+        self._wikipedia_dump_dataset, self._wikidump_url_index = self._load_wikipedia_dump_dataset()
+        # Cache canonical_url -> content to avoid re-scanning for the same URLs across MCTS iterations.
+        self._wikidump_content_cache: Dict[str, Optional[str]] = {}
         self._wikibase_client = None
         if WIKIBASE_AVAILABLE:
             try:
@@ -735,12 +737,24 @@ class WikidataClient:
                     desc="Precompute Wikipedia canonical URLs",
                 )
 
-            return ds
+            # Build canonical_url -> [row_indices] for O(1) lookups.
+            # A page's content may be split across multiple rows, so we collect all indices.
+            url_index: Dict[str, List[int]] = {}
+            if "_canonical_url" in getattr(ds, "column_names", []):
+                logger.info("Building Wikipedia dump URL index (%d rows)...", len(ds))
+                url_series = ds.data.select(["_canonical_url"]).to_pandas()["_canonical_url"]
+                mask = url_series.notna()
+                for idx, url in zip(url_series[mask].index.tolist(), url_series[mask].values.tolist()):
+                    url_index.setdefault(url, []).append(idx)
+                logger.info("Wikipedia dump URL index built: %d unique URLs", len(url_index))
+
+            return ds, url_index
         except Exception as e:
             logger.debug(f"Failed to load Wikipedia dump dataset ({WIKIPEDIA_DUMP_DATASET}): {e}")
-            return None
+            return None, {}
 
     def _lookup_wikipedia_dump_contents(self, urls: Set[str]) -> Dict[str, Optional[str]]:
+        t_lookup_start = time.perf_counter()
         if not urls:
             return {}
 
@@ -761,49 +775,82 @@ class WikidataClient:
             return result
 
         try:
-            target_urls = set(canonical_to_raw.keys())
+            target_canonicals = set(canonical_to_raw.keys())
             ds = self._wikipedia_dump_dataset
+            logger.info(
+                "PROFSTEP wikidump stage=lookup_start target_urls=%d",
+                len(target_canonicals),
+            )
 
-            def _row_url_in_targets(row: Dict[str, Any]) -> bool:
-                canonical_row_url = row.get("_canonical_url") or self._canonicalize_wikipedia_url(
-                    row.get("url")
-                    or row.get("source")
-                    or row.get("wikipedia_url")
-                    or row.get("wiki_url")
-                )
-                return bool(canonical_row_url in target_urls)
+            # Serve cached results; collect only URLs missing from cache.
+            uncached = target_canonicals - self._wikidump_content_cache.keys()
 
-            filtered = ds.filter(_row_url_in_targets, num_proc=os.cpu_count())
-            aggregated: Dict[str, List[str]] = defaultdict(list)
-            for row in filtered:
-                canonical_row_url = row.get("_canonical_url") or self._canonicalize_wikipedia_url(
-                    row.get("url")
-                    or row.get("source")
-                    or row.get("wikipedia_url")
-                    or row.get("wiki_url")
+            if uncached:
+                # Use pre-built index for O(1) row selection — no full scan needed.
+                t0 = time.perf_counter()
+                logger.info(
+                    "PROFSTEP wikidump stage=filter_start target_urls=%d",
+                    len(uncached),
                 )
-                if not canonical_row_url or canonical_row_url not in target_urls:
-                    continue
-                content = (
-                    row.get("contents")
-                    or row.get("content")
-                    or row.get("text")
-                    or row.get("article")
+                indices: List[int] = [
+                    idx
+                    for c in uncached
+                    if c in self._wikidump_url_index
+                    for idx in self._wikidump_url_index[c]
+                ]
+
+                aggregated: Dict[str, List[str]] = defaultdict(list)
+                if indices:
+                    selected = ds.select(indices)
+                    for row in selected:
+                        canonical_row_url = row.get("_canonical_url") or self._canonicalize_wikipedia_url(
+                            row.get("url")
+                            or row.get("source")
+                            or row.get("wikipedia_url")
+                            or row.get("wiki_url")
+                        )
+                        if not canonical_row_url or canonical_row_url not in uncached:
+                            continue
+                        content = (
+                            row.get("contents")
+                            or row.get("content")
+                            or row.get("text")
+                            or row.get("article")
+                        )
+                        if isinstance(content, str):
+                            text = content.strip()
+                            if text:
+                                aggregated[canonical_row_url].append(text)
+
+                logger.info(
+                    "PROFSTEP wikidump stage=filter_done elapsed_ms=%.1f",
+                    (time.perf_counter() - t0) * 1000.0,
                 )
-                if isinstance(content, str):
-                    text = content.strip()
-                    if text:
-                        aggregated[canonical_row_url].append(text)
+
+                t0 = time.perf_counter()
+                for canonical in uncached:
+                    joined = "\n\n".join(aggregated.get(canonical, [])) or None
+                    self._wikidump_content_cache[canonical] = joined
+                logger.info(
+                    "PROFSTEP wikidump stage=aggregate_done elapsed_ms=%.1f matched_urls=%d",
+                    (time.perf_counter() - t0) * 1000.0,
+                    sum(1 for c in uncached if self._wikidump_content_cache[c] is not None),
+                )
 
             for canonical, raw_urls in canonical_to_raw.items():
-                joined = "\n\n".join(aggregated.get(canonical, [])) or None
+                content = self._wikidump_content_cache.get(canonical)
                 for raw in raw_urls:
-                    result[raw] = joined
+                    result[raw] = content
         except Exception as e:
             logger.debug(f"Failed Wikipedia dump lookup ({WIKIPEDIA_DUMP_DATASET}): {e}")
             for raw_urls in canonical_to_raw.values():
                 for raw in raw_urls:
                     result[raw] = None
+        logger.info(
+            "PROFSTEP wikidump stage=lookup_done elapsed_ms=%.1f requested_urls=%d",
+            (time.perf_counter() - t_lookup_start) * 1000.0,
+            len(urls),
+        )
         return result
 
     def _has_fake_property_label(self, prop: Any) -> bool:
@@ -1314,16 +1361,37 @@ class WikidataClient:
     ) -> List[List[WikiTriple]]:
         """Optimized path: k=1, two or more valid QIDs — batched SPARQL + one enrichment pass."""
         unique_seeds = list(dict.fromkeys(nq for nq in normalized if nq))
-        out_by_seed = self._fetch_outgoing_batch_uncached(unique_seeds)
-        in_by_seed = self._fetch_incoming_batch_uncached(unique_seeds) if bidirectional else {}
 
-        for s in unique_seeds:
-            out_list = out_by_seed.get(s, [])
-            inc_list = in_by_seed.get(s, []) if bidirectional else []
-            bid_list = self._deduplicate_triples(out_list + inc_list)
-            with self._cache_lock:
-                self._lru_set(self._outgoing_triples_cache, s, list(out_list))
-                self._lru_set(self._bidirectional_triples_cache, s, bid_list)
+        # Check cache first; only fetch seeds that are not already cached.
+        out_by_seed: Dict[str, List[WikiTriple]] = {}
+        in_by_seed: Dict[str, List[WikiTriple]] = {}
+        uncached_seeds: List[str] = []
+        cache_key = self._bidirectional_triples_cache if bidirectional else self._outgoing_triples_cache
+        with self._cache_lock:
+            for s in unique_seeds:
+                cached = self._lru_get(cache_key, s)
+                if cached is not None:
+                    if bidirectional:
+                        in_by_seed[s] = []  # bidirectional cache already merged
+                        out_by_seed[s] = list(cached)
+                    else:
+                        out_by_seed[s] = list(cached)
+                else:
+                    uncached_seeds.append(s)
+
+        if uncached_seeds:
+            fetched_out = self._fetch_outgoing_batch_uncached(uncached_seeds)
+            fetched_in = self._fetch_incoming_batch_uncached(uncached_seeds) if bidirectional else {}
+            for s in uncached_seeds:
+                out_list = fetched_out.get(s, [])
+                inc_list = fetched_in.get(s, []) if bidirectional else []
+                bid_list = self._deduplicate_triples(out_list + inc_list)
+                with self._cache_lock:
+                    self._lru_set(self._outgoing_triples_cache, s, list(out_list))
+                    self._lru_set(self._bidirectional_triples_cache, s, bid_list)
+                out_by_seed[s] = out_list
+                if bidirectional:
+                    in_by_seed[s] = inc_list
 
         merged: List[WikiTriple] = []
         for s in unique_seeds:
@@ -1368,6 +1436,7 @@ class WikidataClient:
         enrich: bool = True,
     ) -> Union[List[WikiTriple], List[List[WikiTriple]]]:
         """Get k-hop triples from entity QIDs via SPARQL."""
+        t_all = time.perf_counter()
         is_single = isinstance(qids, str)
         raw_list = [qids] if is_single else list(qids)
         normalized: List[Optional[str]] = []
@@ -1377,8 +1446,19 @@ class WikidataClient:
         num_valid = sum(1 for n in normalized if n)
         # Batched SPARQL + single enrichment when multiple seeds and exactly one hop.
         if k == 1 and num_valid >= 2:
+            logger.info(
+                "PROFSTEP wikidata stage=k_hop_batch_start seeds=%d k=%d bidirectional=%s enrich=%s",
+                num_valid,
+                k,
+                str(bidirectional),
+                str(enrich),
+            )
             all_results = self._get_k_hop_multi_seed_one_hop(
                 normalized, bidirectional, enrich,
+            )
+            logger.info(
+                "PROFSTEP wikidata stage=k_hop_batch_done elapsed_ms=%.1f",
+                (time.perf_counter() - t_all) * 1000.0,
             )
             return all_results[0] if is_single else all_results
 
@@ -1387,6 +1467,14 @@ class WikidataClient:
             if not seed_qid:
                 all_results.append([])
                 continue
+            t_seed = time.perf_counter()
+            logger.info(
+                "PROFSTEP wikidata stage=k_hop_seed_start seed=%s k=%d bidirectional=%s enrich=%s",
+                seed_qid,
+                k,
+                str(bidirectional),
+                str(enrich),
+            )
 
             collected: List[WikiTriple] = []
             visited: Set[str] = set()
@@ -1426,7 +1514,18 @@ class WikidataClient:
                 if not self._has_fake_property_label(getattr(t, "relation", None))
             ]
             all_results.append(collected)
+            logger.info(
+                "PROFSTEP wikidata stage=k_hop_seed_done seed=%s elapsed_ms=%.1f triples=%d",
+                seed_qid,
+                (time.perf_counter() - t_seed) * 1000.0,
+                len(collected),
+            )
 
+        logger.info(
+            "PROFSTEP wikidata stage=k_hop_done elapsed_ms=%.1f seeds=%d",
+            (time.perf_counter() - t_all) * 1000.0,
+            num_valid,
+        )
         return all_results[0] if is_single else all_results
 
     # ------------------------------------------------------------------
@@ -1566,6 +1665,11 @@ class WikidataClient:
             self._fetch_wikipedia_contents_concurrent(all_entities)
 
         return all_entities
+
+    async def aenrich_entities(
+        self, entities: List[WikidataEntity], get_details: bool = False,
+    ) -> List[WikidataEntity]:
+        return await asyncio.to_thread(self.enrich_entities, entities, get_details)
 
     def enrich_properties(
         self, properties: List[WikidataProperty],

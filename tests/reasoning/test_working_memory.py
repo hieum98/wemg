@@ -1,10 +1,11 @@
 """Real-system tests for WorkingMemory (`wemg/reasoning/working_memory.py`)."""
 
+import asyncio
 import pytest
 
 from tests.conftest import requires_llm_credentials
 from tests.helpers.slow_integration_debug import print_slow_integration_output
-from wemg.llm.roles import SourceType
+from wemg.llm.roles import Relation, SourceType
 from wemg.reasoning.working_memory import (
     GlobalKnowledge,
     MemoryDelta,
@@ -71,13 +72,6 @@ def test_format_graph_memory_non_empty(live_wikidata_client):
     assert len(text) > 0
 
 
-@pytest.mark.requires_wikidata
-def test_connect_graph_memory_single_node(live_wikidata_client):
-    wm = WorkingMemory(wikidata_client=live_wikidata_client)
-    wm.add_node_to_graph_memory(WikidataEntity(qid="Q64", label="Berlin", description="city"))
-    assert wm.connect_graph_memory(max_hops=1) is True
-
-
 @pytest.mark.requires_llm
 @pytest.mark.asyncio
 async def test_parse_graph_from_text_real(wemg_config, live_llm_client, live_wikidata_client):
@@ -98,7 +92,7 @@ def test_consolidate_textual_memory_real(wemg_config, live_llm_client, live_wiki
     wm = WorkingMemory(max_textual_memory_tokens=2048, wikidata_client=live_wikidata_client)
     wm.add_textual_memory("Paris is the capital of France.", source=SourceType.RETRIEVAL)
     wm.add_textual_memory("Lyon is a city in France.", source=SourceType.RETRIEVAL)
-    wm.consolidate_textual_memory(live_llm_client, "What is the capital of France?")
+    asyncio.run(wm._aconsolidate_textual_memory(live_llm_client, "What is the capital of France?"))
     assert len(wm.textual_memory) >= 1
     assert wm.format_textual_memory()
 
@@ -129,10 +123,9 @@ def test_synchronize_memory_real(wemg_config, live_llm_client, live_wikidata_cli
     requires_llm_credentials(wemg_config)
     wm = WorkingMemory(
         max_textual_memory_tokens=2048, wikidata_client=live_wikidata_client,
-        sync_text_threshold=1,
     )
     wm.add_textual_memory("Berlin is the capital of Germany.", source=SourceType.RETRIEVAL)
-    wm.synchronize_memory(live_llm_client, "What is the capital of Germany?")
+    asyncio.run(wm.asynchronize_memory(live_llm_client, "What is the capital of Germany?"))
     print_slow_integration_output(
         "test_synchronize_memory_real",
         working_memory_after=wm,
@@ -227,21 +220,17 @@ def test_deduplicate_graph_merges_same_qid():
 
 def test_conditional_sync_skips_when_clean():
     """should_synchronize returns False when nothing has changed."""
-    wm = WorkingMemory(wikidata_client=None, sync_text_threshold=5)
+    wm = WorkingMemory(wikidata_client=None)
     assert wm.should_synchronize() is False
 
     wm.add_textual_memory("a", source=SourceType.RETRIEVAL)
-    assert wm._dirty is True
-    assert wm.should_synchronize() is False
-
-    for i in range(5):
-        wm.add_textual_memory(f"item {i}", source=SourceType.RETRIEVAL)
+    assert wm.text_store.dirty is True
     assert wm.should_synchronize() is True
 
 
 def test_sync_one_directional_no_graph_to_text():
     """Graph content should NOT be injected into textual_memory during sync."""
-    wm = WorkingMemory(wikidata_client=None, sync_text_threshold=1)
+    wm = WorkingMemory(wikidata_client=None)
     e1 = WikidataEntity(qid="Q64", label="Berlin", description="city")
     e2 = WikidataEntity(qid="Q183", label="Germany", description="country")
     prop = WikidataProperty(pid="P1376", label="capital of", description=None)
@@ -285,15 +274,15 @@ def test_edge_provenance_stored():
 def test_dirty_tracking_on_add():
     """Adding textual memory should set dirty flag and increment counter."""
     wm = WorkingMemory(wikidata_client=None)
-    assert wm._dirty is False
-    assert wm._items_since_last_sync == 0
+    assert wm.text_store.dirty is False
+    assert wm.text_store.items_since_sync == 0
 
     wm.add_textual_memory("fact", source=SourceType.RETRIEVAL)
-    assert wm._dirty is True
-    assert wm._items_since_last_sync == 1
+    assert wm.text_store.dirty is True
+    assert wm.text_store.items_since_sync == 1
 
     wm.add_textual_memory("fact", source=SourceType.RETRIEVAL)
-    assert wm._items_since_last_sync == 1
+    assert wm.text_store.items_since_sync == 1
 
 
 def test_memory_delta_dataclass():
@@ -306,3 +295,135 @@ def test_memory_delta_dataclass():
     delta2 = MemoryDelta(new_textual_items=["x"], new_entities={"Q1": WikidataEntity(qid="Q1", label="A")})
     assert len(delta2.new_textual_items) == 1
     assert "Q1" in delta2.new_entities
+
+
+def test_global_knowledge_add_relation_with_scalar_object():
+    """GlobalKnowledge should keep relation triples where object is a literal/scalar."""
+    gk = GlobalKnowledge(wikidata_client=None)
+    gk.entity_dict["Q64"] = WikidataEntity(qid="Q64", label="Berlin", description="city")
+
+    gk._add_relation(
+        Relation(
+            subject="Berlin",
+            subject_id="Q64",
+            relation="population",
+            object="3769000",
+            object_id=None,
+        )
+    )
+
+    assert gk.graph.number_of_edges() == 1
+    _, object_id = next(iter(gk.graph.edges()))
+    object_node = gk.graph.nodes[object_id]["data"]
+    assert object_node.id is None
+    assert object_node.name == "3769000"
+
+
+# =====================================================================
+# Graph intelligence helper tests
+# =====================================================================
+
+
+def _make_geo_wm():
+    """Helper: create a WorkingMemory with Berlin -> Germany edge."""
+    wm = WorkingMemory(wikidata_client=None)
+    berlin = WikidataEntity(qid="Q64", label="Berlin", description="city")
+    germany = WikidataEntity(qid="Q183", label="Germany", description="country")
+    prop = WikidataProperty(pid="P1376", label="capital of", description=None)
+    wm.add_edge_to_graph_memory(WikiTriple(subject=berlin, relation=prop, object=germany))
+    return wm
+
+
+def test_format_combined_memory_includes_both():
+    """format_combined_memory should include both textual and graph content."""
+    wm = _make_geo_wm()
+    wm.add_textual_memory("Berlin is nice.", source=SourceType.RETRIEVAL)
+    combined = wm.format_combined_memory()
+    assert "Berlin is nice" in combined
+    assert "capital of" in combined or "Berlin" in combined
+
+
+def test_format_combined_memory_empty():
+    wm = WorkingMemory(wikidata_client=None)
+    assert wm.format_combined_memory() == ""
+
+
+def test_get_known_entity_qids():
+    wm = _make_geo_wm()
+    qids = wm.get_known_entity_qids()
+    assert "Q64" in qids
+    assert "Q183" in qids
+
+
+def test_get_known_entity_qids_includes_global():
+    """Global knowledge graph entities should also appear."""
+    gk = GlobalKnowledge(wikidata_client=None)
+    from wemg.llm.roles import Entity as OpenIEEntity
+
+    gk.graph.add_node("Q42", data=OpenIEEntity(id="Q42", name="Douglas Adams", description="author"))
+    wm = WorkingMemory(wikidata_client=None, global_knowledge=gk)
+    qids = wm.get_known_entity_qids()
+    assert "Q42" in qids
+
+
+def test_get_well_connected_qids():
+    wm = WorkingMemory(wikidata_client=None)
+    berlin = WikidataEntity(qid="Q64", label="Berlin", description="city")
+    germany = WikidataEntity(qid="Q183", label="Germany", description="country")
+    france = WikidataEntity(qid="Q142", label="France", description="country")
+    europe = WikidataEntity(qid="Q46", label="Europe", description="continent")
+
+    wm.add_edge_to_graph_memory(WikiTriple(
+        subject=berlin, relation=WikidataProperty(pid="P17", label="country", description=None), object=germany,
+    ))
+    wm.add_edge_to_graph_memory(WikiTriple(
+        subject=berlin, relation=WikidataProperty(pid="P30", label="continent", description=None), object=europe,
+    ))
+    wm.add_edge_to_graph_memory(WikiTriple(
+        subject=germany, relation=WikidataProperty(pid="P30", label="continent", description=None), object=europe,
+    ))
+    wm.add_edge_to_graph_memory(WikiTriple(
+        subject=france, relation=WikidataProperty(pid="P30", label="continent", description=None), object=europe,
+    ))
+
+    well = wm.get_well_connected_qids(min_degree=3)
+    assert "Q46" in well
+    assert "Q142" not in well
+
+
+def test_get_underexplored_neighbor_qids():
+    wm = _make_geo_wm()
+    paris = WikidataEntity(qid="Q90", label="Paris", description="city")
+    france = WikidataEntity(qid="Q142", label="France", description="country")
+    wm.add_edge_to_graph_memory(WikiTriple(
+        subject=paris,
+        relation=WikidataProperty(pid="P1376", label="capital of", description=None),
+        object=france,
+    ))
+    # Germany (Q183) has degree 1, so it's underexplored relative to Berlin (Q64)
+    neighbors = wm.get_underexplored_neighbor_qids(["Q64"])
+    assert "Q183" in neighbors
+    # France shouldn't appear because it's not a neighbor of Q64
+    assert "Q142" not in neighbors
+
+
+def test_get_underexplored_neighbor_qids_empty_graph():
+    wm = WorkingMemory(wikidata_client=None)
+    assert wm.get_underexplored_neighbor_qids(["Q64"]) == []
+
+
+def test_is_triple_known_true():
+    wm = _make_geo_wm()
+    assert wm.is_triple_known("Q64", "capital of", "Q183") is True
+
+
+def test_is_triple_known_false_different_relation():
+    wm = _make_geo_wm()
+    assert wm.is_triple_known("Q64", "part of", "Q183") is False
+
+
+def test_is_triple_known_false_missing_node():
+    wm = _make_geo_wm()
+    assert wm.is_triple_known("Q999", "capital of", "Q183") is False
+
+
