@@ -136,5 +136,4 @@ def cot_get_answer(terminal_content: Optional[Dict], reasoning_path: List[CoTNod
     
     full = terminal_content.get('final_answer', 'No answer')
     concise = terminal_content.get('concise_answer', full)
-    reasoning = terminal_content.get('reasoning', '')
-    return f"Final Answer: {full}\nReasoning: {reasoning}", concise
+    return f"Final Answer: {full}", concise

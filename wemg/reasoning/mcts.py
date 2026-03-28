@@ -461,7 +461,7 @@ async def get_answer(
         results, log = await execute_role(client=client, role=FINAL_ANSWER_SYNTHESIZER, input_data=synth_input, interaction_memory=interaction_memory, n=1)
         if results:
             log_to_interaction_memory(interaction_memory, log)
-            return f"Final Answer: {results[0].final_answer}\nReasoning: {results[0].reasoning}", results[0].concise_answer
+            return f"Final Answer: {results[0].final_answer}", results[0].concise_answer
     except Exception as e:
         logger.warning(f"Synthesis failed: {e}")
 
@@ -469,6 +469,6 @@ async def get_answer(
     results, log = await execute_role(client=client, role=MAJORITY_VOTER, input_data=vote_input, interaction_memory=interaction_memory, n=1)
     if results:
         log_to_interaction_memory(interaction_memory, log)
-        return f"Final Answer: {results[0].final_answer}\nReasoning: {results[0].reasoning}", results[0].concise_answer
+        return f"Final Answer: {results[0].final_answer}", results[0].concise_answer
 
     return "Unable to determine final answer.", "Unable to determine"

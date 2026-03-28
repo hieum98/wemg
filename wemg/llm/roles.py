@@ -400,6 +400,14 @@ Every generated subquestion must:
    - Remove any dependent subquestion that requires another generated subquestion to be answered first.
    - If more than 3 good subquestions remain, keep only the 3 most useful ones.
 
+## Scope Consistency
+Subquestions should preserve the geographic or categorical scope of the main question unless the decomposition logically requires narrowing it. Do NOT silently narrow a global scope to a specific region or category without justification.
+
+Example of scope drift to avoid:
+  Main Q: "What is the third oldest surviving university in the world?"
+  BAD subquestion: "What is the oldest university in England?" ← narrows to England without justification
+  GOOD subquestion: "What are the three oldest surviving universities in the world and when were they founded?"
+
 ## Output Format
 Respond with a JSON object with exactly these keys:
 - is_answerable: boolean — true if the main question can be answered from the provided context alone; false otherwise
@@ -496,6 +504,9 @@ GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user i
 2. Generate Strategic Queries: Formulate a list of search queries that are necessary to answer/verify the input. Each query is a building block to reach the final answer that follows the guiding principles above. The goal is to provide the user with all the search components they would need to solve the problem from scratch.
 3. Ensure Self-Containment: Each query must be understandable and answerable on its own. Make sure each query is self-contained and does not rely on the original input, other queries, or any external context. Rewrite queries that are not self-contained.
 4. Review for Completeness and Non-Redundancy: Ensure that the set of queries collectively covers all necessary information to answer/verify the input without any overlap or unnecessary duplication.
+5. Rank Verification: If the question asks for a ranked entity ("Nth X", "highest", "most", "record holder", "largest", "oldest", etc.), always generate at least one query that verifies the rank directly — not just the properties of a candidate entity. Example: Q="third largest river by discharge" → include "list of rivers by discharge volume" or "what is the third largest river by discharge", not only "Ganges-Brahmaputra discharge volume" (which only confirms a candidate without establishing the rank).
+6. Temporal Grounding: If the input contains "current", "now", "today", or a present-tense superlative ("tallest", "fastest", "longest", "oldest surviving"), add "as of [current year]" to at least one query to avoid stale results from outdated sources.
+7. Query Breadth: Include at least one query with broader or alternative phrasing — using common aliases, shortened names, or less specific terms — so that retrieval succeeds even when the primary phrasing returns no results. Example: if the primary query is "Frederica of Mecklenburg-Strelitz birthplace", also include "Queen Frederica birthplace" or "Frederica consort of George III birthplace".
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
@@ -678,8 +689,9 @@ MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Y
 2. Memory Atomization: Atomize the memory into a list of atomic, self-contained information items. Each information item should be self-contained and clear (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items and no pronouns or other references to the original memory, question, or other items).
 3. Deduplication: Deduplicate the memory items by content. If two items have the same content, keep only one of them. If one item is completely contained in another item, remove the contained item.
 4. Relevance Evaluation: Assess each item against criteria (directly answering, contextual, supporting evidence, etc.). The information considers relevant or useful if it contains ANY information that could clue the answer to the question or related with any concept in the question.
+4b. Provenance Audit: For each [System Prediction] item, check if any [Retrieval] item provides the same or contradicting information. If contradicted by a [Retrieval] item → remove the [System Prediction] item entirely. If no [Retrieval] item addresses the same claim → prefix it with "Unverified hypothesis: " to clearly mark it as unverified.
 5. Irrelevant Information Removal: Remove information that is not relevant to the question.
-6. Conflict Resolution: [Retrieval] > [System Prediction], specific > general. If unresolvable, merge into an item that notes the conflict
+6. Conflict Resolution: When a [Retrieval] item and a [System Prediction] item state conflicting specific facts (a number, a name, a date, a place), ALWAYS keep the [Retrieval] item and DISCARD the [System Prediction] item — do not merge. Only keep [System Prediction] items that are NOT contradicted by any [Retrieval] item. If two [Retrieval] items conflict with each other, keep both and note the conflict.
 7. Refinement: Check each item to make sure it is self-contained and clear. If it is not, rewrite it to make it self-contained and clear.
 8. Repeat the process until the memory is refined to the best of your ability.
 9. Return the refined memory as a list of information items.
@@ -749,6 +761,16 @@ Instructions:
    - Reuse the exact same subject/object string for the same real-world entity across all extracted relations.
    - Do not use aliases, abbreviations, or pronouns in subject/object strings.
    - Set subject_id/object_id to null if the subject/object is not in the KNOWN ENTITIES list.
+
+## Canonical Relation Direction
+Always extract relations in the ACTIVE form: prefer verb predicates or "has_X" noun phrases. Never use passive or "is_X_of" forms, as these create inconsistency when the same fact is described differently in different texts.
+- CORRECT: (Sigmund Freud, has_child, Anna Freud)
+- WRONG:   (Anna Freud, child_of, Sigmund Freud)  ← passive/inverse form
+- CORRECT: (USA, contains, New York)
+- WRONG:   (New York, is_located_in, USA)  ← use active form when possible
+- CORRECT: (Oxford University, founded_in_year, 1096)
+- WRONG:   (1096, founding_year_of, Oxford University)
+Rule: if a predicate ends in "_of" or starts with "is_", prefer the inverse active form instead.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
