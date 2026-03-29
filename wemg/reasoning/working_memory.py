@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import networkx as nx
 
 from wemg.llm.roles import Relation
-from wemg.reasoning.generator import merge_logs
+from wemg.reasoning.generator import merge_logs, _PRUNE_TRIPLES_BATCH_SIZE
 from wemg.retrieval.entity_linking import link_entities_azure, link_entities_llm
 from wemg.retrieval.wikidata import (
     WikiTriple,
@@ -94,9 +94,6 @@ async def parse_graph_from_text(
         return relation_triples.relations, re_log
     logger.error("Failed relation extraction from text; using empty relation list.")
     return [], re_log
-
-
-_PRUNE_TRIPLES_BATCH_SIZE = 16
 
 
 async def _aprune_triple_strings_llm(
@@ -377,8 +374,8 @@ class WorkingMemory:
         Step 3: graph → text (textualize graph triples → add as RETRIEVAL items).
         Step 4: Consolidate again if new graph triples were added (text now enriched).
         """
+        t_sync = time.perf_counter()
         if self.textual_memory:
-            t_sync = time.perf_counter()
             logger.info(
                 "PROFSTEP wm stage=sync_start text_items=%d graph_nodes=%d question=%s",
                 len(self.textual_memory),
@@ -386,7 +383,7 @@ class WorkingMemory:
                 question[:120].replace("\n", " "),
             )
 
-            # Step 2: Consolidate
+            # Step 1: Consolidate
             t0 = time.perf_counter()
             await self._aconsolidate_textual_memory(client, question=question, interaction_memory=interaction_memory)
             logger.info(
@@ -395,7 +392,7 @@ class WorkingMemory:
                 len(self.textual_memory),
             )
 
-        # Step 3: text → graph
+        # Step 2: text → graph
         if self.textual_memory:
             text_blob = self.format_textual_memory()
             known = filter_entities_relevant_to_text(
@@ -447,13 +444,13 @@ class WorkingMemory:
         if self.graph_memory.number_of_nodes() > 0:
             self.deduplicate_graph()
 
-        # Step 4: graph → text (bidirectional enrichment)
+        # Step 3: graph → text (bidirectional enrichment)
         from wemg.llm.roles import SourceType
         n_before = len(self.textual_memory)
         for item in self._textualize_graph_to_text():
             self.add_textual_memory(item, source=SourceType.SYSTEM_PREDICTION)
 
-        # Step 5: Consolidate again if graph triples enriched the text
+        # Step 4: Consolidate again if graph triples enriched the text
         if len(self.textual_memory) > n_before:
             t0 = time.perf_counter()
             await self._aconsolidate_textual_memory(client, question=question, interaction_memory=interaction_memory)

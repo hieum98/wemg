@@ -460,19 +460,8 @@ def visualize_graph(
 
     edge_labels = {}
     for u, v, data in graph.edges(data=True):
-        relation = data.get("relation", {})
-        if isinstance(relation, set):
-            rel_labels = []
-            for prop in relation:
-                if hasattr(prop, "label"):
-                    rel_labels.append(prop.label)
-                else:
-                    rel_labels.append(str(prop))
-            edge_labels[(u, v)] = ", ".join(rel_labels[:2])
-        elif hasattr(relation, "label"):
-            edge_labels[(u, v)] = relation.label
-        else:
-            edge_labels[(u, v)] = str(relation)[:15]
+        labels = _normalize_relation_labels(data.get("relation"))
+        edge_labels[(u, v)] = ", ".join(labels[:2])
 
     if edge_labels:
         nx.draw_networkx_edge_labels(graph, pos, edge_labels, font_size=6)

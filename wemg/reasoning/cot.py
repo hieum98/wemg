@@ -3,22 +3,16 @@
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
-from wemg.llm.roles import SourceType
 from wemg.reasoning.nodes import (
     CoTNode, NodeType, NodeState,
     check_correctness, make_final_answer_state, make_subqa_state,
+    add_node_content_to_memory,
 )
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
 from wemg.reasoning.memory import WorkingMemory, InteractionMemory, log_to_interaction_memory
 
 logger = logging.getLogger(__name__)
 
-
-def _add_child_to_memory(child: CoTNode, working_memory: WorkingMemory):
-    content = str(child.node_state)
-    source = SourceType.SYSTEM_PREDICTION
-    if child.node_type in [NodeType.SUB_QA_NODE, NodeType.FINAL_ANSWER]:
-        working_memory.add_textual_memory(content, source=source, hop_depth=child.depth)
 
 
 async def generate_next_step(
@@ -35,7 +29,7 @@ async def generate_next_step(
     
     if node and result:
         generator.update_working_memory(result, hop_depth=current.depth + 1)
-        _add_child_to_memory(node, working_memory)
+        add_node_content_to_memory(node, working_memory)
         log_to_interaction_memory(interaction_memory, result.log_data)
     
     return node

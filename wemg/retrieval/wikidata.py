@@ -160,6 +160,26 @@ class WikiTriple(pydantic.BaseModel):
     relation: Any
     object: Any
 
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _reconstruct_nested(cls, data: Any) -> Any:
+        """Reconstruct WikidataEntity/WikidataProperty from dicts (e.g. after Redis deserialization)."""
+        if not isinstance(data, dict):
+            return data
+        subj = data.get("subject")
+        rel = data.get("relation")
+        obj = data.get("object")
+        if isinstance(subj, dict):
+            data["subject"] = WikidataEntity.model_validate(subj)
+        if isinstance(rel, dict):
+            data["relation"] = WikidataProperty.model_validate(rel)
+        if isinstance(obj, dict):
+            try:
+                data["object"] = WikidataEntity.model_validate(obj)
+            except Exception:
+                pass  # object can be a literal string value
+        return data
+
     def __hash__(self):
         s = self.subject.qid if hasattr(self.subject, "qid") else str(self.subject)
         r = self.relation.pid if hasattr(self.relation, "pid") else str(self.relation)

@@ -6,7 +6,7 @@ import random
 from typing import Dict, List, Optional, Tuple, Union
 
 from wemg.llm.roles import (
-    execute_role, SourceType,
+    execute_role,
     FINAL_ANSWER_SYNTHESIZER, MAJORITY_VOTER,
     VERIFIER,
     FinalAnswerSynthesisInput, MajorityVoteInput,
@@ -15,6 +15,7 @@ from wemg.llm.roles import (
 from wemg.reasoning.nodes import (
     MCTSNode, NodeType, NodeState,
     check_correctness, make_final_answer_state, make_subqa_state,
+    add_node_content_to_memory,
 )
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
 from wemg.reasoning.memory import WorkingMemory, log_to_interaction_memory
@@ -152,13 +153,6 @@ async def _self_correct_nodes(node: MCTSNode, gen: NodeGenerator) -> Tuple[List[
     ) for c in result.answers]
     return nodes, result, False
 
-def _add_child_to_memory(child: MCTSNode, working_memory: WorkingMemory):
-    """Add child node content to working memory."""
-    source = SourceType.SYSTEM_PREDICTION
-    if child.node_type in (NodeType.SUB_QA_NODE, NodeType.SELF_CORRECTED_NODE, NodeType.FINAL_ANSWER, NodeType.SYNTHESIS_NODE):
-        content = str(child.node_state)
-        working_memory.add_textual_memory(content, source=source, hop_depth=child.depth)
-
 
 async def simulate(
     node: MCTSNode,
@@ -185,7 +179,7 @@ async def simulate(
         if not nodes:
             break
         for child in nodes:
-            _add_child_to_memory(child, generator.working_memory)
+            add_node_content_to_memory(child, generator.working_memory)
         current = random.choice(nodes)
     return current, has_signal
 
@@ -298,7 +292,7 @@ async def mcts_search(
                 best = [c for c, s in zip(children, ucb_scores) if s == max_score]
                 selected = random.choice(best)
                 for child in children:
-                    _add_child_to_memory(child, generator.working_memory)
+                    add_node_content_to_memory(child, generator.working_memory)
 
         # Simulate: CoT rollout
         if not selected.is_terminal():
@@ -356,12 +350,12 @@ async def get_answer(
 ) -> Tuple[str, str]:
     """Extract final answer from MCTS tree via synthesis or majority vote."""
     terminals = []
-    def collect(node):
+    stack = [root]
+    while stack:
+        node = stack.pop()
         if node.is_terminal():
             terminals.append(node)
-        for child in node.children:
-            collect(child)
-    collect(root)
+        stack.extend(node.children)
 
     if not terminals:
         return "No final answer found.", "No answer"

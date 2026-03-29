@@ -260,6 +260,23 @@ class CoTNode(ReasoningNode):
 # Shared helpers used by both mcts.py and cot.py
 # ---------------------------------------------------------------------------
 
+_MEMORY_NODE_TYPES = frozenset({
+    NodeType.SUB_QA_NODE,
+    NodeType.SELF_CORRECTED_NODE,
+    NodeType.FINAL_ANSWER,
+    NodeType.SYNTHESIS_NODE,
+})
+
+
+def add_node_content_to_memory(node: "ReasoningNode", working_memory) -> None:
+    """Add node content to working memory for nodes with meaningful reasoning content."""
+    if node.node_type in _MEMORY_NODE_TYPES:
+        from wemg.llm.roles import SourceType
+        working_memory.add_textual_memory(
+            str(node.node_state), source=SourceType.SYSTEM_PREDICTION, hop_depth=node.depth
+        )
+
+
 def check_correctness(predicted: str, answers: Union[str, List[str]]) -> bool:
     """Return True if any answer string appears (case-insensitive) in predicted."""
     if not predicted or not answers:

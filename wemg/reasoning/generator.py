@@ -424,15 +424,7 @@ class NodeGenerator:
                     hop_triples.extend(per_seed)
             else:
                 hop_triples = list(hop_results) if hop_results else []
-            seen_keys: set = set()
-            deduped: List[WikiTriple] = []
-            for t in hop_triples:
-                k_key = (t.subject.qid, t.relation.pid,
-                         t.object.qid if isinstance(t.object, WikidataEntity) else str(t.object))
-                if k_key not in seen_keys:
-                    seen_keys.add(k_key)
-                    deduped.append(t)
-            hop_triples = deduped
+            hop_triples = self._deduplicate_triples(hop_triples)
 
             if not hop_triples:
                 break
@@ -459,16 +451,7 @@ class NodeGenerator:
             current_qids = list(next_qids)
             all_visited_qids.update(current_qids)
 
-        # Final dedup across all hops.
-        seen_keys = set()
-        triples: List[WikiTriple] = []
-        for t in all_triples:
-            k_key = (t.subject.qid, t.relation.pid,
-                     t.object.qid if isinstance(t.object, WikidataEntity) else str(t.object))
-            if k_key not in seen_keys:
-                seen_keys.add(k_key)
-                triples.append(t)
-
+        triples = self._deduplicate_triples(all_triples)
         return triples, entities, link_log
 
     def _stage_a_prune_triples(self, question: str, triples: List[WikiTriple]) -> List[WikiTriple]:
@@ -528,6 +511,22 @@ class NodeGenerator:
             kept.extend(chunk[i] for i in range(len(chunk)) if i in keep)
         kept = list(set(kept))
         return kept, log
+
+    @staticmethod
+    def _deduplicate_triples(triples: List[WikiTriple]) -> List[WikiTriple]:
+        """Return triples with duplicates removed (by subject QID, relation PID, object QID/str)."""
+        seen: set = set()
+        result: List[WikiTriple] = []
+        for t in triples:
+            key = (
+                t.subject.qid,
+                t.relation.pid,
+                t.object.qid if isinstance(t.object, WikidataEntity) else str(t.object),
+            )
+            if key not in seen:
+                seen.add(key)
+                result.append(t)
+        return result
 
     @staticmethod
     def _collect_entities_from_triples(triples: List[WikiTriple]) -> List[WikidataEntity]:
