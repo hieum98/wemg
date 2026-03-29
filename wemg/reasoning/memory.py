@@ -1,7 +1,7 @@
 """Working and interaction memory public API.
 """
 
-from .working_memory import GlobalKnowledge, MemoryDelta, WorkingMemory, parse_graph_from_text
+from .working_memory import WorkingMemory, parse_graph_from_text
 from .interaction_memory import (
     AsyncReadWriteLock,
     ThreadSafeReadWriteLock,
@@ -12,8 +12,6 @@ from .interaction_memory import (
 
 __all__ = [
     # Working memory
-    "GlobalKnowledge",
-    "MemoryDelta",
     "WorkingMemory",
     "parse_graph_from_text",
     # Interaction memory

@@ -38,9 +38,13 @@ class Role:
 class SubquestionGenerationInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
     context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
+    intermediate_answer: Optional[str] = pydantic.Field(None, description="Result of the previous reasoning hop to anchor the next subquestion.")
 
     def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+        parts = [f"question:\n{self.question}", f"context:\n{self.context}"]
+        if self.intermediate_answer:
+            parts.append(f"intermediate_answer:\n{self.intermediate_answer}")
+        return "\n\n".join(parts)
 
 
 class SubquestionGenerationOutput(pydantic.BaseModel):
@@ -212,6 +216,20 @@ class ConsensusEvaluationOutput(pydantic.BaseModel):
     reasoning: str = pydantic.Field(..., description="Reasoning behind the rating.")
 
 
+class AnswerVerificationInput(pydantic.BaseModel):
+    question: str
+    candidate_answer: str
+    context: Optional[str] = "Not provided"
+
+    def __str__(self):
+        return f"question:\n{self.question}\n\ncandidate_answer:\n{self.candidate_answer}\n\ncontext:\n{self.context}"
+
+
+class AnswerVerificationOutput(pydantic.BaseModel):
+    rating: float = pydantic.Field(..., ge=0.0, le=10.0)
+    reasoning: str
+
+
 # =============================================================================
 # Extractor I/O Models
 # =============================================================================
@@ -236,6 +254,7 @@ class ExtractionOutput(pydantic.BaseModel):
 class MemoryItem(pydantic.BaseModel):
     content: str = pydantic.Field(..., description="Self-contained information piece.")
     provenance: str = pydantic.Field(..., pattern=r"^(System Prediction|Retrieval)$")
+    hop_depth: Optional[int] = pydantic.Field(None, description="Reasoning hop at which this item was retrieved. Null means pre-consolidated (always retain).")
 
 
 class MemoryConsolidationInput(pydantic.BaseModel):
@@ -367,59 +386,47 @@ class TriplePruneOutput(pydantic.BaseModel):
 # System Prompts -- Generator
 # =============================================================================
 
-GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant for multi-hop question answering and reasoning decomposition. Your job is to decide whether the main question can already be answered from the provided context. If it cannot, generate a small set of strategic subquestions that help advance the reasoning process to answer the main question. 
+GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant for multi-hop question answering and reasoning decomposition. Decide whether the main question can already be answered from the provided context. If not, generate strategic subquestions to advance the reasoning.
 
-## Core Principle
-Every generated subquestion must:
-- target a real knowledge gap needed to answer the main question
-- NOT be answerable from the provided context
-- be atomic, self-contained, and understandable on its own
-- be diverse and non-redundant
-- be independently answerable, without requiring answers to other generated subquestions
+## Intermediate Answer
+If `intermediate_answer` is provided, it is the resolved result of the PREVIOUS hop. Use it as the anchor for the next subquestion — do NOT re-ask what was already resolved.
+
+## Core Principles
+Each subquestion must:
+- target a real knowledge gap not answerable from the provided context
+- be atomic, self-contained, and understandable without the main question
+- be non-redundant with other generated subquestions
+
+**Sequential chains are allowed** when the main question explicitly links hops (e.g., "father of the father of X", "predecessor of the successor of Y"). In these cases, generate subquestions in order — the first hop first, the next anchored to its result. Sequential subquestions may depend on each other.
 
 ## Instructions
-1. Analyze the main question:
-   - Identify the core intent, key entities, constraints, and the information required to answer it.
-2. Check the context:
-   - Determine whether the context already contains enough information to answer the main question.
-3. Make the decision:
-   - If the context is sufficient, set `is_answerable` to true and do not generate subquestions.
-   - If the context is insufficient, set `is_answerable` to false and generate subquestions.
-4. Identify the missing knowledge:
-   - Focus only on gaps that would meaningfully advance the reasoning process toward answering the main question.
-5. Generate candidate subquestions:
-   - Each subquestion should target one distinct missing fact or inference step.
-   - Each subquestion must be fully self-contained and should not rely on the wording of the main question or the other subquestions to be understood.
-   - Avoid trivial questions that are already answered by the context or are obvious general knowledge.
-   - If a subquestion can be answered with high confidence from common knowledge or the context, include the answer directly after the subquestion and treat that subquestion-answer pair as one item.
-6. Validate and filter:
-   - Do not guess or invent uncertain answers.
-   - Remove any subquestion that is answerable from the context.
-   - Remove any subquestion that is not useful for progressing toward the main question.
-   - Remove duplicates, overlaps, and low-value variants.
-   - Remove any dependent subquestion that requires another generated subquestion to be answered first.
-   - If more than 3 good subquestions remain, keep only the 3 most useful ones.
+1. Analyze the main question: identify core intent, key entities, constraints, and required reasoning steps.
+2. Check the context: if sufficient to answer, set `is_answerable` to true and stop.
+3. Identify missing knowledge: only gaps that meaningfully advance reasoning toward the answer.
+4. Generate subquestions:
+   - For parallel gaps: each must be independently answerable.
+   - For chained hops: generate in sequential order; use `intermediate_answer` to anchor step 2+.
+   - For ranked/ordinal questions ("Nth X", "highest", "oldest", "most"): include a subquestion that retrieves the **complete ranked list**, not just confirms a candidate.
+   - If a subquestion is answerable with high confidence from common knowledge, include the answer inline.
+5. Validate: remove subquestions that are answerable from context, redundant, or low-value. Keep at most 3.
 
 ## Scope Consistency
-Subquestions should preserve the geographic or categorical scope of the main question unless the decomposition logically requires narrowing it. Do NOT silently narrow a global scope to a specific region or category without justification.
-
-Example of scope drift to avoid:
-  Main Q: "What is the third oldest surviving university in the world?"
-  BAD subquestion: "What is the oldest university in England?" ← narrows to England without justification
-  GOOD subquestion: "What are the three oldest surviving universities in the world and when were they founded?"
+Preserve the geographic or categorical scope of the main question. Do NOT silently narrow a global scope to a specific region without justification.
+- BAD: Main Q = "third oldest university in the world" → subQ = "oldest university in England" ← narrows to England
+- GOOD: subQ = "three oldest surviving universities in the world and their founding dates"
 
 ## Output Format
 Respond with a JSON object with exactly these keys:
-- is_answerable: boolean — true if the main question can be answered from the provided context alone; false otherwise
-- subquestions: array of strings, or null — if `is_answerable` is true, use null or []; if false, provide up to 3 atomic, diverse, non-redundant subquestions that help answer the main question and cannot be answered from the context
+- is_answerable: boolean — true if the main question can be answered from the provided context alone
+- subquestions: array of strings, or null — up to 5 strategic subquestions; null or [] if is_answerable is true
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
 
 ## Instructions:
-1. Analyze the question and identify key components. Determine if the question can be answered directly: check if the context already contains a sufficient answer, or if the answer follows clearly from well-known facts with high confidence. If so, answer directly without further elaboration.
-2. If the question cannot be answered directly, extract all relevant information from the context. If the context is not provided, use your own knowledge or your own internet search.
-3. Synthesize a clear, well-reasoned answer. State assumptions clearly if you made any assumptions or used your own internet search.
+1. Analyze the question: identify core intent, key entities, and specific information sought.
+2. Context priority: when context is provided, ground your answer **exclusively in the context** — do not introduce external facts. Only use your own knowledge when context is absent or clearly incomplete, and explicitly state when doing so.
+3. Synthesize a clear, well-reasoned answer. State any assumptions clearly, you always try your best to answer the question even if the context is incomplete or missing, but again, always state that what is your own knowledge and what is the context.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
@@ -506,7 +513,7 @@ GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user i
 4. Review for Completeness and Non-Redundancy: Ensure that the set of queries collectively covers all necessary information to answer/verify the input without any overlap or unnecessary duplication.
 5. Rank Verification: If the question asks for a ranked entity ("Nth X", "highest", "most", "record holder", "largest", "oldest", etc.), always generate at least one query that verifies the rank directly — not just the properties of a candidate entity. Example: Q="third largest river by discharge" → include "list of rivers by discharge volume" or "what is the third largest river by discharge", not only "Ganges-Brahmaputra discharge volume" (which only confirms a candidate without establishing the rank).
 6. Temporal Grounding: If the input contains "current", "now", "today", or a present-tense superlative ("tallest", "fastest", "longest", "oldest surviving"), add "as of [current year]" to at least one query to avoid stale results from outdated sources.
-7. Query Breadth: Include at least one query with broader or alternative phrasing — using common aliases, shortened names, or less specific terms — so that retrieval succeeds even when the primary phrasing returns no results. Example: if the primary query is "Frederica of Mecklenburg-Strelitz birthplace", also include "Queen Frederica birthplace" or "Frederica consort of George III birthplace".
+7. Fallback Queries: Add 1–2 fallback queries using common aliases, shortened names, or alternative phrasings for the same facts — so that retrieval succeeds if the primary phrasing returns no results. Fallback queries seek the same information via different wording, not new facts. Example: primary = "Frederica of Mecklenburg-Strelitz birthplace" → fallback = "Queen Frederica birthplace".
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
@@ -570,7 +577,9 @@ Scoring Guidelines:
 - 3.0-4.9: Significant correctness or relevance issues
 - 0.0-2.9: Incorrect or completely off-topic
 
-IMPORTANT NOTE: Conduct your own internet searches/ knowledge investigation as needed to verify factual claims when correct_answer is not provided. Do not assume the system_answer is correct. You must independently verify all claims
+IMPORTANT NOTE: Conduct your own internet searches/knowledge investigation as needed to verify factual claims when correct_answer is not provided. Do not assume the system_answer is correct. You must independently verify all claims.
+
+**Uncertainty rule**: If you are not confident about the correct answer (obscure facts, precise numbers, specific dates, rare entities), assign 5.0 rather than a confident high or low score. Only assign scores below 3.0 or above 8.0 when you are certain.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
@@ -636,6 +645,26 @@ Respond with a JSON object with exactly these keys:
 - confidence_level: string — one of: "high", "medium", "low", or "uncertain"
 """
 
+VERIFY_ANSWER_PROMPT = """You are an expert verifier. Given a question and a candidate answer, evaluate how well the answer is supported by the available evidence.
+
+- If context is provided: use it as the primary source of evidence to verify the answer.
+- If context is not provided or is empty: use your own knowledge to independently verify it.
+
+Rate from 0.0 to 10.0 how well the answer is correct/supported by the evidence.
+
+Scoring:
+- 9.0-10.0: Fully verified / strongly supported by evidence
+- 7.0-8.9: Mostly supported, minor gaps or uncertainties
+- 5.0-6.9: Partially supported or uncertain
+- 3.0-4.9: Weakly supported, significant doubts
+- 0.0-2.9: Contradicted by evidence or completely unsupported
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- rating: number — float from 0.0 to 10.0 inclusive
+- reasoning: string — brief justification
+"""
+
 CONSENSUS_EVALUATION_PROMPT = """You are an expert evaluator. Given two candidate answers with their reasoning, evaluate the consensus between the two answers. Rate from 0.0 to 10.0 how well the two answers are consistent with each other.
 
 Criteria:
@@ -689,18 +718,20 @@ MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Y
 2. Memory Atomization: Atomize the memory into a list of atomic, self-contained information items. Each information item should be self-contained and clear (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items and no pronouns or other references to the original memory, question, or other items).
 3. Deduplication: Deduplicate the memory items by content. If two items have the same content, keep only one of them. If one item is completely contained in another item, remove the contained item.
 4. Relevance Evaluation: Assess each item against criteria (directly answering, contextual, supporting evidence, etc.). The information considers relevant or useful if it contains ANY information that could clue the answer to the question or related with any concept in the question.
-4b. Provenance Audit: For each [System Prediction] item, check if any [Retrieval] item provides the same or contradicting information. If contradicted by a [Retrieval] item → remove the [System Prediction] item entirely. If no [Retrieval] item addresses the same claim → prefix it with "Unverified hypothesis: " to clearly mark it as unverified.
+4b. Provenance Audit: For each [System Prediction] item, check if any [Retrieval] item covers the same claim. If contradicted by a [Retrieval] item → remove the [System Prediction] item entirely. If supported by a [Retrieval] item → upgrade its provenance to "Retrieval". If no [Retrieval] item addresses the same claim → retain as [System Prediction] (unverified by retrieval).
+4c. Hop Depth Filtering: Some input items carry a [hop=N] prefix in their text, meaning they were retrieved/ generated at reasoning step N. Items without this prefix are pre-consolidated from a previous pass. For tagged items: determine whether each provides the lowest-hop answer that completely answers the question. If a lower-hop item already fully answers the question, discard higher-hop items that go beyond what the question asks (e.g., for a 1-hop question, discard [hop=2+] items not needed to answer it). Do NOT include [hop=N] prefixes in the output `content` field — strip them. Instead, set `hop_depth` in the output to the original N value for kept tagged items, the minimum N when merging items at different hop depths, and null for untagged (pre-consolidated) items.
 5. Irrelevant Information Removal: Remove information that is not relevant to the question.
 6. Conflict Resolution: When a [Retrieval] item and a [System Prediction] item state conflicting specific facts (a number, a name, a date, a place), ALWAYS keep the [Retrieval] item and DISCARD the [System Prediction] item — do not merge. Only keep [System Prediction] items that are NOT contradicted by any [Retrieval] item. If two [Retrieval] items conflict with each other, keep both and note the conflict.
 7. Refinement: Check each item to make sure it is self-contained and clear. If it is not, rewrite it to make it self-contained and clear.
-8. Repeat the process until the memory is refined to the best of your ability.
+8. Final check: verify every kept item is self-contained, non-redundant, and has correct provenance. Remove any item that still refers to external context or uses pronouns.
 9. Return the refined memory as a list of information items.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
 - consolidated_memory: array of objects; each object has:
-  - content: string — one atomic, self-contained information item
+  - content: string — one atomic, self-contained information item (NO [hop=N] prefix)
   - provenance: string — exactly "System Prediction" or "Retrieval"
+  - hop_depth: integer or null — hop level of this item (null if pre-consolidated/untagged)
 """
 
 # =============================================================================
@@ -763,14 +794,20 @@ Instructions:
    - Set subject_id/object_id to null if the subject/object is not in the KNOWN ENTITIES list.
 
 ## Canonical Relation Direction
-Always extract relations in the ACTIVE form: prefer verb predicates or "has_X" noun phrases. Never use passive or "is_X_of" forms, as these create inconsistency when the same fact is described differently in different texts.
+Always extract relations in the ACTIVE form: prefer verb predicates or "has_X" noun phrases. Never use passive or inverse forms, as these create inconsistency when the same fact is described differently in different texts.
 - CORRECT: (Sigmund Freud, has_child, Anna Freud)
-- WRONG:   (Anna Freud, child_of, Sigmund Freud)  ← passive/inverse form
+- WRONG:   (Anna Freud, child_of, Sigmund Freud)  ← ends in _of
 - CORRECT: (USA, contains, New York)
-- WRONG:   (New York, is_located_in, USA)  ← use active form when possible
-- CORRECT: (Oxford University, founded_in_year, 1096)
-- WRONG:   (1096, founding_year_of, Oxford University)
-Rule: if a predicate ends in "_of" or starts with "is_", prefer the inverse active form instead.
+- WRONG:   (New York, is_located_in, USA)  ← starts with is_
+- CORRECT: (Tiberius, precedes, Caligula)
+- WRONG:   (Caligula, preceded_by, Tiberius)  ← passive _by form
+- CORRECT: (James Cameron, directed, Titanic)
+- WRONG:   (Titanic, directed_by, James Cameron)  ← passive _by form
+
+Rules — convert to active form when a predicate:
+1. ends in "_of" (child_of, part_of, capital_of) → invert: has_child, contains, has_capital
+2. starts with "is_" (is_located_in, is_a) → invert to active form
+3. ends in "_by" (preceded_by, directed_by, owned_by, succeeded_by) → invert: precedes, directed, owns, succeeds/has_successor
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
@@ -791,14 +828,14 @@ TRIPLE_PRUNE_PROMPT = """You are a Knowledge Graph Expert. Given a question and 
 
 ## Relevance Criteria
 
-A triple (Subject – Relation – Object) is relevant ONLY if it meets one of the following conditions:
+A triple (Subject - Relation - Object) is relevant ONLY if it meets one of the following conditions:
 
 1. **Direct relevance**: Both the subject AND the object are directly related to the question, and the relation connects them in a way that helps answer the question.
-   - Example: Question "What is the capital of France?" → Triple (France – capital – Paris) ✓
-   - Counter-example: Question "What is the capital of France?" → Triple (France – borders – Germany) ✗  (only subject is relevant)
+   - Example: Question "What is the capital of France?" → Triple (France - capital - Paris) ✓
+   - Counter-example: Question "What is the capital of France?" → Triple (France - borders - Germany) ✗  (only subject is relevant)
 
 2. **Chain relevance**: The triple forms part of a reasoning chain with another kept triple. Specifically, one entity of this triple must match an entity in another relevant triple, and together they help answer the question.
-   - Example: Question "Who is the spouse of the president of France?" → Triples (France – president – Macron) + (Macron – spouse – Brigitte) are both relevant as a chain.
+   - Example: Question "Who is the spouse of the president of France?" → Triples (France - president - Macron) + (Macron - spouse - Brigitte) are both relevant as a chain.
 
 ## Key Rule
 
@@ -826,6 +863,7 @@ EVALUATOR = Role("evaluator", JUDGE_ANSWER_PROMPT_V2, AnswerEvaluationInput, Ans
 MAJORITY_VOTER = Role("majority_voter", MAJORITY_VOTE_PROMPT, MajorityVoteInput, MajorityVoteOutput)
 FINAL_ANSWER_SYNTHESIZER = Role("final_answer_synthesizer", SYNTHESIZE_FINAL_ANSWER_PROMPT, FinalAnswerSynthesisInput, FinalAnswerSynthesisOutput)
 CONSENSUS_EVALUATOR = Role("consensus_evaluator", CONSENSUS_EVALUATION_PROMPT, ConsensusEvaluationInput, ConsensusEvaluationOutput)
+VERIFIER = Role("verifier", VERIFY_ANSWER_PROMPT, AnswerVerificationInput, AnswerVerificationOutput)
 EXTRACTOR = Role("extractor", EXTRACT_PROMPT, ExtractionInput, ExtractionOutput)
 MEMORY_CONSOLIDATOR = Role("memory_consolidation", MEMORY_CONSOLIDATION_PROMPT, MemoryConsolidationInput, MemoryConsolidationOutput)
 NER = Role("named_entity_recognition", NER_PROMPT, NERInput, NEROutput)

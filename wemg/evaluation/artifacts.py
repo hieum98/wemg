@@ -47,28 +47,56 @@ def load_search_tree_json(path: Union[str, Path]) -> Dict[str, Any]:
 
 
 def _summarize_tree_node(node: Dict[str, Any]) -> str:
+    """Full serialized node content on one line (newlines collapsed)."""
     node_type = str(node.get("node_type", "UNKNOWN"))
     content = node.get("content", {}) or {}
+
+    def nl(s: str) -> str:
+        return str(s).replace("\n", " ").replace("\r", " ")
+
     if node_type == "USER_QUESTION":
-        return f"User: {str(content.get('user_question', ''))[:80]}"
+        gt = content.get("golden_answer", "N/A")
+        return nl(f"User: {content.get('user_question', '')} - GT: {gt}")
     if node_type == "FINAL_ANSWER":
-        return f"Final: {str(content.get('final_answer', ''))[:80]}"
+        parts = [f"Final: {content.get('final_answer', '')}"]
+        if content.get("reasoning"):
+            parts.append(f"Reasoning: {content['reasoning']}")
+        if content.get("concise_answer"):
+            parts.append(f"Concise: {content['concise_answer']}")
+        return nl(" | ".join(parts))
     if node_type == "SUBQUESTION":
-        sub_q = str(content.get("sub_question", ""))[:60]
-        sub_a = str(content.get("sub_answer", ""))[:60]
-        return f"Sub_Q: {sub_q} - Sub_A: {sub_a}"
+        parts = [
+            f"Sub_Q: {content.get('sub_question', '')}",
+            f"Sub_A: {content.get('sub_answer', '')}",
+        ]
+        if content.get("reasoning"):
+            parts.append(f"Reasoning: {content['reasoning']}")
+        return nl(" | ".join(parts))
     if node_type == "REPHRASE_QUESTION":
-        return f"Rephrase: {str(content.get('sub_question', ''))[:80]}"
+        return nl(f"Rephrase: {content.get('sub_question', '')}")
     if node_type == "SELF_CORRECT":
-        return f"Self_corrected: {str(content.get('sub_answer', ''))[:80]}"
+        parts = [
+            f"Sub_Q: {content.get('sub_question', '')}",
+            f"Sub_A: {content.get('sub_answer', '')}",
+        ]
+        if content.get("reasoning"):
+            parts.append(f"Reasoning: {content['reasoning']}")
+        return nl(" | ".join(parts))
     if node_type == "SYNTHESIS":
-        return f"Synthesis: {str(content.get('synthesized_reasoning', ''))[:80]}"
-    return str(content)[:80]
+        return nl(f"Synthesis: {content.get('synthesized_reasoning', '')}")
+    return nl(str(content))
 
 
 def _format_tree_lines(node: Dict[str, Any], prefix: str = "", is_last: bool = True) -> list[str]:
     node_type = str(node.get("node_type", "UNKNOWN"))
     summary = _summarize_tree_node(node).replace("\n", " ").replace("\r", " ")
+    mcts: list[str] = []
+    if "visits" in node:
+        mcts.append(f"visits={node['visits']}")
+    if "value" in node:
+        mcts.append(f"value={node['value']}")
+    if mcts:
+        summary = f"{summary} | {' '.join(mcts)}"
     marker = "└── " if is_last else "├── "
     lines = [f"{prefix}{marker}{node_type} {summary}"]
 
@@ -89,7 +117,7 @@ def _format_tree_lines(node: Dict[str, Any], prefix: str = "", is_last: bool = T
 def print_saved_search_tree(
     tree_or_path: Union[Dict[str, Any], str, Path],
 ) -> str:
-    """Print a saved search tree in a compact hierarchy similar to system output."""
+    """Print a saved search tree hierarchy (full node text, like system ``print_tree``)."""
     tree = (
         load_search_tree_json(tree_or_path)
         if isinstance(tree_or_path, (str, Path))

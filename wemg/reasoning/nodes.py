@@ -129,28 +129,46 @@ class ReasoningNode(NodeMixin):
         return self.parent is None
 
     def _summary(self) -> str:
-        """Compact, single-line summary string for this node."""
+        """Full node text on one line (newlines collapsed) for tree printing."""
         data = self.node_state.content
+
+        def one_line(s: str) -> str:
+            return s.replace("\n", " ").replace("\r", " ")
+
         if self.node_type == NodeType.USER_QUESTION:
             gt = data.get("golden_answer", "N/A")
-            detail = f"User: {data['user_question'][:80]} - GT: {gt}"
+            detail = f"User: {data['user_question']} - GT: {gt}"
         elif self.node_type == NodeType.FINAL_ANSWER:
-            detail = f"Final: {data.get('final_answer', '')[:80]}"
+            parts = [f"Final: {data.get('final_answer', '')}"]
+            if data.get("reasoning"):
+                parts.append(f"Reasoning: {data['reasoning']}")
+            if data.get("concise_answer"):
+                parts.append(f"Concise: {data['concise_answer']}")
+            detail = " | ".join(parts)
         elif self.node_type == NodeType.SUB_QA_NODE:
-            detail = (
-                f"Sub_Q: {data.get('sub_question', '')[:60]} - "
-                f"Sub_A: {data.get('sub_answer', '')[:60]}"
-            )
+            parts = [
+                f"Sub_Q: {data.get('sub_question', '')}",
+                f"Sub_A: {data.get('sub_answer', '')}",
+            ]
+            if data.get("reasoning"):
+                parts.append(f"Reasoning: {data['reasoning']}")
+            detail = " | ".join(parts)
         elif self.node_type == NodeType.REPHRASED_QUESTION_NODE:
-            detail = f"Rephrase: {data.get('sub_question', '')[:80]}"
+            detail = f"Rephrase: {data.get('sub_question', '')}"
         elif self.node_type == NodeType.SELF_CORRECTED_NODE:
-            detail = f"Self_corrected: {data.get('sub_answer', '')[:80]}"
+            parts = [
+                f"Sub_Q: {data.get('sub_question', '')}",
+                f"Sub_A: {data.get('sub_answer', '')}",
+            ]
+            if data.get("reasoning"):
+                parts.append(f"Reasoning: {data['reasoning']}")
+            detail = " | ".join(parts)
         elif self.node_type == NodeType.SYNTHESIS_NODE:
-            detail = f"Synthesis: {data.get('synthesized_reasoning', '')[:80]}"
+            detail = f"Synthesis: {data.get('synthesized_reasoning', '')}"
         else:
-            detail = str(data)[:80]
+            detail = str(data)
 
-        return detail.replace("\n", " ").replace("\r", " ")
+        return one_line(detail)
 
     def _stable_id(self) -> str:
         """Stable identifier based on node type and content, depth-agnostic."""
@@ -178,6 +196,8 @@ class ReasoningNode(NodeMixin):
             color = color_map.get(node.node_type, "")
             node_id = node._stable_id()
             detail = node._summary()
+            if hasattr(node, "visits") and hasattr(node, "value"):
+                detail = f"{detail} | visits={node.visits} value={node.value:g}"
             print(f"{pre}{color}{node_id}{Style.RESET_ALL} {detail}")
 
     def __repr__(self) -> str:

@@ -20,7 +20,7 @@ from wemg.retrieval.reranker import Reranker
 from wemg.retrieval.wikidata import WikidataClient
 from wemg.reasoning.cot import cot_search, cot_get_answer
 from wemg.reasoning.mcts import mcts_search, get_answer
-from wemg.reasoning.memory import GlobalKnowledge, WorkingMemory, InteractionMemory
+from wemg.reasoning.memory import WorkingMemory, InteractionMemory
 logger = logging.getLogger(__name__)
 
 
@@ -78,7 +78,6 @@ class AnswerResult:
     search_tree: Optional[Any] = None
     metadata: Optional[Dict[str, Any]] = None
     working_memory: Optional[WorkingMemory] = None
-    global_knowledge: Optional[GlobalKnowledge] = None
 
 
 class WEMGSystem:
@@ -201,21 +200,14 @@ class WEMGSystem:
         )
         return Reranker(client=reranker_client, top_k=r.top_k, instruction=r.instruction)
 
-    def _create_working_memory(self, global_knowledge: Optional[GlobalKnowledge] = None) -> WorkingMemory:
+    def _create_working_memory(self) -> WorkingMemory:
         wm_cfg = self.cfg.memory.working_memory
         return WorkingMemory(
             max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
             wikidata_client=self.wikidata_client,
-            global_knowledge=global_knowledge,
         )
 
-    def _create_global_knowledge(self) -> GlobalKnowledge:
-        wm_cfg = self.cfg.memory.working_memory
-        return GlobalKnowledge(
-            wikidata_client=self.wikidata_client,
-            max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
-        )
-    
+
     def _create_interaction_memory(self, collection_name: str = None) -> Optional[InteractionMemory]:
         im = self.cfg.memory.interaction_memory
         if not im.enabled:
@@ -259,7 +251,24 @@ class WEMGSystem:
         at the process level.
         """
         max_rps: Optional[float] = self.cfg.retriever.web_search.max_crawl_requests_per_second
-        return WikidataClient(max_wikipedia_requests_per_second=max_rps)
+        redis_client = None
+        if self.cfg.cache.enabled:
+            try:
+                import redis as redis_lib
+                redis_client = redis_lib.Redis(
+                    host=self.cfg.cache.host,
+                    port=self.cfg.cache.port,
+                    db=self.cfg.cache.db,
+                    password=self.cfg.cache.password,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                    decode_responses=True,
+                )
+                redis_client.ping()
+            except Exception as e:
+                logger.warning("Redis unavailable, triple cache disabled: %s", e)
+                redis_client = None
+        return WikidataClient(max_wikipedia_requests_per_second=max_rps, redis_client=redis_client)
     
     def answer(self, question: str, question_id: str = None, golden_answer: Optional[str] = None) -> AnswerResult:
         self._initialize()
@@ -289,9 +298,8 @@ class WEMGSystem:
             )
             return result
         elif strategy == "mcts":
-            gk = self._create_global_knowledge()
-            working_memory = self._create_working_memory(global_knowledge=gk)
-            result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, gk, interaction_memory, node_gen_kwargs, golden_answer))
+            working_memory = self._create_working_memory()
+            result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
             logger.info(
                 "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
                 strategy,
@@ -321,29 +329,24 @@ class WEMGSystem:
             working_memory=working_memory,
         )
     
-    async def _answer_with_mcts(self, question, question_id, working_memory, global_knowledge, interaction_memory, kwargs, golden_answer):
+    async def _answer_with_mcts(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer):
         mcts_cfg = self.cfg.search.mcts
         et = mcts_cfg.early_termination
-        wm_cfg = self.cfg.memory.working_memory
         t_mcts = time.perf_counter()
         logger.info("PROFSTEP system stage=mcts_search_start question_id=%s", str(question_id))
         best_content, root, pass_at_k = await mcts_search(
             question=question, client=self.client, retriever=self.retriever,
             wikidata_client=self.wikidata_client, reranker=self.reranker,
             working_memory=working_memory, interaction_memory=interaction_memory,
-            global_knowledge=global_knowledge,
             num_iterations=mcts_cfg.num_iterations, max_tree_depth=mcts_cfg.max_tree_depth,
             exploration_weight=mcts_cfg.exploration_weight,
             golden_answer=golden_answer if mcts_cfg.use_golden_answer_for_reward else None,
+            max_simulation_depth=mcts_cfg.max_simulation_depth,
             correct_answers=golden_answer,
             early_termination_enabled=et.enabled, min_iterations=et.min_iterations,
             high_confidence_threshold=et.high_confidence_threshold,
             convergence_patience=et.convergence_patience,
             semantic_sufficiency_count=et.semantic_sufficiency_count,
-            absorption_min_reward=wm_cfg.absorption_min_reward,
-            absorption_top_k=wm_cfg.absorption_top_k,
-            min_graph_nodes_for_consensus=mcts_cfg.min_graph_nodes_for_consensus,
-            consensus_weight=mcts_cfg.consensus_weight,
             **kwargs,
         )
         logger.info(
@@ -352,12 +355,12 @@ class WEMGSystem:
             (time.perf_counter() - t_mcts) * 1000.0,
             str(pass_at_k),
         )
-        
+
         if self.cfg.output.show_search_tree:
             root.print_tree()
         t_final = time.perf_counter()
         logger.info("PROFSTEP system stage=get_answer_start question_id=%s", str(question_id))
-        full_answer, concise_answer = await get_answer(root, self.client, interaction_memory, working_memory=working_memory, global_knowledge=global_knowledge)
+        full_answer, concise_answer = await get_answer(root, self.client, interaction_memory, working_memory=working_memory)
         logger.info(
             "PROFSTEP system stage=get_answer_done question_id=%s elapsed_ms=%.1f",
             str(question_id),
@@ -368,7 +371,6 @@ class WEMGSystem:
             search_tree=root if self.cfg.output.include_reasoning else None,
             metadata={"question_id": question_id, "strategy": "mcts", "pass_at_k": pass_at_k},
             working_memory=working_memory,
-            global_knowledge=global_knowledge,
         )
     
     def answer_batch(

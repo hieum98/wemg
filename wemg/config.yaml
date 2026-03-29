@@ -55,18 +55,16 @@ reranker:
 search:
   strategy: "mcts"
   mcts:
-    num_iterations: 15
+    num_iterations: 20
     max_tree_depth: 10
     exploration_weight: 2.5
-    use_golden_answer_for_reward: false
-    min_graph_nodes_for_consensus: 3
-    consensus_weight: 0.7        # weight for consensus reward when graph is available (answer_weight = 1 - this)
+    max_simulation_depth: 5
     early_termination:
       enabled: true
-      min_iterations: 3
+      min_iterations: 5
       high_confidence_threshold: 0.9
-      convergence_patience: 3
-      semantic_sufficiency_count: 3
+      convergence_patience: 5
+      semantic_sufficiency_count: 5
   cot:
     max_depth: 10
 
@@ -75,19 +73,17 @@ node_generation:
   n_subquestions: 3
   top_k_websearch: 5
   top_k_entities: 5
-  n_hops: 1
+  n_hops: 2
   entity_linking_method: "llm"
   rerank_kb_documents: true
-  triple_pruning_delta: 0.05
-  triple_pruning_top_k: 32
+  triple_pruning_delta: 0.07
+  triple_pruning_top_k: 128
   azure_endpoint: null
   azure_key: null
 
 memory:
   working_memory:
     max_textual_memory_tokens: 16384
-    absorption_min_reward: 0.0       # min branch reward to promote delta into GlobalKnowledge
-    absorption_top_k: 3              # fallback: absorb top-k branches by reward if nothing was absorbed
   interaction_memory:
     enabled: false
     scope: "question"

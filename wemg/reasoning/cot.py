@@ -18,7 +18,7 @@ def _add_child_to_memory(child: CoTNode, working_memory: WorkingMemory):
     content = str(child.node_state)
     source = SourceType.SYSTEM_PREDICTION
     if child.node_type in [NodeType.SUB_QA_NODE, NodeType.FINAL_ANSWER]:
-        working_memory.add_textual_memory(content, source=source)
+        working_memory.add_textual_memory(content, source=source, hop_depth=child.depth)
 
 
 async def generate_next_step(
@@ -34,7 +34,7 @@ async def generate_next_step(
         node, result = await _generate_subqa(current, generator)
     
     if node and result:
-        generator.update_working_memory(result)
+        generator.update_working_memory(result, hop_depth=current.depth + 1)
         _add_child_to_memory(node, working_memory)
         log_to_interaction_memory(interaction_memory, result.log_data)
     
@@ -55,7 +55,8 @@ async def _generate_final_answer(current: CoTNode, gen: NodeGenerator) -> Tuple[
 
 
 async def _generate_subqa(current: CoTNode, gen: NodeGenerator) -> Tuple[Optional[CoTNode], GenerationResult]:
-    subquestions, should_direct, subq_log = await gen.generate_subquestion(current.user_question)
+    intermediate = current.node_state.content.get('sub_answer') if current.node_type == NodeType.SUB_QA_NODE else None
+    subquestions, should_direct, subq_log = await gen.generate_subquestion(current.user_question, intermediate_answer=intermediate)
     
     if should_direct or not subquestions:
         node, result = await _generate_final_answer(current, gen)
@@ -104,10 +105,10 @@ async def cot_search(
     pass_at_k = None
 
     while not current.is_terminal():        
-        next_node = await generate_next_step(current, generator, working_memory, interaction_memory)
+        next_node = await generate_next_step(current, generator, generator.working_memory, interaction_memory)
         if next_node is None:
             break
-        await working_memory.asynchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
+        await generator.working_memory.synchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
         
         current = next_node
         reasoning_path.append(current)
@@ -115,8 +116,6 @@ async def cot_search(
             answer = current.node_state.content.get('concise_answer') or current.node_state.content.get('final_answer', '')
             if answer and check_correctness(answer, correct_answers):
                 pass_at_k = len(reasoning_path) - 1
-    if working_memory is not None:
-        await working_memory.afinalize(client, question, interaction_memory, **kwargs)
     terminal_content = current.node_state.content if current.is_terminal() else None
     return terminal_content, reasoning_path, pass_at_k
 

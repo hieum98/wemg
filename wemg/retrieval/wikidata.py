@@ -200,6 +200,7 @@ MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2
 LIMIT_PER_QUERY = 100
 MAX_ENTITIES_PER_HOP = 500
+SPARQL_TIMEOUT_S = 120
 # Cap total SPARQL rows for batched k-hop queries (scales with number of seeds).
 MAX_BATCH_SPARQL_ROWS = 10000
 BATCH_SIZE = 25
@@ -361,6 +362,7 @@ class WikidataClient:
         property_labels: Optional[Dict[str, Dict[str, str]]] = None,
         max_wikipedia_requests_per_second: Optional[float] = None,
         triple_cache_max_entries: int = 5000,
+        redis_client=None,
     ):
         self.properties = properties or list(DEFAULT_PROPERTIES)
         self.property_labels = dict(property_labels or PROPERTY_LABELS)
@@ -370,6 +372,9 @@ class WikidataClient:
             else DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND
         )
         self._triple_cache_max_entries = max(1, int(triple_cache_max_entries))
+        self._redis = redis_client
+        self._redis_prefix = "wemg:triples"
+        self._redis_ttl = 86400  # 24h
         self._semaphore = threading.Semaphore(10)
         self._cache_lock = threading.Lock()
         # Raw 1-hop triples per QID (pre-enrichment); shared across k-hop and find_path.
@@ -393,10 +398,19 @@ class WikidataClient:
         key: str,
     ) -> Optional[List[WikiTriple]]:
         value = cache.get(key)
-        if value is None:
-            return None
-        cache.move_to_end(key)
-        return value
+        if value is not None:
+            cache.move_to_end(key)
+            return value
+        if self._redis:
+            try:
+                raw = self._redis.get(f"{self._redis_prefix}:{key}")
+                if raw:
+                    triples = [WikiTriple.model_validate(t) for t in json.loads(raw)]
+                    self._lru_set(cache, key, triples)
+                    return triples
+            except Exception:
+                pass
+        return None
 
     def _lru_set(
         self,
@@ -408,6 +422,12 @@ class WikidataClient:
         cache.move_to_end(key)
         while len(cache) > self._triple_cache_max_entries:
             cache.popitem(last=False)
+        if self._redis:
+            try:
+                raw = json.dumps([t.model_dump() for t in value])
+                self._redis.setex(f"{self._redis_prefix}:{key}", self._redis_ttl, raw)
+            except Exception:
+                pass
 
     def clear_triple_caches(self) -> None:
         """Clear in-process Wikidata triple caches."""
@@ -422,6 +442,7 @@ class WikidataClient:
     def _sparql_query(self, sparql: str) -> List[Dict]:
         with self._semaphore:
             client = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
+            client.setTimeout(SPARQL_TIMEOUT_S)
             client.setQuery(sparql)
             client.setReturnFormat(JSON)
             client.addCustomHttpHeader("User-Agent", USER_AGENT)
@@ -754,7 +775,6 @@ class WikidataClient:
             return None, {}
 
     def _lookup_wikipedia_dump_contents(self, urls: Set[str]) -> Dict[str, Optional[str]]:
-        t_lookup_start = time.perf_counter()
         if not urls:
             return {}
 
@@ -777,21 +797,11 @@ class WikidataClient:
         try:
             target_canonicals = set(canonical_to_raw.keys())
             ds = self._wikipedia_dump_dataset
-            logger.info(
-                "PROFSTEP wikidump stage=lookup_start target_urls=%d",
-                len(target_canonicals),
-            )
-
             # Serve cached results; collect only URLs missing from cache.
             uncached = target_canonicals - self._wikidump_content_cache.keys()
 
             if uncached:
                 # Use pre-built index for O(1) row selection — no full scan needed.
-                t0 = time.perf_counter()
-                logger.info(
-                    "PROFSTEP wikidump stage=filter_start target_urls=%d",
-                    len(uncached),
-                )
                 indices: List[int] = [
                     idx
                     for c in uncached
@@ -822,20 +832,9 @@ class WikidataClient:
                             if text:
                                 aggregated[canonical_row_url].append(text)
 
-                logger.info(
-                    "PROFSTEP wikidump stage=filter_done elapsed_ms=%.1f",
-                    (time.perf_counter() - t0) * 1000.0,
-                )
-
-                t0 = time.perf_counter()
                 for canonical in uncached:
                     joined = "\n\n".join(aggregated.get(canonical, [])) or None
                     self._wikidump_content_cache[canonical] = joined
-                logger.info(
-                    "PROFSTEP wikidump stage=aggregate_done elapsed_ms=%.1f matched_urls=%d",
-                    (time.perf_counter() - t0) * 1000.0,
-                    sum(1 for c in uncached if self._wikidump_content_cache[c] is not None),
-                )
 
             for canonical, raw_urls in canonical_to_raw.items():
                 content = self._wikidump_content_cache.get(canonical)
@@ -846,11 +845,6 @@ class WikidataClient:
             for raw_urls in canonical_to_raw.values():
                 for raw in raw_urls:
                     result[raw] = None
-        logger.info(
-            "PROFSTEP wikidump stage=lookup_done elapsed_ms=%.1f requested_urls=%d",
-            (time.perf_counter() - t_lookup_start) * 1000.0,
-            len(urls),
-        )
         return result
 
     def _has_fake_property_label(self, prop: Any) -> bool:
@@ -1446,19 +1440,8 @@ class WikidataClient:
         num_valid = sum(1 for n in normalized if n)
         # Batched SPARQL + single enrichment when multiple seeds and exactly one hop.
         if k == 1 and num_valid >= 2:
-            logger.info(
-                "PROFSTEP wikidata stage=k_hop_batch_start seeds=%d k=%d bidirectional=%s enrich=%s",
-                num_valid,
-                k,
-                str(bidirectional),
-                str(enrich),
-            )
             all_results = self._get_k_hop_multi_seed_one_hop(
                 normalized, bidirectional, enrich,
-            )
-            logger.info(
-                "PROFSTEP wikidata stage=k_hop_batch_done elapsed_ms=%.1f",
-                (time.perf_counter() - t_all) * 1000.0,
             )
             return all_results[0] if is_single else all_results
 
@@ -1467,14 +1450,6 @@ class WikidataClient:
             if not seed_qid:
                 all_results.append([])
                 continue
-            t_seed = time.perf_counter()
-            logger.info(
-                "PROFSTEP wikidata stage=k_hop_seed_start seed=%s k=%d bidirectional=%s enrich=%s",
-                seed_qid,
-                k,
-                str(bidirectional),
-                str(enrich),
-            )
 
             collected: List[WikiTriple] = []
             visited: Set[str] = set()
@@ -1514,18 +1489,6 @@ class WikidataClient:
                 if not self._has_fake_property_label(getattr(t, "relation", None))
             ]
             all_results.append(collected)
-            logger.info(
-                "PROFSTEP wikidata stage=k_hop_seed_done seed=%s elapsed_ms=%.1f triples=%d",
-                seed_qid,
-                (time.perf_counter() - t_seed) * 1000.0,
-                len(collected),
-            )
-
-        logger.info(
-            "PROFSTEP wikidata stage=k_hop_done elapsed_ms=%.1f seeds=%d",
-            (time.perf_counter() - t_all) * 1000.0,
-            num_valid,
-        )
         return all_results[0] if is_single else all_results
 
     # ------------------------------------------------------------------

@@ -141,10 +141,10 @@ class NodeGenerator:
             log_data=merge_logs(exploration_log, extractor_log, qa_log),
         )
     
-    async def generate_subquestion(self, user_question: str) -> Tuple[List[str], bool, Dict]:
+    async def generate_subquestion(self, user_question: str, intermediate_answer: str = None) -> Tuple[List[str], bool, Dict]:
         """Generate subquestions. Returns (subquestions, should_direct_answer, log_data)."""
         context = self._build_context()
-        subq_input = SubquestionGenerationInput(question=user_question, context=context)
+        subq_input = SubquestionGenerationInput(question=user_question, context=context, intermediate_answer=intermediate_answer)
         n_subq = self.kwargs.get('n_subquestions', 3)
         subquestions, log = await execute_role(
             client=self.client, role=SUBQUESTION_GENERATOR, input_data=subq_input,
@@ -219,10 +219,10 @@ class NodeGenerator:
         
         return GenerationResult(answers=outputs, log_data=reasoning_log)
     
-    def update_working_memory(self, result: GenerationResult, *, source_step: int = None) -> None:
+    def update_working_memory(self, result: GenerationResult, *, source_step: int = None, hop_depth: int = None) -> None:
         """Update working memory with generation results."""
         for item in result.information_items:
-            self.working_memory.add_textual_memory(item, source=SourceType.RETRIEVAL)
+            self.working_memory.add_textual_memory(item, source=SourceType.RETRIEVAL, hop_depth=hop_depth)
 
         entity_dict = {e.qid: e for e in result.retrieved_entities}
         self.working_memory.entity_dict.update(entity_dict)
@@ -293,6 +293,11 @@ class NodeGenerator:
         )
 
         entities = list(set(entities))
+        triples = list(set(triples))
+        # prune triples
+        triples, prune_log = await self._prune_triples(question, triples)
+        entities = list(set(entities + self._collect_entities_from_triples(triples)))
+
         assert self.wikidata_client is not None and isinstance(self.wikidata_client, WikidataClient), "WikidataClient must be provided"
         all_entities = [self.working_memory.entity_dict.get(e.qid) if self.working_memory.entity_dict.get(e.qid) else e 
                         for e in entities]
@@ -324,7 +329,7 @@ class NodeGenerator:
             q_short,
         )
         documents = list(set(documents + top_kb))
-        all_log = merge_logs(query_log, kb_log)
+        all_log = merge_logs(query_log, kb_log, prune_log)
         logger.info(
             "PROFSTEP explore stage=done elapsed_ms=%.1f docs=%d triples=%d entities=%d question=%s",
             (time.perf_counter() - t_explore_start) * 1000.0,
@@ -394,37 +399,77 @@ class NodeGenerator:
         neighbor_qids = self.working_memory.get_underexplored_neighbor_qids(qids)
         all_qids = list(dict.fromkeys(qids + neighbor_qids))
 
-        triples = await self.wikidata_client.aget_k_hop_triples(
-            all_qids, k=n_hops, bidirectional=True, enrich=True
-        )
-        if isinstance(triples, list) and triples and isinstance(triples[0], list):
-            triples = sum(triples, [])
-        triples = list(set(triples)) if triples else []
+        # Iterative 1-hop + rerank loop.
+        # Each iteration calls aget_k_hop_triples(k=1) which always uses the fast
+        # batched SPARQL path (_get_k_hop_multi_seed_one_hop) instead of the slow
+        # per-entity BFS triggered by k>1.
+        TOP_K_FRONTIER = 64
+        MAX_FRONTIER = 500
 
-        triples = self._filter_known_triples(triples)
+        current_qids = list(all_qids)
+        all_triples: List[WikiTriple] = []
+        all_visited_qids: set = set(current_qids)
 
-        all_entities = entities
-        if triples:
-            triples, prune_log = await self._prune_triples(question, triples)
-            all_entities = list(set(all_entities + self._collect_entities_from_triples(triples)))
-            link_log = merge_logs(link_log, prune_log)
-        return triples, all_entities, link_log
+        for hop in range(n_hops):
+            if not current_qids:
+                break
 
-    def _filter_known_triples(self, triples: List[WikiTriple]) -> List[WikiTriple]:
-        """Remove triples whose (subject, relation, object) edge already exists in the graph."""
-        filtered: List[WikiTriple] = []
-        for triple in triples:
-            s_qid = getattr(triple.subject, "qid", None)
-            o_qid = getattr(triple.object, "qid", None)
-            rel = (
-                triple.relation.label
-                if hasattr(triple.relation, "label")
-                else str(triple.relation)
+            hop_results = await self.wikidata_client.aget_k_hop_triples(
+                current_qids, k=1, bidirectional=False, enrich=True
             )
-            if s_qid and o_qid and rel and self.working_memory.is_triple_known(s_qid, rel, o_qid):
-                continue
-            filtered.append(triple)
-        return filtered
+            # Flatten per-seed lists into a single deduplicated list.
+            hop_triples: List[WikiTriple] = []
+            if isinstance(hop_results, list) and hop_results and isinstance(hop_results[0], list):
+                for per_seed in hop_results:
+                    hop_triples.extend(per_seed)
+            else:
+                hop_triples = list(hop_results) if hop_results else []
+            seen_keys: set = set()
+            deduped: List[WikiTriple] = []
+            for t in hop_triples:
+                k_key = (t.subject.qid, t.relation.pid,
+                         t.object.qid if isinstance(t.object, WikidataEntity) else str(t.object))
+                if k_key not in seen_keys:
+                    seen_keys.add(k_key)
+                    deduped.append(t)
+            hop_triples = deduped
+
+            if not hop_triples:
+                break
+
+            # Between hops: rerank to prune the frontier to TOP_K_FRONTIER triples.
+            # Skip on the last hop — full pruning happens later in _prune_triples.
+            if self.reranker is not None and hop < n_hops - 1:
+                triple_docs = [str(t) for t in hop_triples]
+                sorted_indices, _ = await asyncio.to_thread(
+                    self.reranker.get_scores, question, triple_docs
+                )
+                hop_triples = [hop_triples[i] for i in sorted_indices[:TOP_K_FRONTIER]]
+
+            all_triples.extend(hop_triples)
+
+            # Extract object QIDs from this hop's triples as seeds for the next hop.
+            next_qids: set = set()
+            for t in hop_triples:
+                if isinstance(t.object, WikidataEntity) and t.object.qid:
+                    next_qids.add(t.object.qid)
+            next_qids -= all_visited_qids
+            if len(next_qids) > MAX_FRONTIER:
+                next_qids = set(list(next_qids)[:MAX_FRONTIER])
+            current_qids = list(next_qids)
+            all_visited_qids.update(current_qids)
+
+        # Final dedup across all hops.
+        seen_keys = set()
+        triples: List[WikiTriple] = []
+        for t in all_triples:
+            k_key = (t.subject.qid, t.relation.pid,
+                     t.object.qid if isinstance(t.object, WikidataEntity) else str(t.object))
+            if k_key not in seen_keys:
+                seen_keys.add(k_key)
+                triples.append(t)
+
+        return triples, entities, link_log
 
     def _stage_a_prune_triples(self, question: str, triples: List[WikiTriple]) -> List[WikiTriple]:
         """Stage A: reranker score filtering with delta and top-k cap."""
