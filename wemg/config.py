@@ -118,6 +118,7 @@ class NodeGenerationConfig(BaseModel):
 
 class WorkingMemoryConfig(BaseModel):
     max_textual_memory_tokens: int = 16384
+    annotate_steps: bool = True
 
 
 class InteractionMemoryConfig(BaseModel):

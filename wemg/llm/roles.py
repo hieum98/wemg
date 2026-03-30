@@ -702,9 +702,7 @@ Instructions:
 4. Extraction: Extract ALL relevant information verbatim. Add context for clarity but preserve original meaning, make sure each extracted information is self-contained (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items) and can be used to answer the question.
 5. Final evaluation: 
     - Examine the extracted information to make sure each information is self-contained. If it is not, rewrite it to make it self-contained.
-    - Remove information that is not relevant to the question. The information considers relevant if it contains ANY information that could clue the answer to the question or related with any concept in the question.
-    - If the extracted information is relevant, return the extracted information as a list of strings.
-    - If the extracted information is not relevant, return an empty list.
+    - Remove information that is not relevant to the question. The information considers relevant if it contains ANY information that could clue the answer to the question.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:

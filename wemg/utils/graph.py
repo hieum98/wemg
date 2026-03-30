@@ -46,8 +46,13 @@ def textualize_graph(
     component: Set,
     graph: Union[nx.DiGraph, nx.Graph],
     method: str = "dfs",
+    annotate_steps: bool = False,
 ) -> Tuple[List[str], str]:
-    """Convert a graph component to textual triples via DFS or BFS traversal."""
+    """Convert a graph component to textual triples via DFS or BFS traversal.
+
+    Triples are sorted by source_step ascending (foundational facts first,
+    more specific later-step facts after). Triples without provenance sort last.
+    """
     if not component:
         return [], ""
 
@@ -64,7 +69,12 @@ def textualize_graph(
     if not traverser:
         raise ValueError(f"Unknown textualization method: {method}")
 
-    all_triples = traverser(graph, start_node)
+    raw: List[Tuple[Optional[int], str]] = traverser(graph, start_node, annotate_step=annotate_steps)
+
+    # Sort by source_step ascending; None-step triples sort last. Stable sort preserves traversal order for ties.
+    raw.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0))
+
+    all_triples = [text for _, text in raw]
 
     cluster_text = "\n-----------------------\n".join(
         f"{i}. {triple}" for i, triple in enumerate(all_triples, 1)
@@ -89,8 +99,9 @@ def _format_triple(
     target: str,
     graph: Union[nx.DiGraph, nx.Graph],
     edge_data: dict,
-) -> List[str]:
-    """Format a graph edge into readable triple strings."""
+    annotate_step: bool = False,
+) -> List[Tuple[Optional[int], str]]:
+    """Format a graph edge into readable triple strings, paired with source_step for sorting."""
     source_data = graph.nodes[source].get("data")
     target_data = graph.nodes[target].get("data")
     relations = edge_data.get("relation", set())
@@ -98,11 +109,14 @@ def _format_triple(
     if not source_data or not target_data or not relations:
         return []
 
+    step: Optional[int] = edge_data.get("provenance", {}).get("source_step")
+    prefix = f"[Step {step}] " if (annotate_step and step is not None) else ""
+
     triples = []
     for relation in relations:
         rel_label = relation.label if hasattr(relation, "label") else str(relation)
-        triple = f"Subject: {source_data}\nRelation: {rel_label}\nObject: {target_data}"
-        triples.append(triple)
+        triple = f"{prefix}Subject: {source_data} - Relation: {rel_label} - Object: {target_data}"
+        triples.append((step, triple))
     return triples
 
 
@@ -131,10 +145,11 @@ def _get_neighbors(
 def _dfs_textualize(
     graph: Union[nx.DiGraph, nx.Graph],
     start_node: str,
-) -> List[str]:
+    annotate_step: bool = False,
+) -> List[Tuple[Optional[int], str]]:
     """DFS traversal to textualize graph."""
     visited = set()
-    all_triples = []
+    all_triples: List[Tuple[Optional[int], str]] = []
     stack = [(start_node, None, None)]
 
     while stack:
@@ -146,7 +161,7 @@ def _dfs_textualize(
 
         if edge_source is not None and edge_target is not None:
             edge_data = graph.edges[edge_source, edge_target]
-            all_triples.extend(_format_triple(edge_source, edge_target, graph, edge_data))
+            all_triples.extend(_format_triple(edge_source, edge_target, graph, edge_data, annotate_step=annotate_step))
 
         for source, target, _ in reversed(_get_neighbors(current, graph, visited)):
             next_node = target if source == current else source
@@ -156,7 +171,7 @@ def _dfs_textualize(
     if not all_triples and start_node:
         node_description = _format_node_description(start_node, graph)
         if node_description:
-            all_triples.append(node_description)
+            all_triples.append((None, node_description))
 
     return all_triples
 
@@ -164,10 +179,11 @@ def _dfs_textualize(
 def _bfs_textualize(
     graph: Union[nx.DiGraph, nx.Graph],
     start_node: str,
-) -> List[str]:
+    annotate_step: bool = False,
+) -> List[Tuple[Optional[int], str]]:
     """BFS traversal to textualize graph."""
     visited = set()
-    all_triples = []
+    all_triples: List[Tuple[Optional[int], str]] = []
     queue = deque([(start_node, None, None)])
 
     while queue:
@@ -179,7 +195,7 @@ def _bfs_textualize(
 
         if edge_source is not None and edge_target is not None:
             edge_data = graph.edges[edge_source, edge_target]
-            all_triples.extend(_format_triple(edge_source, edge_target, graph, edge_data))
+            all_triples.extend(_format_triple(edge_source, edge_target, graph, edge_data, annotate_step=annotate_step))
 
         for source, target, _ in _get_neighbors(current, graph, visited):
             next_node = target if source == current else source
@@ -189,7 +205,7 @@ def _bfs_textualize(
     if not all_triples and start_node:
         node_description = _format_node_description(start_node, graph)
         if node_description:
-            all_triples.append(node_description)
+            all_triples.append((None, node_description))
 
     return all_triples
 

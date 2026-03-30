@@ -5,10 +5,11 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from wemg.reasoning.nodes import (
     CoTNode, NodeType, NodeState,
-    check_correctness, make_final_answer_state, make_subqa_state,
+    make_final_answer_state, make_subqa_state,
     add_node_content_to_memory,
 )
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
+from wemg.evaluation.metrics import compute_acc
 from wemg.reasoning.memory import WorkingMemory, InteractionMemory, log_to_interaction_memory
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,11 @@ async def cot_search(
     correct_answers: Optional[Union[str, List[str]]] = None,
     **kwargs,
 ) -> Tuple[Optional[Dict], List[CoTNode], Optional[int]]:
-    """Run Chain-of-Thought reasoning. Returns (terminal_content, reasoning_path, pass_at_k)."""
+    """Run Chain-of-Thought reasoning.
+
+    ``pass_at_k`` is the first step where evaluator Acc is strictly > 0.8
+    (equivalent to evaluator rating > 8.0).
+    """
     root = CoTNode(
         node_state=NodeState(node_type=NodeType.USER_QUESTION, content={'user_question': question}),
         max_depth=max_depth,
@@ -108,8 +113,10 @@ async def cot_search(
         reasoning_path.append(current)
         if pass_at_k is None and correct_answers and current.is_terminal():
             answer = current.node_state.content.get('concise_answer') or current.node_state.content.get('final_answer', '')
-            if answer and check_correctness(answer, correct_answers):
-                pass_at_k = len(reasoning_path) - 1
+            if answer:
+                acc = await compute_acc(question, answer, correct_answers, client, interaction_memory=interaction_memory)
+                if acc > 0.8:
+                    pass_at_k = len(reasoning_path) - 1
     terminal_content = current.node_state.content if current.is_terminal() else None
     return terminal_content, reasoning_path, pass_at_k
 

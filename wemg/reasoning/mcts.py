@@ -14,10 +14,12 @@ from wemg.llm.roles import (
 )
 from wemg.reasoning.nodes import (
     MCTSNode, NodeType, NodeState,
-    check_correctness, make_final_answer_state, make_subqa_state,
+    make_final_answer_state, make_subqa_state,
     add_node_content_to_memory,
 )
+from wemg.llm.roles import SourceType
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
+from wemg.evaluation.metrics import compute_acc
 from wemg.reasoning.memory import WorkingMemory, log_to_interaction_memory
 
 logger = logging.getLogger(__name__)
@@ -216,9 +218,25 @@ async def evaluate(
             execute_role(client, VERIFIER, AnswerVerificationInput(question=question, candidate_answer=node_answer, context=text_ctx), n=1),
             execute_role(client, VERIFIER, AnswerVerificationInput(question=question, candidate_answer=node_answer, context=graph_ctx), n=1),
         )
-        s1 = r1[0].rating if r1 else 5.0
-        s2 = r2[0].rating if r2 else 5.0
-        s3 = r3[0].rating if r3 else 5.0
+        if r1:
+            s1 = r1[0].rating
+            llm_assessment = f"LLM as verifier assessment without context:\nRating: {s1} over 10\nAssessment: {r1[0].reasoning}"
+            working_memory.add_textual_memory(llm_assessment, source=SourceType.SYSTEM_PREDICTION, hop_depth=node.depth)
+        else:
+            s1 = 5.0
+        if r2:
+            s2 = r2[0].rating
+            text_assessment = f"LLM as verifier assessment with textual memory context:\nRating: {s2} over 10\nAssessment: {r2[0].reasoning}"
+            working_memory.add_textual_memory(text_assessment, source=SourceType.SYSTEM_PREDICTION, hop_depth=node.depth)
+        else:
+            s2 = 5.0
+        if r3:
+            s3 = r3[0].rating
+            graph_assessment = f"LLM as verifier assessment with graph memory context:\nRating: {s3} over 10\nAssessment: {r3[0].reasoning}"
+            working_memory.add_textual_memory(graph_assessment, source=SourceType.SYSTEM_PREDICTION, hop_depth=node.depth)
+        else:
+            s3 = 5.0
+        
         return ((s1 + s2 + s3) / 3.0 - 5.0) / 5.0
     except Exception:
         return 0.0
@@ -251,6 +269,9 @@ async def mcts_search(
     iteration, bidirectional text↔graph sync is performed via
     ``synchronize_memory()``.  Simulation uses a full n-step CoT rollout
     (``simulate()``) rather than a lightweight force-terminal step.
+
+    ``pass_at_k`` is the first iteration where evaluator Acc is strictly
+    > 0.8 (equivalent to evaluator rating > 8.0).
     """
     root = MCTSNode(
         node_state=NodeState(node_type=NodeType.USER_QUESTION, content={'user_question': question}),
@@ -314,10 +335,12 @@ async def mcts_search(
 
         is_new_terminal = terminal.visits == 1  # just backpropagated
         if terminal.is_terminal():
-            if pass_at_k is None and correct_answers:
+            if pass_at_k is None and correct_answers and is_new_terminal:
                 answer = extract_answer(terminal)
-                if answer and check_correctness(answer, correct_answers):
-                    pass_at_k = iteration + 1
+                if answer:
+                    acc = await compute_acc(question, answer, correct_answers, client, interaction_memory=interaction_memory)
+                    if acc > 0.8:
+                        pass_at_k = iteration + 1
             if reward > best_reward:
                 best_reward = reward
                 best_node = terminal

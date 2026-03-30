@@ -1,4 +1,8 @@
-"""Evaluation metrics: Sub-EM, Acc (LLM-based), Pass@k."""
+"""Evaluation metrics: Sub-EM, Acc (LLM-based), Pass@k.
+
+Pass@k values are computed from search metadata where ``pass_at_k`` marks
+the first step/iteration with evaluator rating > 8.0 (Acc > 0.8).
+"""
 
 import asyncio
 import logging
@@ -77,7 +81,11 @@ def compute_aggregate_metrics(
     pass_at_k_values: List[Optional[int]],
     max_k: int = 10,
 ) -> Dict:
-    """Compute aggregate metrics from per-question results."""
+    """Compute aggregate metrics from per-question results.
+
+    ``pass_at_k_values`` contains the earliest step/iteration index where the
+    evaluator-threshold pass condition was met for each question.
+    """
     valid_sub_ems = [s for s in sub_ems if s is not None]
     valid_accs = [a for a in accs if a is not None]
     valid_pass = [p for p in pass_at_k_values if p is not None]

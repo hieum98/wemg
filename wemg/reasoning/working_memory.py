@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import networkx as nx
 
@@ -206,11 +206,13 @@ class WorkingMemory:
         graph_memory: Optional[nx.DiGraph] = None,
         max_textual_memory_tokens: int = 16384,
         wikidata_client: Optional[WikidataClient] = None,
+        annotate_steps: bool = False,
     ):
         self.textual_memory: List[str] = list(textual_memory or [])
         self.graph_store = _GraphStore(graph_memory)
         self.graph_memory = self.graph_store.graph
         self.max_textual_memory_tokens = max_textual_memory_tokens
+        self.annotate_steps = annotate_steps
         self.entity_dict: Dict[str, WikidataEntity] = {}
 
         self._wikidata_client = wikidata_client
@@ -311,7 +313,7 @@ class WorkingMemory:
             "azure_key": kwargs.get("azure_key"),
         }
 
-    def _enhance_relations(self, relations: List[Relation]) -> List[WikiTriple]:
+    def _enhance_relations(self, relations: List[Relation]) -> List[Union[WikiTriple, Relation]]:
         to_lookup: List[str] = []
         for rel in relations:
             if rel.subject_id and rel.subject_id not in self.entity_dict:
@@ -332,21 +334,25 @@ class WorkingMemory:
                     self.entity_dict[first.qid] = first
                     resolved[query] = first.qid
 
-        triples: List[WikiTriple] = []
+        triples: List[Union[WikiTriple, Relation]] = []
         for rel in relations:
+            if not rel.relation:
+                continue
             sub_key = rel.subject_id or resolved.get(rel.subject or "", "")
             obj_key = rel.object_id or resolved.get(rel.object or "", "")
             subject = self.entity_dict.get(sub_key)
             object_ = self.entity_dict.get(obj_key)
-            if not subject or not object_ or not rel.relation:
-                continue
-            triples.append(
-                WikiTriple(
-                    subject=subject,
-                    relation=WikidataProperty(pid="", label=str(rel.relation), description=None),
-                    object=object_,
+            if subject and object_:
+                triples.append(
+                    WikiTriple(
+                        subject=subject,
+                        relation=WikidataProperty(pid="", label=str(rel.relation), description=None),
+                        object=object_,
+                    )
                 )
-            )
+            elif rel.subject and rel.object:
+                # Fall back to string-based relation when QID resolution fails
+                triples.append(rel)
         return triples
 
     def _textualize_graph_to_text(self) -> List[str]:
@@ -478,6 +484,15 @@ class WorkingMemory:
                 results = self._wikidata_client.search_entities(node.id or node.name, num_results=1, get_details=False)
                 entity = results[0] if results else None
             if entity is None:
+                if node.name:
+                    # Fall back to a string-only node (no Wikidata QID).
+                    # Use the name directly as the node ID so it's human-readable
+                    # and can be merged later if the entity is resolved to a QID.
+                    node_data = OpenIEEntity(id=None, name=node.name, description=None)
+                    node_id = node.name
+                    if not self.graph_memory.has_node(node_id):
+                        self.graph_memory.add_node(node_id, data=node_data)
+                    return node_data
                 return None
         elif isinstance(node, WikidataEntity):
             entity = node
@@ -543,11 +558,58 @@ class WorkingMemory:
         edge = self.graph_memory.edges[subject_id, object_id]
         edge.setdefault("relation", set()).add(relation_label)
         if provenance:
-            edge["provenance"] = provenance
+            existing = edge.get("provenance", {})
+            merged: Dict[str, Any] = dict(existing)
+            new_step = provenance.get("source_step")
+            old_step = existing.get("source_step")
+            if new_step is not None and (old_step is None or new_step < old_step):
+                merged["source_step"] = new_step
+            new_ts = provenance.get("timestamp")
+            old_ts = existing.get("timestamp")
+            if new_ts is not None and (old_ts is None or new_ts < old_ts):
+                merged["timestamp"] = new_ts
+            if provenance.get("reward") is not None:
+                merged["reward"] = provenance["reward"]
+            edge["provenance"] = merged
+
+    def _remove_isolated_graph_nodes(self) -> None:
+        isolated_nodes = [
+            node_id
+            for node_id in list(self.graph_memory.nodes())
+            if self.graph_memory.in_degree(node_id) == 0 and self.graph_memory.out_degree(node_id) == 0
+        ]
+        if isolated_nodes:
+            self.graph_memory.remove_nodes_from(isolated_nodes)
+
+    def _merge_string_nodes_with_qid_nodes(self) -> None:
+        """Merge string-only nodes (id=None) into QID nodes that share the same label."""
+        label_to_qid_node: Dict[str, str] = {}
+        for node_id, data in self.graph_memory.nodes(data=True):
+            node_data = data.get("data")
+            qid = getattr(node_data, "id", None)
+            label = getattr(node_data, "name", None)
+            if qid and label:
+                label_to_qid_node[label.lower()] = node_id
+
+        to_merge: List[Tuple[str, str]] = []  # (string_node_id, qid_node_id)
+        for node_id, data in self.graph_memory.nodes(data=True):
+            node_data = data.get("data")
+            if getattr(node_data, "id", None) is not None:
+                continue
+            label = getattr(node_data, "name", None)
+            if label and label.lower() in label_to_qid_node:
+                canonical = label_to_qid_node[label.lower()]
+                if canonical != node_id:
+                    to_merge.append((canonical, node_id))
+
+        for canonical_id, dup_id in to_merge:
+            self.graph_store._merge_nodes(canonical_id, [dup_id])
 
     def deduplicate_graph(self) -> None:
         self.graph_store.merge_same_qid_nodes()
-        # Rebuild cache: merging may have removed duplicate node IDs.
+        self._merge_string_nodes_with_qid_nodes()
+        self._remove_isolated_graph_nodes()
+        # Rebuild cache: merging/removal may change node IDs.
         self._qid_to_node_id = {}
         for node_id, data in self.graph_memory.nodes(data=True):
             qid = getattr(data.get("data"), "id", None)
@@ -561,7 +623,7 @@ class WorkingMemory:
         components = list(nx.weakly_connected_components(self.graph_memory))
         sections = []
         for comp in components:
-            triples, _ = textualize_graph(comp, self.graph_memory, method="dfs")
+            triples, _ = textualize_graph(comp, self.graph_memory, method="dfs", annotate_steps=self.annotate_steps)
             triples = [_MemoryFormatter.format_item(t, SourceType.SYSTEM_PREDICTION) for t in triples]
             sections.append(_MemoryFormatter.format_lines(triples))
         return "\n\n".join(f"**Information {idx}**\n{text}" for idx, text in enumerate(sections, 1))

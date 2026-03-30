@@ -205,6 +205,7 @@ class WEMGSystem:
         return WorkingMemory(
             max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
             wikidata_client=self.wikidata_client,
+            annotate_steps=wm_cfg.annotate_steps,
         )
 
 
