@@ -9,10 +9,10 @@ from pathlib import Path
 import networkx as nx
 
 from wemg.evaluation.artifacts import (
-    load_graph_memory,
+    load_notes,
     load_question_artifacts,
     print_saved_search_tree,
-    visualize_graph_memory,
+    build_note_graph,
 )
 from wemg.evaluation.runner import DatasetEvaluator
 from wemg.reasoning.memory import WorkingMemory
@@ -44,12 +44,16 @@ def _build_search_tree(question: str) -> CoTNode:
 
 
 def _build_working_memory() -> WorkingMemory:
+    from wemg.llm.roles import SourceType
+    from wemg.retrieval.wikidata import WikidataEntity, WikidataProperty, WikiTriple
     wm = WorkingMemory()
-    wm.textual_memory = ["[System Prediction]: France has capital Paris."]
-    wm.graph_memory = nx.DiGraph()
-    wm.graph_memory.add_node("France", data="France")
-    wm.graph_memory.add_node("Paris", data="Paris")
-    wm.graph_memory.add_edge("France", "Paris", relation={"has capital"})
+    wm.add_textual_memory("France has capital Paris.", source=SourceType.SYSTEM_PREDICTION)
+    # Register a triple so entity graph + notes are populated
+    france = WikidataEntity(qid="Q142", label="France", description="country in Western Europe")
+    paris = WikidataEntity(qid="Q90", label="Paris", description="capital of France")
+    prop = WikidataProperty(pid="P36", label="capital", description=None)
+    triple = WikiTriple(subject=france, relation=prop, object=paris)
+    wm.register_retrieved_triples([triple], [france, paris])
     return wm
 
 
@@ -86,7 +90,8 @@ def test_evaluate_persists_per_question_artifacts(tmp_path: Path):
     assert Path(artifacts["artifact_dir"]).is_dir()
     assert Path(artifacts["search_tree_path"]).is_file()
     assert Path(artifacts["textual_memory_path"]).is_file()
-    assert Path(artifacts["graph_memory_path"]).is_file()
+    assert Path(artifacts["notes_path"]).is_file()
+    assert Path(artifacts["entity_graph_path"]).is_file()
 
 
 def test_artifact_helpers_load_and_visualize(tmp_path: Path):
@@ -105,16 +110,23 @@ def test_artifact_helpers_load_and_visualize(tmp_path: Path):
     loaded = load_question_artifacts(tmp_path, index=0)
     assert loaded["search_tree"]["node_type"] == NodeType.USER_QUESTION.value
     assert isinstance(loaded["textual_memory"], list)
-    assert isinstance(loaded["graph_memory"], nx.DiGraph)
-    assert loaded["graph_memory"].number_of_edges() == 1
+    assert isinstance(loaded["notes"], list)
+    assert len(loaded["notes"]) >= 1
 
-    graph_path = loaded["artifact_paths"]["graph_memory_path"]
-    graph = load_graph_memory(graph_path)
-    assert isinstance(graph, nx.DiGraph)
+    # Build note graph and verify structure
+    note_graph = build_note_graph(loaded["notes"])
+    assert isinstance(note_graph, nx.DiGraph)
 
-    img_path = tmp_path / "graph.png"
-    visualize_graph_memory(graph_path, title="Test Graph", save_path=img_path)
-    assert img_path.is_file()
+    # Entity graph should be a MultiDiGraph with the registered triple
+    entity_graph = loaded["entity_graph"]
+    assert isinstance(entity_graph, nx.MultiDiGraph)
+    assert entity_graph.number_of_nodes() >= 2
+
+    # Verify notes.json can be loaded directly
+    notes_path = loaded["artifact_paths"]["notes_path"]
+    notes_direct = load_notes(notes_path)
+    assert isinstance(notes_direct, list)
+    assert len(notes_direct) == len(loaded["notes"])
 
 
 def test_print_saved_search_tree(tmp_path: Path, capsys):
@@ -137,4 +149,3 @@ def test_print_saved_search_tree(tmp_path: Path, capsys):
     assert "USER_QUESTION" in rendered
     assert "FINAL_ANSWER" in rendered
     assert rendered in out
-

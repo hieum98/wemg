@@ -80,12 +80,10 @@ class NodeGenerator:
         retrieval_info: List[str] = None,
         reasoning_trace: str = None,
     ) -> str:
-        """Build LLM context from textual memory, graph memory, and retrieval."""
+        """Build LLM context from textual memory and retrieval."""
         memory = self.working_memory.format_textual_memory()
-        graph_mem = self.working_memory.format_graph_memory()
         return format_context(
             memory=memory,
-            graph_memory=graph_mem or None,
             retrieval_info=retrieval_info,
             reasoning_trace=reasoning_trace,
         )
@@ -224,12 +222,9 @@ class NodeGenerator:
         for item in result.information_items:
             self.working_memory.add_textual_memory(item, source=SourceType.RETRIEVAL, hop_depth=hop_depth)
 
-        entity_dict = {e.qid: e for e in result.retrieved_entities}
-        self.working_memory.entity_dict.update(entity_dict)
-        for entity in result.retrieved_entities:
-            self.working_memory.add_node_to_graph_memory(entity)
-        for triple in result.retrieved_triples:
-            self.working_memory.add_edge_to_graph_memory(triple, source_step=source_step)
+        self.working_memory.register_retrieved_triples(
+            result.retrieved_triples, result.retrieved_entities
+        )
     
     # =========================================================================
     # Retrieval pipeline

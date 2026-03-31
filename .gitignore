@@ -17,3 +17,5 @@ results-v0/*
 .cursor/
 CLAUDE.md
 .github
+.note_store/
+.gitignore

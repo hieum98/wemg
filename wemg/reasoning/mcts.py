@@ -192,11 +192,10 @@ async def evaluate(
     working_memory: WorkingMemory,
     golden_answer: Optional[str] = None,
 ) -> float:
-    """Evaluate terminal node with 3 parallel VERIFIER calls. Returns reward in [-1, 1].
+    """Evaluate terminal node with 2 parallel VERIFIER calls. Returns reward in [-1, 1].
 
     Score 1: no context (LLM uses own knowledge)
     Score 2: textual memory context
-    Score 3: graph memory context
 
     reward = (mean_rating - 5.0) / 5.0
     """
@@ -209,14 +208,12 @@ async def evaluate(
         f"Reasoning: {node.node_state.content.get('reasoning', '')}"
     )
     text_ctx = working_memory.format_textual_memory() or "Not provided"
-    graph_ctx = working_memory.format_graph_memory() or "Not provided"
     golden_ctx = f"Golden Answer: {golden_answer}" if golden_answer else "Not provided"
 
     try:
-        (r1, _), (r2, _), (r3, _) = await asyncio.gather(
+        (r1, _), (r2, _) = await asyncio.gather(
             execute_role(client, VERIFIER, AnswerVerificationInput(question=question, candidate_answer=node_answer, context=golden_ctx), n=1),
             execute_role(client, VERIFIER, AnswerVerificationInput(question=question, candidate_answer=node_answer, context=text_ctx), n=1),
-            execute_role(client, VERIFIER, AnswerVerificationInput(question=question, candidate_answer=node_answer, context=graph_ctx), n=1),
         )
         if r1:
             s1 = r1[0].rating
@@ -230,14 +227,8 @@ async def evaluate(
             working_memory.add_textual_memory(text_assessment, source=SourceType.SYSTEM_PREDICTION, hop_depth=node.depth)
         else:
             s2 = 5.0
-        if r3:
-            s3 = r3[0].rating
-            graph_assessment = f"LLM as verifier assessment with graph memory context:\nRating: {s3} over 10\nAssessment: {r3[0].reasoning}"
-            working_memory.add_textual_memory(graph_assessment, source=SourceType.SYSTEM_PREDICTION, hop_depth=node.depth)
-        else:
-            s3 = 5.0
-        
-        return ((s1 + s2 + s3) / 3.0 - 5.0) / 5.0
+
+        return ((s1 + s2) / 2.0 - 5.0) / 5.0
     except Exception:
         return 0.0
 
@@ -261,6 +252,7 @@ async def mcts_search(
     convergence_patience: int = 3,
     semantic_sufficiency_count: int = 2,
     correct_answers: Optional[Union[str, List[str]]] = None,
+    cheap_client=None,
     **kwargs,
 ) -> Tuple[Dict, MCTSNode, Optional[int]]:
     """Run MCTS search with shared working memory.
@@ -331,7 +323,16 @@ async def mcts_search(
         terminal.backpropagate(reward)
 
         # Sync shared memory (bidirectional) after each iteration
-        await generator.working_memory.synchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
+        gap_questions = await generator.working_memory.synchronize_memory(
+            client, question, interaction_memory,
+            cheap_client=cheap_client, reranker=reranker, **kwargs,
+        )
+        # Inject gap questions as knowledge-gap notes for the next iteration
+        for gq in gap_questions:
+            from wemg.llm.roles import SourceType
+            generator.working_memory.add_textual_memory(
+                f"[Knowledge Gap]: {gq}", source=SourceType.SYSTEM_PREDICTION
+            )
 
         is_new_terminal = terminal.visits == 1  # just backpropagated
         if terminal.is_terminal():
@@ -387,9 +388,7 @@ async def get_answer(
     scores = [n.value / n.visits if n.visits > 0 else 0.0 for n in terminals]
     question = root.user_question
     if working_memory:
-        textual = working_memory.format_textual_memory()
-        graph = working_memory.format_graph_memory()
-        context = f"{textual}\n\n{graph}".strip()
+        context = working_memory.format_textual_memory()
     else:
         context = ""
 

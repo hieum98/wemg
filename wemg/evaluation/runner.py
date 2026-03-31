@@ -56,7 +56,8 @@ def _save_question_artifacts(
         "artifact_dir": str(q_dir),
         "search_tree_path": None,
         "textual_memory_path": None,
-        "graph_memory_path": None,
+        "notes_path": None,
+        "entity_graph_path": None,
     }
 
     tree_payload = _serialize_search_tree(getattr(result, "search_tree", None))
@@ -69,14 +70,15 @@ def _save_question_artifacts(
     working_memory = getattr(result, "working_memory", None)
     global_knowledge = getattr(result, "global_knowledge", None)
 
+    # Resolve the working memory source:
     # MCTS: global_knowledge absorbs all branch discoveries — use it as the source of truth.
     # CoT: no global_knowledge, so fall back to working_memory directly.
+    wm = global_knowledge if global_knowledge is not None else working_memory
+
     if global_knowledge is not None:
         textual_items = list(getattr(global_knowledge, "confirmed_facts", []) or [])
-        graph = getattr(global_knowledge, "graph", None)
     else:
         textual_items = list(getattr(working_memory, "textual_memory", []) or []) if working_memory else []
-        graph = getattr(working_memory, "graph_memory", None) if working_memory else None
 
     if textual_items:
         textual_path = q_dir / "working_memory_textual.json"
@@ -84,11 +86,21 @@ def _save_question_artifacts(
             json.dump(textual_items, f, indent=2, ensure_ascii=False)
         out["textual_memory_path"] = str(textual_path)
 
-    if graph is not None:
-        graph_path = q_dir / "working_memory_graph.pkl"
-        with open(graph_path, "wb") as f:
-            pickle.dump(graph, f)
-        out["graph_memory_path"] = str(graph_path)
+    # Save notes as JSON (for note-graph visualization)
+    notes_dict = getattr(wm, "_notes", None) if wm is not None else None
+    if notes_dict:
+        notes_path = q_dir / "notes.json"
+        with open(notes_path, "w", encoding="utf-8") as f:
+            json.dump([note.to_json() for note in notes_dict.values()], f, indent=2, ensure_ascii=False)
+        out["notes_path"] = str(notes_path)
+
+    # Save entity graph as pickle (for structural viz / inspection)
+    entity_graph = getattr(wm, "_entity_graph", None) if wm is not None else None
+    if entity_graph is not None and entity_graph.number_of_nodes() > 0:
+        entity_graph_path = q_dir / "entity_graph.pkl"
+        with open(entity_graph_path, "wb") as f:
+            pickle.dump(entity_graph, f)
+        out["entity_graph_path"] = str(entity_graph_path)
 
     return out
 

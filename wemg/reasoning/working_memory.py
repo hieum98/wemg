@@ -1,14 +1,18 @@
 """Maintainable working-memory layer for reasoning.
 
 This module exposes:
-- ``parse_graph_from_text``: relation extraction helper.
-- ``WorkingMemory``: local text/graph/entity memory with bidirectional synchronization.
+- ``WorkingMemory``: Zettelkasten-inspired note-based memory with a structural entity
+  index and bidirectional note lifecycle.
 """
 
 import asyncio
+import json
 import logging
 import time
+import uuid
 from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import networkx as nx
@@ -29,56 +33,98 @@ from .interaction_memory import InteractionMemory, log_to_interaction_memory
 logger = logging.getLogger(__name__)
 
 
-class _GraphStore:
-    """Thin wrapper around a NetworkX graph with dedup helpers."""
+# =============================================================================
+# Zettelkasten data model
+# =============================================================================
 
-    def __init__(self, graph: Optional[nx.DiGraph] = None):
-        self.graph: nx.DiGraph = graph or nx.DiGraph()
-
-    def merge_same_qid_nodes(self) -> None:
-        groups: Dict[str, List[str]] = defaultdict(list)
-        for node_id, data in self.graph.nodes(data=True):
-            qid = getattr(data.get("data"), "id", None)
-            if qid:
-                groups[qid].append(node_id)
-        for _, node_ids in groups.items():
-            if len(node_ids) > 1:
-                self._merge_nodes(node_ids[0], node_ids[1:])
-
-    def _merge_nodes(self, canonical_id: str, duplicate_ids: List[str]) -> None:
-        for dup_id in duplicate_ids:
-            if not self.graph.has_node(dup_id):
-                continue
-            for pred in list(self.graph.predecessors(dup_id)):
-                if pred == canonical_id:
-                    continue
-                edge = dict(self.graph.edges[pred, dup_id])
-                if self.graph.has_edge(pred, canonical_id):
-                    self.graph.edges[pred, canonical_id].setdefault("relation", set()).update(
-                        edge.get("relation", set())
-                    )
-                else:
-                    self.graph.add_edge(pred, canonical_id, **edge)
-            for succ in list(self.graph.successors(dup_id)):
-                if succ == canonical_id:
-                    continue
-                edge = dict(self.graph.edges[dup_id, succ])
-                if self.graph.has_edge(canonical_id, succ):
-                    self.graph.edges[canonical_id, succ].setdefault("relation", set()).update(
-                        edge.get("relation", set())
-                    )
-                else:
-                    self.graph.add_edge(canonical_id, succ, **edge)
-            self.graph.remove_node(dup_id)
+class NoteType(str, Enum):
+    FLEETING = "fleeting"
+    LITERATURE = "literature"
+    PERMANENT = "permanent"
+    STRUCTURE = "structure"
 
 
-async def parse_graph_from_text(
+class LinkType(str, Enum):
+    SUPPORTS = "supports"
+    CONTRADICTS = "contradicts"
+    DERIVED_FROM = "derived_from"
+    GAP_FOR = "gap_for"
+    ANSWERS = "answers"
+    ELABORATES = "elaborates"
+    PRECEDES = "precedes"
+    REFINES = "refines"
+    ANALOGOUS_TO = "analogous_to"
+    CO_OCCURS_WITH = "co_occurs_with"
+
+
+@dataclass
+class NoteLink:
+    target_id: str
+    link_type: LinkType
+
+
+@dataclass
+class MemoryNote:
+    id: str
+    content: str
+    note_type: NoteType
+    provenance: Any  # SourceType — avoid circular import at module level
+    confidence: float
+    links: List[NoteLink] = field(default_factory=list)
+    hop_depth: Optional[int] = None
+    created_at_step: int = 0
+    promoted_at: Optional[int] = None
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "id": self.id,
+            "content": self.content,
+            "note_type": self.note_type.value,
+            "provenance": self.provenance.value if hasattr(self.provenance, "value") else str(self.provenance),
+            "confidence": self.confidence,
+            "links": [{"target_id": lnk.target_id, "link_type": lnk.link_type.value} for lnk in self.links],
+            "hop_depth": self.hop_depth,
+            "created_at_step": self.created_at_step,
+            "promoted_at": self.promoted_at,
+        })
+
+    @classmethod
+    def from_json(cls, s: str) -> "MemoryNote":
+        from wemg.llm.roles import SourceType
+        d = json.loads(s)
+        prov_raw = d.get("provenance", "system_prediction")
+        try:
+            provenance = SourceType(prov_raw)
+        except (ValueError, KeyError):
+            provenance = SourceType.SYSTEM_PREDICTION
+        links = [
+            NoteLink(target_id=lnk["target_id"], link_type=LinkType(lnk["link_type"]))
+            for lnk in d.get("links", [])
+        ]
+        return cls(
+            id=d["id"],
+            content=d["content"],
+            note_type=NoteType(d["note_type"]),
+            provenance=provenance,
+            confidence=d.get("confidence", 0.5),
+            links=links,
+            hop_depth=d.get("hop_depth"),
+            created_at_step=d.get("created_at_step", 0),
+            promoted_at=d.get("promoted_at"),
+        )
+
+
+# =============================================================================
+# Module-level helpers
+# =============================================================================
+
+async def _extract_relations(
     client,
     text: str,
     interaction_memory: Optional[InteractionMemory] = None,
     known_entities: Optional[List[Any]] = None,
 ):
-    """Parse text into relation triples extracted by the RELATION_EXTRACTOR role."""
+    """Extract relation triples from text using the RELATION_EXTRACTOR role."""
     from wemg.llm.roles import RELATION_EXTRACTOR, RelationExtractionInput, execute_role
 
     re_input = RelationExtractionInput(text=text, known_entities=known_entities)
@@ -128,46 +174,31 @@ async def _aprune_triple_strings_llm(
     return kept
 
 
-async def _aprune_graph_edges(
+async def _aprune_relations(
     client,
     question: str,
-    graph: nx.DiGraph,
-    new_edges: Set[Tuple],
+    triples: List[Union[WikiTriple, Relation]],
     interaction_memory=None,
-) -> None:
-    """Remove irrelevant new edges from *graph* in-place using TRIPLE_PRUNER (Stage B).
+) -> List[Union[WikiTriple, Relation]]:
+    """Prune irrelevant relation triples using TRIPLE_PRUNER (Stage B).
 
-    Only the edges in *new_edges* are evaluated — previously-pruned edges are not re-examined.
+    Works on List[Union[WikiTriple, Relation]] — replaces the old graph-edge-based pruner.
     """
-    if not new_edges:
-        return
-    flat: List[Tuple] = []  # (src, tgt, rel_str, triple_str)
-    for src, tgt in new_edges:
-        if not graph.has_edge(src, tgt):
-            continue
-        data = graph.edges[src, tgt]
-        src_label = str(getattr(graph.nodes[src].get("data"), "name", src))
-        tgt_label = str(getattr(graph.nodes[tgt].get("data"), "name", tgt))
-        for rel in data.get("relation") or set():
-            rel_str = rel.label if hasattr(rel, "label") else str(rel)
-            flat.append((src, tgt, rel_str, f"Subject: {src_label}\nRelation: {rel_str}\nObject: {tgt_label}"))
-    if not flat:
-        return
-    kept_idx = await _aprune_triple_strings_llm(client, question, [t[3] for t in flat], interaction_memory)
-    # Collect edges whose ALL relations were pruned
-    edge_kept_rels: Dict[Tuple, Set[str]] = {}
-    for i, (src, tgt, rel_str, _) in enumerate(flat):
-        key = (src, tgt)
-        if i in kept_idx:
-            edge_kept_rels.setdefault(key, set()).add(rel_str)
-    for src, tgt in new_edges:
-        if not graph.has_edge(src, tgt):
-            continue
-        kept_rels = edge_kept_rels.get((src, tgt))
-        if not kept_rels:
-            graph.remove_edge(src, tgt)
-        else:
-            graph.edges[src, tgt]["relation"] = kept_rels
+    if not triples:
+        return triples
+    triple_strings: List[str] = []
+    for t in triples:
+        if isinstance(t, WikiTriple):
+            subj = t.subject.label if hasattr(t.subject, "label") and t.subject.label else str(t.subject)
+            obj = t.object.label if hasattr(t.object, "label") and t.object.label else str(t.object)
+            rel = t.relation.label if hasattr(t.relation, "label") and t.relation.label else str(t.relation)
+        else:  # Relation (string-only)
+            subj = t.subject or ""
+            obj = t.object or ""
+            rel = str(t.relation) if t.relation else ""
+        triple_strings.append(f"Subject: {subj}\nRelation: {rel}\nObject: {obj}")
+    kept_idx = await _aprune_triple_strings_llm(client, question, triple_strings, interaction_memory)
+    return [t for i, t in enumerate(triples) if i in kept_idx]
 
 
 class _MemoryFormatter:
@@ -189,40 +220,91 @@ class _MemoryFormatter:
         return "\n".join(f"- {i.strip()}" for i in items if i and i.strip())
 
 
+# =============================================================================
+# WorkingMemory
+# =============================================================================
+
+# Priority for sorting notes (lower = higher priority)
+_NOTE_TYPE_PRIORITY: Dict[NoteType, int] = {
+    NoteType.STRUCTURE: 0,
+    NoteType.PERMANENT: 1,
+    NoteType.LITERATURE: 2,
+    NoteType.FLEETING: 3,
+}
+
+
 class WorkingMemory:
-    """Local working memory used by CoT and MCTS branch execution.
+    """Zettelkasten-inspired working memory for CoT and MCTS reasoning.
 
-    Text↔graph sync is bidirectional:
-    - text → graph: entity linking + relation extraction
-    - graph → text: textualize graph triples → add as RETRIEVAL items
+    Notes enter as FLEETING, survive consolidation as LITERATURE, gain promotion
+    to PERMANENT via corroboration, and are synthesized into STRUCTURE notes that
+    emit gap questions to steer the reasoning process.
 
-    Entity linking is always redone on all current text items each sync call.
-    Idempotency is guaranteed by graph deduplication.
+    The ``_entity_graph`` (nx.MultiDiGraph) is a pure structural index for
+    triple dedup and KB frontier expansion — it never feeds the LLM directly.
+    The ``_note_graph`` (nx.DiGraph) carries semantic note-to-note links.
+    All LLM context is served via ``format_textual_memory()``.
+
+    ``synchronize_memory()`` returns ``List[str]`` gap questions.
     """
 
     def __init__(
         self,
         textual_memory: Optional[List[str]] = None,
-        graph_memory: Optional[nx.DiGraph] = None,
+        graph_memory=None,  # accepted but ignored — kept for call-site compat
         max_textual_memory_tokens: int = 16384,
         wikidata_client: Optional[WikidataClient] = None,
         annotate_steps: bool = False,
+        # Note lifecycle config
+        promotion_corroboration_count: int = 2,
+        structure_note_trigger_m: int = 5,
+        retrieval_k_min: int = 3,
+        note_store=None,  # Optional[NoteVectorStore]
     ):
-        self.textual_memory: List[str] = list(textual_memory or [])
-        self.graph_store = _GraphStore(graph_memory)
-        self.graph_memory = self.graph_store.graph
+        # --- Note system ---
+        self._notes: Dict[str, MemoryNote] = {}
+        self._note_graph: nx.DiGraph = nx.DiGraph()  # note_id → note_id with LinkType
+        self._entity_to_notes: Dict[str, Set[str]] = defaultdict(set)  # QID → {note_id}
+        self._step_counter: int = 0
+        self._permanents_since_last_structure: int = 0
+        self._note_store = note_store
+        self._promotion_corroboration_count = promotion_corroboration_count
+        self._structure_note_trigger_m = structure_note_trigger_m
+        self._retrieval_k_min = retrieval_k_min
+
+        # --- Structural entity index (pure structural, never feeds LLM) ---
+        self._entity_graph: nx.MultiDiGraph = nx.MultiDiGraph()
         self.max_textual_memory_tokens = max_textual_memory_tokens
         self.annotate_steps = annotate_steps
         self.entity_dict: Dict[str, WikidataEntity] = {}
-
         self._wikidata_client = wikidata_client
-        self._qid_to_node_id: Dict[str, str] = {}
+
+        # Seed from pre-existing textual_memory list (backward compat)
+        for item in (textual_memory or []):
+            self.add_textual_memory(item)
+
+    # ------------------------------------------------------------------
+    # Backward-compat property
+    # ------------------------------------------------------------------
+
+    @property
+    def textual_memory(self) -> List[str]:
+        """Return note contents in priority order (STRUCTURE > PERMANENT > LITERATURE > FLEETING)."""
+        notes = sorted(
+            self._notes.values(),
+            key=lambda n: (_NOTE_TYPE_PRIORITY.get(n.note_type, 4), -n.confidence, -n.created_at_step),
+        )
+        return [n.content for n in notes]
+
+    # ------------------------------------------------------------------
+    # Public write API
+    # ------------------------------------------------------------------
 
     @staticmethod
     def format_memory_item(content: str, provenance) -> str:
         return _MemoryFormatter.format_item(content, provenance)
 
-    def add_textual_memory(self, text: str, source=None, hop_depth: int = None) -> None:
+    def add_textual_memory(self, text: str, source=None, hop_depth: Optional[int] = None) -> None:
         from wemg.llm.roles import SourceType
 
         if source is None:
@@ -230,11 +312,214 @@ class WorkingMemory:
         formatted = _MemoryFormatter.format_item(text, source)
         if hop_depth is not None:
             formatted = f"[hop={hop_depth}] {formatted}"
-        if formatted not in self.textual_memory:
-            self.textual_memory.append(formatted)
+        # Content-based deduplication
+        if any(n.content == formatted for n in self._notes.values()):
+            return
+        self._step_counter += 1
+        note = MemoryNote(
+            id=uuid.uuid4().hex,
+            content=formatted,
+            note_type=NoteType.FLEETING,
+            provenance=source,
+            confidence=0.3,
+            hop_depth=hop_depth,
+            created_at_step=self._step_counter,
+        )
+        self._notes[note.id] = note
+        if self._note_store is not None:
+            self._note_store.add_or_update(note)
 
-    def format_textual_memory(self) -> str:
-        return _MemoryFormatter.format_lines(self.textual_memory)
+    # ------------------------------------------------------------------
+    # Public read API
+    # ------------------------------------------------------------------
+
+    def format_textual_memory(self, query: Optional[str] = None) -> str:
+        notes = sorted(
+            self._notes.values(),
+            key=lambda n: (_NOTE_TYPE_PRIORITY.get(n.note_type, 4), -n.confidence, -n.created_at_step),
+        )
+        return _MemoryFormatter.format_lines([n.content for n in notes])
+
+    async def retrieve_relevant_notes(
+        self,
+        entities: List[str],
+        question: str,
+        k_min: Optional[int] = None,
+    ) -> List[MemoryNote]:
+        """Graph-proximity retrieval with semantic fallback.
+
+        1. Find notes linked to active entity QIDs.
+        2. Expand 1 hop via SUPPORTS / DERIVED_FROM / ELABORATES / REFINES / ANSWERS links.
+        3. If still < k_min notes: semantic fallback via NoteVectorStore.
+        4. Rank: PERMANENT > STRUCTURE > LITERATURE > FLEETING, then confidence, then recency.
+        """
+        k_min = k_min if k_min is not None else self._retrieval_k_min
+        candidate_ids: Set[str] = set()
+
+        for qid in entities:
+            candidate_ids.update(self._entity_to_notes.get(qid, set()))
+
+        expansion_types = {
+            LinkType.SUPPORTS, LinkType.DERIVED_FROM, LinkType.ELABORATES,
+            LinkType.REFINES, LinkType.ANSWERS,
+        }
+        for nid in list(candidate_ids):
+            if self._note_graph.has_node(nid):
+                for _, nbr, data in self._note_graph.out_edges(nid, data=True):
+                    if data.get("link_type") in expansion_types:
+                        candidate_ids.add(nbr)
+                for pred, _, data in self._note_graph.in_edges(nid, data=True):
+                    if data.get("link_type") in expansion_types:
+                        candidate_ids.add(pred)
+
+        if len(candidate_ids) < k_min and self._note_store is not None:
+            for n in self._note_store.search(question, k=10):
+                candidate_ids.add(n.id)
+
+        candidates = [self._notes[nid] for nid in candidate_ids if nid in self._notes]
+        candidates.sort(
+            key=lambda n: (_NOTE_TYPE_PRIORITY.get(n.note_type, 4), -n.confidence, -n.created_at_step)
+        )
+        return candidates
+
+    # ------------------------------------------------------------------
+    # Entity graph: structural index
+    # ------------------------------------------------------------------
+
+    def register_retrieved_triples(
+        self,
+        triples: List[WikiTriple],
+        entities: List[WikidataEntity],
+    ) -> None:
+        """Update entity structural index and create LITERATURE notes for new triples.
+
+        - Adds/updates QID nodes in ``_entity_graph`` for each entity.
+        - For each triple: skips if already known (earlier-wins dedup); else adds edge
+          and creates a LITERATURE note ("subj → rel → obj").
+        - Object node: QID node if ``triple.object`` has a qid, else literal node.
+        """
+        from wemg.llm.roles import SourceType
+
+        # Update entity dict + ensure QID nodes exist
+        for entity in entities:
+            if not entity.qid:
+                continue
+            self.entity_dict[entity.qid] = entity
+            if self._entity_graph.has_node(entity.qid):
+                self._entity_graph.nodes[entity.qid]["label"] = entity.label or entity.qid
+                self._entity_graph.nodes[entity.qid]["description"] = entity.description or ""
+            else:
+                self._entity_graph.add_node(
+                    entity.qid,
+                    label=entity.label or entity.qid,
+                    description=entity.description or "",
+                )
+
+        existing_contents = {n.content for n in self._notes.values()}
+
+        for triple in triples:
+            subj = triple.subject
+            if not isinstance(subj, WikidataEntity) or not subj.qid:
+                continue
+            subj_id = subj.qid
+            subj_label = subj.label or subj_id
+
+            # Ensure subject node exists
+            if not self._entity_graph.has_node(subj_id):
+                self._entity_graph.add_node(subj_id, label=subj_label, description=subj.description or "")
+
+            rel_label = (
+                triple.relation.label
+                if hasattr(triple.relation, "label") and triple.relation.label
+                else str(triple.relation)
+            )
+            if not rel_label:
+                continue
+
+            obj = triple.object
+            if isinstance(obj, WikidataEntity) and obj.qid:
+                obj_id = obj.qid
+                obj_label = obj.label or obj_id
+                if not self._entity_graph.has_node(obj_id):
+                    self._entity_graph.add_node(obj_id, label=obj_label, description=obj.description or "")
+            else:
+                # Literal node (date, number, string scalar)
+                obj_val = obj.label if hasattr(obj, "label") and obj.label else str(obj)
+                obj_id = obj_val
+                if not self._entity_graph.has_node(obj_id):
+                    self._entity_graph.add_node(obj_id, label=obj_val, node_type="literal")
+                obj_label = obj_val
+
+            # Earlier-wins dedup
+            if self.is_triple_known(subj_id, rel_label, obj_id):
+                continue
+
+            self._entity_graph.add_edge(subj_id, obj_id, rel_label=rel_label)
+
+            # Create LITERATURE note
+            note_content = f"{subj_label} → {rel_label} → {obj_label}"
+            formatted = _MemoryFormatter.format_item(note_content, SourceType.RETRIEVAL)
+            if formatted not in existing_contents:
+                self._step_counter += 1
+                note = MemoryNote(
+                    id=uuid.uuid4().hex,
+                    content=formatted,
+                    note_type=NoteType.LITERATURE,
+                    provenance=SourceType.RETRIEVAL,
+                    confidence=0.5,
+                    created_at_step=self._step_counter,
+                )
+                self._notes[note.id] = note
+                existing_contents.add(formatted)
+                if self._note_store is not None:
+                    self._note_store.add_or_update(note)
+
+    def is_triple_known(self, subj_id: str, rel_label: str, obj_id: str) -> bool:
+        """Return True if (subj_id, rel_label, obj_id) is already in the entity graph."""
+        return (
+            self._entity_graph.has_edge(subj_id, obj_id)
+            and any(
+                d["rel_label"] == rel_label
+                for d in self._entity_graph[subj_id][obj_id].values()
+            )
+        )
+
+    def get_underexplored_neighbor_qids(
+        self,
+        seed_qids: Sequence[str],
+        max_degree: int = 2,
+        max_results: int = 5,
+    ) -> List[str]:
+        """Return QID neighbors of seed_qids that have low degree (underexplored frontier).
+
+        Filters out literal nodes and nodes already in seed_qids.
+        """
+        neighbor_qids: List[str] = []
+        seen: Set[str] = set(seed_qids)
+        for q in seed_qids:
+            if not self._entity_graph.has_node(q):
+                continue
+            neighbours = (
+                set(self._entity_graph.successors(q))
+                | set(self._entity_graph.predecessors(q))
+            )
+            for nbr in neighbours:
+                if nbr in seen:
+                    continue
+                if self._entity_graph.nodes[nbr].get("node_type") == "literal":
+                    continue
+                degree = self._entity_graph.in_degree(nbr) + self._entity_graph.out_degree(nbr)
+                if degree > max_degree:
+                    continue
+                seen.add(nbr)
+                neighbor_qids.append(nbr)
+                if len(neighbor_qids) >= max_results:
+                    return neighbor_qids
+        return neighbor_qids
+
+    # ------------------------------------------------------------------
+    # Internal: consolidation (step 2)
+    # ------------------------------------------------------------------
 
     async def _arun_consolidation(self, client, question: str, raw_memory: str, interaction_memory=None):
         from wemg.llm.roles import MEMORY_CONSOLIDATOR, MemoryConsolidationInput, MemoryConsolidationOutput, MemoryItem, execute_role
@@ -253,20 +538,58 @@ class WorkingMemory:
             ), log
         return responses[0], log
 
-    async def _aconsolidate_textual_memory(self, client, question: str, interaction_memory=None) -> None:
+    async def _aconsolidate_fleeting_notes(
+        self, cheap_client, question: str, interaction_memory=None
+    ) -> None:
+        """Consolidate all FLEETING notes; surviving content becomes LITERATURE."""
         from wemg.llm.roles import SourceType
 
-        raw_memory = self.format_textual_memory()
-        if not raw_memory:
+        fleeting = [n for n in self._notes.values() if n.note_type == NoteType.FLEETING]
+        if not fleeting:
             return
-        output, log = await self._arun_consolidation(client, question, raw_memory, interaction_memory)
-        self.textual_memory = []
+
+        raw_memory = _MemoryFormatter.format_lines([n.content for n in fleeting])
+        output, log = await self._arun_consolidation(cheap_client, question, raw_memory, interaction_memory)
+
+        # Remove old FLEETING notes
+        for n in fleeting:
+            self._notes.pop(n.id, None)
+            if self._note_graph.has_node(n.id):
+                self._note_graph.remove_node(n.id)
+            if self._note_store is not None:
+                self._note_store.delete(n.id)
+
+        # Create LITERATURE notes from consolidated output
         for item in output.consolidated_memory:
             prov = SourceType.SYSTEM_PREDICTION
-            if item.provenance == SourceType.RETRIEVAL.value:
+            if hasattr(item, "provenance") and item.provenance == SourceType.RETRIEVAL.value:
                 prov = SourceType.RETRIEVAL
-            self.add_textual_memory(item.content, source=prov, hop_depth=item.hop_depth)
+            hop = getattr(item, "hop_depth", None)
+            content = _MemoryFormatter.format_item(item.content, prov)
+            if hop is not None:
+                content = f"[hop={hop}] {content}"
+            # Skip if exact content already exists
+            if any(n.content == content for n in self._notes.values()):
+                continue
+            self._step_counter += 1
+            note = MemoryNote(
+                id=uuid.uuid4().hex,
+                content=content,
+                note_type=NoteType.LITERATURE,
+                provenance=prov,
+                confidence=0.4,
+                hop_depth=hop,
+                created_at_step=self._step_counter,
+            )
+            self._notes[note.id] = note
+            if self._note_store is not None:
+                self._note_store.add_or_update(note)
+
         log_to_interaction_memory(interaction_memory, log)
+
+    # ------------------------------------------------------------------
+    # Internal: entity linking + note linking (step 3)
+    # ------------------------------------------------------------------
 
     async def _link_entities_async(
         self,
@@ -285,16 +608,11 @@ class WorkingMemory:
             return [], {}
         if entity_linking_method == "azure":
             entities, _, link_log = await link_entities_azure(
-                text,
-                self._wikidata_client,
-                endpoint=azure_endpoint,
-                key=azure_key,
+                text, self._wikidata_client, endpoint=azure_endpoint, key=azure_key,
             )
         else:
             entities, _, link_log = await link_entities_llm(
-                client,
-                text,
-                self._wikidata_client,
+                client, text, self._wikidata_client,
                 top_k_entities=top_k_entities,
                 interaction_memory=interaction_memory,
                 known_entities=known_entities,
@@ -351,361 +669,374 @@ class WorkingMemory:
                     )
                 )
             elif rel.subject and rel.object:
-                # Fall back to string-based relation when QID resolution fails
                 triples.append(rel)
         return triples
 
-    def _textualize_graph_to_text(self) -> List[str]:
-        """Return graph triples as plain strings for adding to textual memory."""
-        from wemg.utils.graph import textualize_graph
+    def _update_entity_to_notes(self) -> None:
+        """Rebuild QID → note-ID index based on entity name occurrence in note content."""
+        self._entity_to_notes = defaultdict(set)
+        for qid, entity in self.entity_dict.items():
+            label = getattr(entity, "label", None) or ""
+            if not label:
+                continue
+            label_lower = label.lower()
+            for nid, note in self._notes.items():
+                if label_lower in note.content.lower():
+                    self._entity_to_notes[qid].add(nid)
 
-        items = []
-        components = list(nx.weakly_connected_components(self.graph_memory))
-        for comp in components:
-            triples, _ = textualize_graph(comp, self.graph_memory, method="dfs")
-            items.extend(triples)
-        return items
+    def _create_entity_based_links(self) -> None:
+        """Add CO_OCCURS_WITH links between notes that mention the same entity."""
+        for note_ids in self._entity_to_notes.values():
+            ids = list(note_ids)
+            for i, nid_a in enumerate(ids):
+                for nid_b in ids[i + 1:]:
+                    if not self._note_graph.has_edge(nid_a, nid_b):
+                        self._note_graph.add_edge(nid_a, nid_b, link_type=LinkType.CO_OCCURS_WITH)
+                    note_a = self._notes.get(nid_a)
+                    note_b = self._notes.get(nid_b)
+                    if note_a and not any(lnk.target_id == nid_b for lnk in note_a.links):
+                        note_a.links.append(NoteLink(nid_b, LinkType.CO_OCCURS_WITH))
+                    if note_b and not any(lnk.target_id == nid_a for lnk in note_b.links):
+                        note_b.links.append(NoteLink(nid_a, LinkType.CO_OCCURS_WITH))
+
+    async def _alink_entities_and_update_notes(
+        self,
+        cheap_client,
+        question: str,
+        interaction_memory,
+        reranker=None,
+        **kwargs,
+    ) -> None:
+        """Entity linking + relation extraction → entity graph update + LITERATURE notes.
+
+        Step 3 of synchronize_memory():
+        - Entity linking: text → WikidataEntity QIDs (populates entity_dict).
+        - Relation extraction: text → List[Relation].
+        - Enhance relations (try to resolve string subjects/objects to WikidataEntity).
+        - Prune irrelevant relations with TRIPLE_PRUNER.
+        - Register kept WikiTriple relations via register_retrieved_triples() (dedup + note creation).
+        - String-only Relation objects get LITERATURE notes directly.
+        - Rebuild entity_to_notes index and CO_OCCURS_WITH note links.
+        """
+        from wemg.llm.roles import SourceType
+
+        non_structure = [n for n in self._notes.values() if n.note_type != NoteType.STRUCTURE]
+        if not non_structure:
+            return
+
+        text_blob = _MemoryFormatter.format_lines([n.content for n in non_structure])
+        known = filter_entities_relevant_to_text(
+            [e for e in self.entity_dict.values() if isinstance(e, WikidataEntity)],
+            text_blob,
+        )
+        link_kwargs = self._entity_link_kwargs(kwargs)
+        t0 = time.perf_counter()
+        link_result, parse_result = await asyncio.gather(
+            self._link_entities_async(cheap_client, text_blob, known, interaction_memory, **link_kwargs),
+            _extract_relations(
+                cheap_client, text_blob,
+                interaction_memory=interaction_memory,
+                known_entities=list(known) if known else None,
+            ),
+        )
+        logger.info(
+            "PROFSTEP wm stage=link_parse_done elapsed_ms=%.1f",
+            (time.perf_counter() - t0) * 1000.0,
+        )
+
+        linked_entities, link_log = link_result
+        relations, parse_log = parse_result
+        for entity in linked_entities:
+            self.entity_dict[entity.qid] = entity
+        log_to_interaction_memory(interaction_memory, merge_logs(link_log, parse_log))
+
+        enhanced = self._enhance_relations(relations)
+
+        if enhanced:
+            t0 = time.perf_counter()
+            kept = await _aprune_relations(cheap_client, question, enhanced, interaction_memory)
+            logger.info(
+                "PROFSTEP wm stage=relation_prune_done elapsed_ms=%.1f relations=%d",
+                (time.perf_counter() - t0) * 1000.0,
+                len(kept),
+            )
+
+            # WikiTriple → entity graph + LITERATURE notes via register_retrieved_triples
+            wiki_triples = [t for t in kept if isinstance(t, WikiTriple)]
+            all_triple_entities: List[WikidataEntity] = []
+            for t in wiki_triples:
+                if isinstance(t.subject, WikidataEntity):
+                    all_triple_entities.append(t.subject)
+                if isinstance(t.object, WikidataEntity):
+                    all_triple_entities.append(t.object)
+            if wiki_triples:
+                self.register_retrieved_triples(wiki_triples, all_triple_entities)
+
+            # String-only Relation → LITERATURE notes directly
+            existing_contents = {n.content for n in self._notes.values()}
+            for rel in kept:
+                if isinstance(rel, WikiTriple):
+                    continue
+                if not rel.subject or not rel.object or not rel.relation:
+                    continue
+                note_content = f"{rel.subject} → {rel.relation} → {rel.object}"
+                formatted = _MemoryFormatter.format_item(note_content, SourceType.RETRIEVAL)
+                if formatted not in existing_contents:
+                    self._step_counter += 1
+                    note = MemoryNote(
+                        id=uuid.uuid4().hex,
+                        content=formatted,
+                        note_type=NoteType.LITERATURE,
+                        provenance=SourceType.RETRIEVAL,
+                        confidence=0.5,
+                        created_at_step=self._step_counter,
+                    )
+                    self._notes[note.id] = note
+                    existing_contents.add(formatted)
+                    if self._note_store is not None:
+                        self._note_store.add_or_update(note)
+
+            logger.info(
+                "PROFSTEP wm stage=graph_update_done linked=%d relations=%d graph_nodes=%d graph_edges=%d",
+                len(linked_entities), len(relations),
+                self._entity_graph.number_of_nodes(), self._entity_graph.number_of_edges(),
+            )
+
+        self._update_entity_to_notes()
+        self._create_entity_based_links()
+
+    # ------------------------------------------------------------------
+    # Internal: promotion (step 4)
+    # ------------------------------------------------------------------
+
+    async def _apromote_notes(self, client, question: str, interaction_memory=None) -> int:
+        """Run PROMOTION_EVALUATOR to move LITERATURE → PERMANENT. Returns new-permanent count."""
+        from wemg.llm.roles import (
+            PROMOTION_EVALUATOR, PromotionEvalInput, NoteForPromotion, execute_role, SourceType
+        )
+
+        literature = [n for n in self._notes.values() if n.note_type == NoteType.LITERATURE]
+        permanents = [n for n in self._notes.values() if n.note_type == NoteType.PERMANENT]
+        if not literature:
+            return 0
+
+        def _prov_label(n: MemoryNote) -> str:
+            v = n.provenance.value if hasattr(n.provenance, "value") else str(n.provenance)
+            return "Retrieval" if v == "retrieval" else "System Prediction"
+
+        candidates = [NoteForPromotion(idx=i, content=n.content, provenance=_prov_label(n)) for i, n in enumerate(literature)]
+        perm_list = [NoteForPromotion(idx=i, content=n.content, provenance=_prov_label(n)) for i, n in enumerate(permanents)]
+
+        results, log = await execute_role(
+            client=client,
+            role=PROMOTION_EVALUATOR,
+            input_data=PromotionEvalInput(question=question, candidate_notes=candidates, permanent_notes=perm_list),
+            interaction_memory=interaction_memory,
+            n=1,
+        )
+        log_to_interaction_memory(interaction_memory, log)
+        if not results:
+            return 0
+
+        result = results[0]
+        new_perms = 0
+
+        for idx in result.promote_indices:
+            if 0 <= idx < len(literature):
+                note = literature[idx]
+                note.note_type = NoteType.PERMANENT
+                note.confidence = min(note.confidence + 0.2, 1.0)
+                note.promoted_at = self._step_counter
+                new_perms += 1
+                if self._note_store is not None:
+                    self._note_store.add_or_update(note)
+
+        for dem in result.demotions:
+            pidx, cidx = dem.permanent_idx, dem.contradicting_candidate_idx
+            if 0 <= pidx < len(permanents):
+                perm_note = permanents[pidx]
+                perm_note.note_type = NoteType.LITERATURE
+                perm_note.confidence = max(perm_note.confidence - 0.2, 0.1)
+                if 0 <= cidx < len(literature):
+                    contra = literature[cidx]
+                    if not any(lnk.target_id == contra.id for lnk in perm_note.links):
+                        perm_note.links.append(NoteLink(contra.id, LinkType.CONTRADICTS))
+                    if not any(lnk.target_id == perm_note.id for lnk in contra.links):
+                        contra.links.append(NoteLink(perm_note.id, LinkType.CONTRADICTS))
+                    if not self._note_graph.has_edge(perm_note.id, contra.id):
+                        self._note_graph.add_edge(perm_note.id, contra.id, link_type=LinkType.CONTRADICTS)
+                if self._note_store is not None:
+                    self._note_store.add_or_update(perm_note)
+
+        return new_perms
+
+    # ------------------------------------------------------------------
+    # Internal: structure notes + gap questions (step 5)
+    # ------------------------------------------------------------------
+
+    async def _agenerate_structure_notes(
+        self, client, question: str, interaction_memory=None
+    ) -> List[str]:
+        """Generate a STRUCTURE note from PERMANENT notes. Returns gap_questions list."""
+        from wemg.llm.roles import (
+            STRUCTURE_NOTE_GENERATOR, StructureNoteInput, execute_role, SourceType
+        )
+
+        permanents = [n for n in self._notes.values() if n.note_type == NoteType.PERMANENT]
+        if not permanents:
+            return []
+
+        structures = [n for n in self._notes.values() if n.note_type == NoteType.STRUCTURE]
+        existing_summaries = [n.content for n in structures]
+        permanent_contents = [n.content for n in permanents]
+
+        results, log = await execute_role(
+            client=client,
+            role=STRUCTURE_NOTE_GENERATOR,
+            input_data=StructureNoteInput(
+                question=question,
+                permanent_notes=permanent_contents,
+                existing_structure_summaries=existing_summaries,
+            ),
+            interaction_memory=interaction_memory,
+            n=1,
+        )
+        log_to_interaction_memory(interaction_memory, log)
+        if not results:
+            return []
+
+        result = results[0]
+        struct_content = f"[Structure: {result.theme}] {result.summary}"
+        self._step_counter += 1
+        struct_note = MemoryNote(
+            id=uuid.uuid4().hex,
+            content=struct_content,
+            note_type=NoteType.STRUCTURE,
+            provenance=SourceType.SYSTEM_PREDICTION,
+            confidence=0.9,
+            created_at_step=self._step_counter,
+        )
+
+        for idx in result.covered_note_indices:
+            if 0 <= idx < len(permanents):
+                perm_note = permanents[idx]
+                struct_note.links.append(NoteLink(perm_note.id, LinkType.DERIVED_FROM))
+                if not self._note_graph.has_edge(struct_note.id, perm_note.id):
+                    self._note_graph.add_edge(struct_note.id, perm_note.id, link_type=LinkType.DERIVED_FROM)
+
+        self._notes[struct_note.id] = struct_note
+        if self._note_store is not None:
+            self._note_store.add_or_update(struct_note)
+
+        logger.info(
+            "PROFSTEP wm stage=structure_note theme=%s gap_questions=%d",
+            result.theme, len(result.gap_questions),
+        )
+        return result.gap_questions
+
+    # ------------------------------------------------------------------
+    # Main synchronize_memory — 6-step Zettelkasten pipeline
+    # ------------------------------------------------------------------
 
     async def synchronize_memory(
         self,
         client,
         question: str,
         interaction_memory: Optional[InteractionMemory] = None,
+        cheap_client=None,
+        reranker=None,
         **kwargs,
-    ) -> None:
-        """Bidirectional text↔graph sync.
+    ) -> List[str]:
+        """Note lifecycle management with entity structural index sync.
 
-        Step 1: Consolidate textual memory.
-        Step 2: text → graph (entity link + relation extraction + prune + dedup).
-        Step 3: graph → text (textualize graph triples → add as RETRIEVAL items).
-        Step 4: Consolidate again if new graph triples were added (text now enriched).
+        Step 1: Notes already entered as FLEETING via add_textual_memory().
+        Step 2: Consolidate FLEETING → LITERATURE (cheap client).
+        Step 3: Entity linking + relation extraction → entity graph update + LITERATURE notes + entity-based note links.
+        Step 4: Promote LITERATURE → PERMANENT via PROMOTION_EVALUATOR (expensive).
+        Step 5: Generate STRUCTURE notes + gap questions if threshold reached (expensive).
+        Step 6: Retrieval happens on-demand via retrieve_relevant_notes() / format_textual_memory().
+
+        Returns list of gap questions emitted by new STRUCTURE notes.
         """
+        cheap = cheap_client or client
+        gap_questions: List[str] = []
+
+        if not self._notes:
+            return gap_questions
+
         t_sync = time.perf_counter()
-        if self.textual_memory:
-            logger.info(
-                "PROFSTEP wm stage=sync_start text_items=%d graph_nodes=%d question=%s",
-                len(self.textual_memory),
-                self.graph_memory.number_of_nodes(),
-                question[:120].replace("\n", " "),
-            )
+        logger.info(
+            "PROFSTEP wm stage=sync_start total_notes=%d entity_graph_nodes=%d question=%s",
+            len(self._notes),
+            self._entity_graph.number_of_nodes(),
+            question[:120].replace("\n", " "),
+        )
 
-            # Step 1: Consolidate
+        # Step 2: Consolidate FLEETING → LITERATURE
+        t0 = time.perf_counter()
+        await self._aconsolidate_fleeting_notes(cheap, question, interaction_memory)
+        logger.info(
+            "PROFSTEP wm stage=consolidate_done elapsed_ms=%.1f lit=%d perm=%d",
+            (time.perf_counter() - t0) * 1000.0,
+            sum(1 for n in self._notes.values() if n.note_type == NoteType.LITERATURE),
+            sum(1 for n in self._notes.values() if n.note_type == NoteType.PERMANENT),
+        )
+
+        # Step 3: Entity linking + relation extraction + entity graph + LITERATURE notes
+        t0 = time.perf_counter()
+        await self._alink_entities_and_update_notes(cheap, question, interaction_memory, reranker=reranker, **kwargs)
+        logger.info(
+            "PROFSTEP wm stage=entity_notes_sync_done elapsed_ms=%.1f total_notes=%d",
+            (time.perf_counter() - t0) * 1000.0, len(self._notes),
+        )
+
+        # Step 4: Promote LITERATURE → PERMANENT (expensive client)
+        literature = [n for n in self._notes.values() if n.note_type == NoteType.LITERATURE]
+        if literature:
             t0 = time.perf_counter()
-            await self._aconsolidate_textual_memory(client, question=question, interaction_memory=interaction_memory)
+            new_perms = await self._apromote_notes(client, question, interaction_memory)
+            self._permanents_since_last_structure += new_perms
             logger.info(
-                "PROFSTEP wm stage=consolidate_done elapsed_ms=%.1f text_items=%d",
+                "PROFSTEP wm stage=promotion_done elapsed_ms=%.1f new_perms=%d total_perms=%d",
                 (time.perf_counter() - t0) * 1000.0,
-                len(self.textual_memory),
+                new_perms,
+                sum(1 for n in self._notes.values() if n.note_type == NoteType.PERMANENT),
             )
 
-        # Step 2: text → graph
-        if self.textual_memory:
-            text_blob = self.format_textual_memory()
-            known = filter_entities_relevant_to_text(
-                [e for e in self.entity_dict.values() if isinstance(e, WikidataEntity)],
-                text_blob,
-            )
-            link_kwargs = self._entity_link_kwargs(kwargs)
+        # Step 5: Structure notes + gap questions (expensive client)
+        permanents = [n for n in self._notes.values() if n.note_type == NoteType.PERMANENT]
+        has_structure = any(n.note_type == NoteType.STRUCTURE for n in self._notes.values())
+        should_gen_structure = (
+            self._permanents_since_last_structure >= self._structure_note_trigger_m
+            or (permanents and not has_structure)
+        )
+        if should_gen_structure and permanents:
             t0 = time.perf_counter()
-            link_result, parse_result = await asyncio.gather(
-                self._link_entities_async(client, text_blob, known, interaction_memory, **link_kwargs),
-                parse_graph_from_text(
-                    client,
-                    text_blob,
-                    interaction_memory=interaction_memory,
-                    known_entities=list(known) if known else None,
-                ),
-            )
+            new_gaps = await self._agenerate_structure_notes(client, question, interaction_memory)
+            gap_questions.extend(new_gaps)
+            self._permanents_since_last_structure = 0
             logger.info(
-                "PROFSTEP wm stage=link_parse_done elapsed_ms=%.1f text_items=%d",
-                (time.perf_counter() - t0) * 1000.0,
-                len(self.textual_memory),
-            )
-            linked_entities, link_log = link_result
-            relations, parse_log = parse_result
-            for entity in linked_entities:
-                self.entity_dict[entity.qid] = entity
-            edges_before = set(self.graph_memory.edges())
-            for triple in self._enhance_relations(relations):
-                self.add_edge_to_graph_memory(triple)
-            log_to_interaction_memory(interaction_memory, merge_logs(link_log, parse_log))
-            logger.info(
-                "PROFSTEP wm stage=graph_update_done linked_entities=%d relations=%d graph_nodes=%d graph_edges=%d",
-                len(linked_entities),
-                len(relations),
-                self.graph_memory.number_of_nodes(),
-                self.graph_memory.number_of_edges(),
-            )
-            new_edges = set(self.graph_memory.edges()) - edges_before
-            if new_edges:
-                t0 = time.perf_counter()
-                await _aprune_graph_edges(client, question, self.graph_memory, new_edges, interaction_memory)
-                logger.info(
-                    "PROFSTEP wm stage=graph_prune_done elapsed_ms=%.1f graph_nodes=%d graph_edges=%d",
-                    (time.perf_counter() - t0) * 1000.0,
-                    self.graph_memory.number_of_nodes(),
-                    self.graph_memory.number_of_edges(),
-                )
-
-        if self.graph_memory.number_of_nodes() > 0:
-            self.deduplicate_graph()
-
-        # Step 3: graph → text (bidirectional enrichment)
-        from wemg.llm.roles import SourceType
-        n_before = len(self.textual_memory)
-        for item in self._textualize_graph_to_text():
-            self.add_textual_memory(item, source=SourceType.SYSTEM_PREDICTION)
-
-        # Step 4: Consolidate again if graph triples enriched the text
-        if len(self.textual_memory) > n_before:
-            t0 = time.perf_counter()
-            await self._aconsolidate_textual_memory(client, question=question, interaction_memory=interaction_memory)
-            logger.info(
-                "PROFSTEP wm stage=consolidate2_done elapsed_ms=%.1f text_items=%d",
-                (time.perf_counter() - t0) * 1000.0,
-                len(self.textual_memory),
+                "PROFSTEP wm stage=structure_done elapsed_ms=%.1f gap_questions=%d",
+                (time.perf_counter() - t0) * 1000.0, len(new_gaps),
             )
 
         logger.info(
-            "PROFSTEP wm stage=sync_done elapsed_ms=%.1f",
+            "PROFSTEP wm stage=sync_done elapsed_ms=%.1f total_notes=%d gap_questions=%d",
             (time.perf_counter() - t_sync) * 1000.0,
+            len(self._notes), len(gap_questions),
         )
+        return gap_questions
 
-    def add_node_to_graph_memory(self, node):
-        from wemg.llm.roles import Entity as OpenIEEntity
-        from wemg.utils.graph import get_node_id
-
-        entity: Optional[WikidataEntity] = None
-        node_data = None
-        if isinstance(node, OpenIEEntity):
-            if node.id and node.id in self.entity_dict:
-                entity = self.entity_dict[node.id]
-            elif node.name and self._wikidata_client is not None:
-                results = self._wikidata_client.search_entities(node.id or node.name, num_results=1, get_details=False)
-                entity = results[0] if results else None
-            if entity is None:
-                if node.name:
-                    # Fall back to a string-only node (no Wikidata QID).
-                    # Use the name directly as the node ID so it's human-readable
-                    # and can be merged later if the entity is resolved to a QID.
-                    node_data = OpenIEEntity(id=None, name=node.name, description=None)
-                    node_id = node.name
-                    if not self.graph_memory.has_node(node_id):
-                        self.graph_memory.add_node(node_id, data=node_data)
-                    return node_data
-                return None
-        elif isinstance(node, WikidataEntity):
-            entity = node
-        else:
-            raise ValueError(f"Invalid node type: {type(node)}")
-
-        if entity.qid and entity.label:
-            node_data = OpenIEEntity(id=entity.qid, name=entity.label, description=entity.description)
-            self.entity_dict[entity.qid] = entity
-        elif entity.label:
-            node_data = OpenIEEntity(id=None, name=entity.label, description=entity.description)
-        else:
-            return None
-        node_id = get_node_id(node_data)
-        if not self.graph_memory.has_node(node_id):
-            self.graph_memory.add_node(node_id, data=node_data)
-        if entity.qid:
-            self._qid_to_node_id[entity.qid] = node_id
-        return node_data
-
-    def add_edge_to_graph_memory(
-        self,
-        triple,
-        *,
-        source_step: Optional[int] = None,
-        timestamp: Optional[float] = None,
-        reward: Optional[float] = None,
-    ) -> None:
-        from wemg.llm.roles import Entity as OpenIEEntity, Relation as OpenIERelation
-        from wemg.utils.graph import get_node_id
-
-        relation_label = None
-        if isinstance(triple, OpenIERelation):
-            subject = self.add_node_to_graph_memory(OpenIEEntity(id=triple.subject_id, name=triple.subject, description=None))
-            object_ = self.add_node_to_graph_memory(OpenIEEntity(id=triple.object_id, name=triple.object, description=None))
-            relation_label = str(triple.relation) if triple.relation else None
-        elif isinstance(triple, WikiTriple):
-            subject = self.add_node_to_graph_memory(triple.subject) if isinstance(triple.subject, WikidataEntity) else None
-            object_ = self.add_node_to_graph_memory(triple.object) if isinstance(triple.object, WikidataEntity) else None
-            if isinstance(triple.relation, WikidataProperty):
-                relation_label = triple.relation.label
-        else:
-            raise ValueError(f"Invalid triple type: {type(triple)}")
-        if subject is None or object_ is None or not relation_label:
-            return
-        subject_id = get_node_id(subject)
-        object_id = get_node_id(object_)
-
-        provenance: Dict[str, Any] = {}
-        if source_step is not None:
-            provenance["source_step"] = source_step
-        if timestamp is not None:
-            provenance["timestamp"] = timestamp
-        if reward is not None:
-            provenance["reward"] = reward
-
-        if not self.graph_memory.has_edge(subject_id, object_id):
-            payload: Dict[str, Any] = {"relation": {relation_label}}
-            if provenance:
-                payload["provenance"] = provenance
-            self.graph_memory.add_edge(subject_id, object_id, **payload)
-            return
-        edge = self.graph_memory.edges[subject_id, object_id]
-        edge.setdefault("relation", set()).add(relation_label)
-        if provenance:
-            existing = edge.get("provenance", {})
-            merged: Dict[str, Any] = dict(existing)
-            new_step = provenance.get("source_step")
-            old_step = existing.get("source_step")
-            if new_step is not None and (old_step is None or new_step < old_step):
-                merged["source_step"] = new_step
-            new_ts = provenance.get("timestamp")
-            old_ts = existing.get("timestamp")
-            if new_ts is not None and (old_ts is None or new_ts < old_ts):
-                merged["timestamp"] = new_ts
-            if provenance.get("reward") is not None:
-                merged["reward"] = provenance["reward"]
-            edge["provenance"] = merged
-
-    def _remove_isolated_graph_nodes(self) -> None:
-        isolated_nodes = [
-            node_id
-            for node_id in list(self.graph_memory.nodes())
-            if self.graph_memory.in_degree(node_id) == 0 and self.graph_memory.out_degree(node_id) == 0
-        ]
-        if isolated_nodes:
-            self.graph_memory.remove_nodes_from(isolated_nodes)
-
-    def _merge_string_nodes_with_qid_nodes(self) -> None:
-        """Merge string-only nodes (id=None) into QID nodes that share the same label."""
-        label_to_qid_node: Dict[str, str] = {}
-        for node_id, data in self.graph_memory.nodes(data=True):
-            node_data = data.get("data")
-            qid = getattr(node_data, "id", None)
-            label = getattr(node_data, "name", None)
-            if qid and label:
-                label_to_qid_node[label.lower()] = node_id
-
-        to_merge: List[Tuple[str, str]] = []  # (string_node_id, qid_node_id)
-        for node_id, data in self.graph_memory.nodes(data=True):
-            node_data = data.get("data")
-            if getattr(node_data, "id", None) is not None:
-                continue
-            label = getattr(node_data, "name", None)
-            if label and label.lower() in label_to_qid_node:
-                canonical = label_to_qid_node[label.lower()]
-                if canonical != node_id:
-                    to_merge.append((canonical, node_id))
-
-        for canonical_id, dup_id in to_merge:
-            self.graph_store._merge_nodes(canonical_id, [dup_id])
-
-    def deduplicate_graph(self) -> None:
-        self.graph_store.merge_same_qid_nodes()
-        self._merge_string_nodes_with_qid_nodes()
-        self._remove_isolated_graph_nodes()
-        # Rebuild cache: merging/removal may change node IDs.
-        self._qid_to_node_id = {}
-        for node_id, data in self.graph_memory.nodes(data=True):
-            qid = getattr(data.get("data"), "id", None)
-            if qid:
-                self._qid_to_node_id[qid] = node_id
-
-    def format_graph_memory(self) -> str:
-        from wemg.llm.roles import SourceType
-        from wemg.utils.graph import textualize_graph
-
-        components = list(nx.weakly_connected_components(self.graph_memory))
-        sections = []
-        for comp in components:
-            triples, _ = textualize_graph(comp, self.graph_memory, method="dfs", annotate_steps=self.annotate_steps)
-            triples = [_MemoryFormatter.format_item(t, SourceType.SYSTEM_PREDICTION) for t in triples]
-            sections.append(_MemoryFormatter.format_lines(triples))
-        return "\n\n".join(f"**Information {idx}**\n{text}" for idx, text in enumerate(sections, 1))
-
-    def format_combined_memory(self) -> str:
-        """Format both textual and graph memory into a single string."""
-        textual = self.format_textual_memory()
-        graph = self.format_graph_memory()
-        parts = [p for p in (textual, graph) if p]
-        return "\n\n".join(parts)
-
-    # ------------------------------------------------------------------
-    # Graph intelligence helpers
-    # ------------------------------------------------------------------
-
-    def get_known_entity_qids(self) -> Set[str]:
-        """Return QIDs of all entities currently represented in the graph."""
-        qids: Set[str] = set()
-        for _, data in self.graph_memory.nodes(data=True):
-            qid = getattr(data.get("data"), "id", None)
-            if qid:
-                qids.add(qid)
-        return qids
-
-    def get_well_connected_qids(self, min_degree: int = 4) -> Set[str]:
-        """Return QIDs of graph entities whose degree >= *min_degree*."""
-        well: Set[str] = set()
-        for node_id, data in self.graph_memory.nodes(data=True):
-            degree = self.graph_memory.in_degree(node_id) + self.graph_memory.out_degree(node_id)
-            if degree >= min_degree:
-                qid = getattr(data.get("data"), "id", None)
-                if qid:
-                    well.add(qid)
-        return well
-
-    def get_underexplored_neighbor_qids(
-        self,
-        seed_qids: Sequence[str],
-        max_degree: int = 2,
-        max_results: int = 5,
-    ) -> List[str]:
-        """Return QIDs of graph neighbours of *seed_qids* with low degree.
-
-        These represent entities we've seen but haven't fully explored yet.
-        """
-        node_for_qid: Dict[str, str] = {}
-        for node_id, data in self.graph_memory.nodes(data=True):
-            qid = getattr(data.get("data"), "id", None)
-            if qid:
-                node_for_qid[qid] = node_id
-
-        seed_nodes = {node_for_qid[q] for q in seed_qids if q in node_for_qid}
-        if not seed_nodes:
-            return []
-
-        neighbor_qids: List[str] = []
-        seen: Set[str] = set(seed_qids)
-        for seed in seed_nodes:
-            neighbours = set(self.graph_memory.successors(seed)) | set(
-                self.graph_memory.predecessors(seed)
-            )
-            for nbr in neighbours:
-                degree = self.graph_memory.in_degree(nbr) + self.graph_memory.out_degree(nbr)
-                if degree > max_degree:
-                    continue
-                qid = getattr(self.graph_memory.nodes[nbr].get("data"), "id", None)
-                if qid and qid not in seen:
-                    seen.add(qid)
-                    neighbor_qids.append(qid)
-                    if len(neighbor_qids) >= max_results:
-                        return neighbor_qids
-        return neighbor_qids
-
-    def is_triple_known(self, subject_qid: str, relation_label: str, object_qid: str) -> bool:
-        """Return True if the graph already contains this (s, r, o) edge."""
-        s_node = self._qid_to_node_id.get(subject_qid)
-        o_node = self._qid_to_node_id.get(object_qid)
-        if s_node is None or o_node is None:
-            return False
-        if not self.graph_memory.has_edge(s_node, o_node):
-            return False
-        return relation_label in self.graph_memory.edges[s_node, o_node].get("relation", set())
+    def close(self) -> None:
+        """Release auxiliary resources used by working memory."""
+        if self._note_store is not None:
+            try:
+                self._note_store.close()
+            except Exception:
+                pass
 
 
-__all__ = ["parse_graph_from_text", "WorkingMemory"]
+__all__ = [
+    "NoteType", "LinkType", "NoteLink", "MemoryNote",
+    "WorkingMemory",
+]

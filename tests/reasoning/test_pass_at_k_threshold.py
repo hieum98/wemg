@@ -12,7 +12,7 @@ class _DummyWorkingMemory:
         return None
 
     async def synchronize_memory(self, *args, **kwargs):
-        return None
+        return []
 
 
 class _FakeNodeGenerator:

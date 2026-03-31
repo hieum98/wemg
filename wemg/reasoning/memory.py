@@ -1,7 +1,11 @@
 """Working and interaction memory public API.
 """
 
-from .working_memory import WorkingMemory, parse_graph_from_text
+from .working_memory import (
+    NoteType, LinkType, NoteLink, MemoryNote,
+    WorkingMemory,
+)
+from .note_store import NoteVectorStore
 from .interaction_memory import (
     AsyncReadWriteLock,
     ThreadSafeReadWriteLock,
@@ -11,9 +15,14 @@ from .interaction_memory import (
 )
 
 __all__ = [
+    # Zettelkasten note model
+    "NoteType",
+    "LinkType",
+    "NoteLink",
+    "MemoryNote",
+    "NoteVectorStore",
     # Working memory
     "WorkingMemory",
-    "parse_graph_from_text",
     # Interaction memory
     "AsyncReadWriteLock",
     "ThreadSafeReadWriteLock",

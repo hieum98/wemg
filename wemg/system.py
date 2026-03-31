@@ -103,6 +103,7 @@ class WEMGSystem:
             raise ValueError("Config validation failed: " + "; ".join(errors))
         
         self.client: Optional[LLMClient] = None
+        self.cheap_client: Optional[LLMClient] = None
         self.retriever = None
         self.reranker: Optional[Reranker] = None
         self.interaction_memory: Optional[InteractionMemory] = None
@@ -120,6 +121,7 @@ class WEMGSystem:
         logger.info("Initializing WEMG system...")
         logger.info(f"Config: {self.cfg}")
         self.client = self._create_client()
+        self.cheap_client = self._create_cheap_client()
         self.retriever = self._create_retriever()
         self.reranker = self._create_reranker()
         self.wikidata_client = self._create_wikidata_client()
@@ -162,6 +164,41 @@ class WEMGSystem:
             random_seed=gen.random_seed,
         )
     
+    def _create_cheap_client(self) -> Optional[LLMClient]:
+        """Create a cheap (smaller) LLM client for mechanical tasks; None if not configured."""
+        llm = self.cfg.llm
+        if not llm.cheap_model_name:
+            return None
+        cache_config = None
+        if self.cfg.cache.enabled:
+            cache_config = {
+                "enabled": True,
+                "host": self.cfg.cache.host,
+                "port": self.cfg.cache.port,
+                "db": self.cfg.cache.db,
+                "password": self.cfg.cache.password,
+                "prefix": self.cfg.cache.prefix,
+                "ttl": self.cfg.cache.ttl,
+            }
+        gen = self.cfg.llm.cheap_generation
+        return LLMClient(
+            model_name=llm.cheap_model_name,
+            url=llm.cheap_url or llm.url,
+            api_key=llm.cheap_api_key or llm.api_key,
+            concurrency=llm.cheap_concurrency,
+            max_retries=self.cfg.llm.max_retries,
+            cache_config=cache_config,
+            timeout=gen.timeout,
+            temperature=gen.temperature,
+            n=gen.n,
+            top_p=gen.top_p,
+            max_tokens=gen.max_tokens,
+            max_input_tokens=gen.max_input_tokens,
+            top_k=gen.top_k,
+            enable_thinking=gen.enable_thinking,
+            random_seed=gen.random_seed,
+        )
+
     def _create_retriever(self):
         if self.cfg.retriever.type == "web_search":
             tool = WebSearchTool(
@@ -201,11 +238,27 @@ class WEMGSystem:
         return Reranker(client=reranker_client, top_k=r.top_k, instruction=r.instruction)
 
     def _create_working_memory(self) -> WorkingMemory:
+        from wemg.reasoning.note_store import NoteVectorStore
         wm_cfg = self.cfg.memory.working_memory
+        ns_cfg = wm_cfg.note_store
+        note_store = None
+        if ns_cfg.enabled:
+            im_cfg = self.cfg.memory.interaction_memory
+            note_store = NoteVectorStore(
+                persist_dir=ns_cfg.persist_dir,
+                embedding_base_url=ns_cfg.embedding_base_url or im_cfg.embedding_base_url,
+                embedding_model_name=ns_cfg.embedding_model_name or im_cfg.embedding_model_name,
+                embedding_api_key=ns_cfg.embedding_api_key or im_cfg.embedding_api_key,
+                cleanup_collection_on_close=ns_cfg.cleanup_collection_on_close,
+            )
         return WorkingMemory(
             max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
             wikidata_client=self.wikidata_client,
             annotate_steps=wm_cfg.annotate_steps,
+            promotion_corroboration_count=wm_cfg.promotion_corroboration_count,
+            structure_note_trigger_m=wm_cfg.structure_note_trigger_m,
+            retrieval_k_min=wm_cfg.retrieval_k_min,
+            note_store=note_store,
         )
 
 
@@ -290,7 +343,10 @@ class WEMGSystem:
         
         if strategy == "cot":
             working_memory = self._create_working_memory()
-            result = asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            try:
+                result = asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            finally:
+                working_memory.close()
             logger.info(
                 "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
                 strategy,
@@ -300,7 +356,10 @@ class WEMGSystem:
             return result
         elif strategy == "mcts":
             working_memory = self._create_working_memory()
-            result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            try:
+                result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            finally:
+                working_memory.close()
             logger.info(
                 "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
                 strategy,
@@ -316,7 +375,8 @@ class WEMGSystem:
             question=question, client=self.client, retriever=self.retriever,
             wikidata_client=self.wikidata_client, reranker=self.reranker,
             working_memory=working_memory, interaction_memory=interaction_memory,
-            max_depth=max_depth, correct_answers=golden_answer, **kwargs,
+            max_depth=max_depth, correct_answers=golden_answer,
+            cheap_client=self.cheap_client, **kwargs,
         )
         
         if self.cfg.output.show_search_tree and reasoning_path:
@@ -348,6 +408,7 @@ class WEMGSystem:
             high_confidence_threshold=et.high_confidence_threshold,
             convergence_patience=et.convergence_patience,
             semantic_sufficiency_count=et.semantic_sufficiency_count,
+            cheap_client=self.cheap_client,
             **kwargs,
         )
         logger.info(
@@ -433,6 +494,9 @@ class WEMGSystem:
     def close(self):
         if self.client:
             self.client.close()
+        if self.cheap_client:
+            self.cheap_client.close()
+            self.cheap_client = None
         if self.reranker:
             self.reranker.close()
             self.reranker = None

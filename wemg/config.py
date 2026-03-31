@@ -26,6 +26,17 @@ class LLMConfig(BaseModel):
     concurrency: int = 64
     max_retries: int = 3
     generation: LLMGenerationConfig = LLMGenerationConfig()
+    # Cheap LLM tier for mechanical tasks (entity linking, consolidation, etc.)
+    # Falls back to the main model if not set.
+    cheap_model_name: Optional[str] = None
+    cheap_url: Optional[str] = None
+    cheap_api_key: Optional[str] = None
+    cheap_concurrency: int = 128
+    cheap_generation: LLMGenerationConfig = LLMGenerationConfig(
+        temperature=0.6,
+        max_tokens=8192,
+        enable_thinking=False,
+    )
 
 
 class CacheConfig(BaseModel):
@@ -116,9 +127,24 @@ class NodeGenerationConfig(BaseModel):
     triple_pruning_top_k: int = 64
 
 
+class NoteStoreConfig(BaseModel):
+    enabled: bool = True
+    persist_dir: str = ".note_store"
+    cleanup_collection_on_close: bool = True
+    # If None, inherits from memory.interaction_memory embedding settings
+    embedding_base_url: Optional[str] = None
+    embedding_model_name: Optional[str] = None
+    embedding_api_key: Optional[str] = None
+
+
 class WorkingMemoryConfig(BaseModel):
     max_textual_memory_tokens: int = 16384
     annotate_steps: bool = True
+    # Note lifecycle thresholds
+    promotion_corroboration_count: int = 2   # distinct-source confirmations for lit→perm
+    structure_note_trigger_m: int = 5        # new permanents added before structure generation
+    retrieval_k_min: int = 3                 # min notes from graph proximity before semantic fallback
+    note_store: NoteStoreConfig = NoteStoreConfig()
 
 
 class InteractionMemoryConfig(BaseModel):
@@ -255,6 +281,7 @@ def _resolve_env_vars(data: Dict[str, Any]) -> None:
     api_key = os.environ.get("API_KEY")
     if api_key:
         _set_nested(data, "llm.api_key", data.get("llm", {}).get("api_key") or api_key)
+        _set_nested(data, "llm.cheap_api_key", data.get("llm", {}).get("cheap_api_key") or api_key)
         _set_nested(
             data,
             "retriever.corpus.embedder.api_key",

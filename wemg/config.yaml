@@ -15,6 +15,22 @@ llm:
     top_k: 20
     enable_thinking: true
     random_seed: 8888
+  # Cheap LLM tier for mechanical tasks (entity linking, consolidation, relation extraction).
+  # Falls back to the main model if cheap_model_name is null.
+  cheap_model_name: null
+  cheap_url: null
+  cheap_api_key: null
+  cheap_concurrency: 128
+  cheap_generation:
+    timeout: 300
+    temperature: 0.6
+    n: 1
+    top_p: 0.95
+    max_tokens: 8192
+    max_input_tokens: 65536
+    top_k: 20
+    enable_thinking: false
+    random_seed: null
 
 cache:
   enabled: true
@@ -84,6 +100,19 @@ node_generation:
 memory:
   working_memory:
     max_textual_memory_tokens: 16384
+    annotate_steps: true
+    # Note lifecycle thresholds
+    promotion_corroboration_count: 2   # distinct-source confirmations required for literature→permanent
+    structure_note_trigger_m: 5        # new permanents before a structure note is generated
+    retrieval_k_min: 3                 # min notes from graph proximity before semantic fallback
+    note_store:
+      enabled: true
+      persist_dir: ".note_store"
+      cleanup_collection_on_close: true
+      # Inherits from memory.interaction_memory embedding settings if null
+      embedding_base_url: null
+      embedding_model_name: null
+      embedding_api_key: null
   interaction_memory:
     enabled: false
     scope: "question"

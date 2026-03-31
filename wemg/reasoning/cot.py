@@ -84,6 +84,7 @@ async def cot_search(
     interaction_memory=None,
     max_depth: int = 10,
     correct_answers: Optional[Union[str, List[str]]] = None,
+    cheap_client=None,
     **kwargs,
 ) -> Tuple[Optional[Dict], List[CoTNode], Optional[int]]:
     """Run Chain-of-Thought reasoning.
@@ -107,7 +108,15 @@ async def cot_search(
         next_node = await generate_next_step(current, generator, generator.working_memory, interaction_memory)
         if next_node is None:
             break
-        await generator.working_memory.synchronize_memory(client, question, interaction_memory, reranker=reranker, **kwargs)
+        gap_questions = await generator.working_memory.synchronize_memory(
+            client, question, interaction_memory,
+            cheap_client=cheap_client, reranker=reranker, **kwargs,
+        )
+        for gq in gap_questions:
+            from wemg.llm.roles import SourceType
+            generator.working_memory.add_textual_memory(
+                f"[Knowledge Gap]: {gq}", source=SourceType.SYSTEM_PREDICTION
+            )
         
         current = next_node
         reasoning_path.append(current)

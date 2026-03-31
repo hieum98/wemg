@@ -871,6 +871,139 @@ STRUCTURED_QUERY_GENERATOR = Role("structured_query_generator", GENERATE_STRUCTU
 
 
 # =============================================================================
+# Zettelkasten Memory -- I/O Models
+# =============================================================================
+
+class NoteForPromotion(pydantic.BaseModel):
+    idx: int = pydantic.Field(..., description="0-based index in the candidates list.")
+    content: str = pydantic.Field(..., description="Note content.")
+    provenance: str = pydantic.Field(..., description="'Retrieval' or 'System Prediction'.")
+
+
+class DemotionDecision(pydantic.BaseModel):
+    permanent_idx: int = pydantic.Field(..., description="Index in the permanents list of the note to demote.")
+    contradicting_candidate_idx: int = pydantic.Field(..., description="Index in candidates list of the note that contradicts it.")
+    reason: str = pydantic.Field(..., description="Brief explanation of the contradiction.")
+
+
+class PromotionEvalInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The main question being answered.")
+    candidate_notes: List[NoteForPromotion] = pydantic.Field(..., description="LITERATURE notes under evaluation for promotion.")
+    permanent_notes: List[NoteForPromotion] = pydantic.Field(..., description="Already-established PERMANENT notes.")
+
+    def __str__(self) -> str:
+        candidates_str = "\n".join(
+            f"[{n.idx}] ({n.provenance}): {n.content}" for n in self.candidate_notes
+        )
+        permanents_str = (
+            "\n".join(f"[{n.idx}] ({n.provenance}): {n.content}" for n in self.permanent_notes)
+            if self.permanent_notes else "None"
+        )
+        return (
+            f"Question:\n{self.question}\n\n"
+            f"Established Knowledge (PERMANENT notes):\n{permanents_str}\n\n"
+            f"Candidate Notes for Promotion (LITERATURE):\n{candidates_str}"
+        )
+
+
+class PromotionEvalOutput(pydantic.BaseModel):
+    promote_indices: List[int] = pydantic.Field(..., description="0-based indices from candidate_notes to promote to PERMANENT.")
+    demotions: List[DemotionDecision] = pydantic.Field(default_factory=list, description="PERMANENT notes that should be demoted due to contradiction by a candidate.")
+    reasoning: str = pydantic.Field(..., description="Brief explanation of promotion/demotion decisions.")
+
+
+class StructureNoteInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The main question being answered.")
+    permanent_notes: List[str] = pydantic.Field(..., description="All current PERMANENT notes.")
+    existing_structure_summaries: List[str] = pydantic.Field(default_factory=list, description="Summaries of previously generated structure notes.")
+
+    def __str__(self) -> str:
+        permanents_str = "\n".join(f"- {n}" for n in self.permanent_notes) if self.permanent_notes else "None"
+        existing_str = (
+            "\n".join(f"- {s}" for s in self.existing_structure_summaries)
+            if self.existing_structure_summaries else "None"
+        )
+        return (
+            f"Question:\n{self.question}\n\n"
+            f"Existing Structure Summaries:\n{existing_str}\n\n"
+            f"Established Knowledge (PERMANENT notes):\n{permanents_str}"
+        )
+
+
+class StructureNoteOutput(pydantic.BaseModel):
+    theme: str = pydantic.Field(..., description="Short label for the knowledge theme (e.g. 'Subject Background', 'Temporal Sequence').")
+    summary: str = pydantic.Field(..., description="A concise synthesis of what is well-established across the PERMANENT notes.")
+    gap_questions: List[str] = pydantic.Field(..., description="Specific, targeted questions identifying what is missing to answer the main question. Each must be atomic and self-contained.")
+    covered_note_indices: List[int] = pydantic.Field(default_factory=list, description="0-based indices of PERMANENT notes synthesized into this structure note.")
+
+
+# =============================================================================
+# System Prompts -- Zettelkasten Memory
+# =============================================================================
+
+PROMOTION_EVALUATOR_PROMPT = """You are a Knowledge Curator responsible for deciding which LITERATURE notes deserve promotion to PERMANENT status, and whether any PERMANENT notes should be demoted due to new contradictions.
+
+## Definitions
+- **PERMANENT notes**: Well-established facts that have survived multiple reasoning steps. Treat these as ground truth unless a new note provides a direct factual contradiction with strong evidence.
+- **LITERATURE notes (candidates)**: Recently consolidated facts awaiting promotion. They may duplicate, extend, or contradict existing knowledge.
+- **Provenance**: `Retrieval` facts come from external sources (higher trust). `System Prediction` facts are LLM-inferred (lower trust, require corroboration).
+
+## Promotion Criteria — promote a candidate if ANY of:
+1. It is a `Retrieval` fact that is NOT contradicted by any PERMANENT note.
+2. It corroborates (restates or refines) an existing PERMANENT note with new source evidence.
+3. It fills a clearly identified gap in the PERMANENT notes relevant to the question.
+
+## Do NOT promote if:
+- It is a `System Prediction` contradicted by a PERMANENT `Retrieval` note.
+- It is redundant (fully subsumed by an existing PERMANENT note).
+- It is speculative or vague without factual grounding.
+
+## Demotion Criteria — demote a PERMANENT note if:
+- A new `Retrieval` candidate provides a DIRECT factual contradiction (e.g., different date, different name, different quantity) AND the candidate confidence is high.
+- Do NOT demote for minor wording differences or partial overlaps.
+
+## Output Format
+Respond with a JSON object with exactly these keys:
+- promote_indices: array of integers — 0-based indices from the candidate list to promote
+- demotions: array of objects; each has:
+  - permanent_idx: integer — index in the permanents list
+  - contradicting_candidate_idx: integer — index in candidates list
+  - reason: string — brief explanation
+- reasoning: string — concise summary of decisions
+"""
+
+STRUCTURE_NOTE_GENERATOR_PROMPT = """You are a Knowledge Architect. Analyze established PERMANENT notes and synthesize a structure note that captures what is known and — critically — what is still missing to answer the main question.
+
+## Your Task
+1. **Identify a coherent theme** across the PERMANENT notes (e.g., "Entity Background", "Temporal Chain", "Causal Link").
+2. **Write a concise summary** of what is well-established. Do not introduce facts not in the notes.
+3. **Identify knowledge gaps**: What specific facts are MISSING that would be needed to answer the main question? Be concrete and targeted — not vague curiosity questions but precise, atomic questions that, if answered, would directly advance reasoning toward the final answer.
+4. **Avoid redundancy**: Do not generate gap questions already addressed by existing structure notes.
+
+## Gap Question Guidelines
+- Each gap question must be atomic (one fact per question) and fully self-contained.
+- Focus on the SHORTEST path to answering the main question — prioritize gaps that block progress.
+- Maximum 5 gap questions. Fewer if the gaps are obvious.
+- BAD: "What else can you tell me about X?" (vague)
+- GOOD: "What year was X founded?" / "Who was the CEO of X in 2010?" (specific, atomic)
+
+## Output Format
+Respond with a JSON object with exactly these keys:
+- theme: string — short label for the knowledge cluster
+- summary: string — what is well-established (1-3 sentences, no new facts)
+- gap_questions: array of strings — specific, atomic questions identifying missing knowledge
+- covered_note_indices: array of integers — 0-based indices of PERMANENT notes synthesized here
+"""
+
+# =============================================================================
+# Role Instances -- Zettelkasten Memory
+# =============================================================================
+
+PROMOTION_EVALUATOR = Role("promotion_evaluator", PROMOTION_EVALUATOR_PROMPT, PromotionEvalInput, PromotionEvalOutput)
+STRUCTURE_NOTE_GENERATOR = Role("structure_note_generator", STRUCTURE_NOTE_GENERATOR_PROMPT, StructureNoteInput, StructureNoteOutput)
+
+
+# =============================================================================
 # Message formatting
 # =============================================================================
 
