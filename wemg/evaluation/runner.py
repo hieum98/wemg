@@ -108,6 +108,7 @@ class DatasetEvaluator:
         dataset,
         output_path: str = "./results",
         resume: bool = True,
+        score_only: bool = False,
         question_column: str = "question",
         answer_column: str = "answer",
         max_concurrent: Optional[int] = None,
@@ -120,6 +121,7 @@ class DatasetEvaluator:
             dataset: HuggingFace Dataset with question and answer columns
             output_path: Directory to save results
             resume: Whether to resume from previous run
+            score_only: If True, only recompute scores from existing logfile (skip answer generation)
             question_column: Column name for questions
             answer_column: Column name for correct answers
             max_concurrent: Max concurrent workers per answer_batch chunk. None uses
@@ -138,36 +140,89 @@ class DatasetEvaluator:
         artifacts_root = output_dir / "artifacts"
         artifacts_root.mkdir(parents=True, exist_ok=True)
         
-        # Load existing results for resume
+        # Load existing results for resume or score_only
         completed = {}
-        if resume and log_file.exists():
+        completed_rows: List[Dict[str, Any]] = []
+        if (resume or score_only) and log_file.exists():
             with open(log_file) as f:
                 for line in f:
                     entry = json.loads(line)
+                    completed_rows.append(entry)
                     completed[entry["question"]] = entry
-            print(f"Resuming: {len(completed)} questions already processed")
+            print(f"Loaded: {len(completed)} questions from logfile")
         
         from wemg.evaluation.metrics import compute_sub_em
         
         n = len(dataset)
-        sub_ems: List[float] = [0.0] * n
-        accs: List[Optional[float]] = [None] * n
+        sub_ems_short: List[float] = [0.0] * n
+        sub_ems_long: List[float] = [0.0] * n
+        accs_short: List[Optional[float]] = [None] * n
+        accs_long: List[Optional[float]] = [None] * n
         pass_at_k_values: List[Optional[int]] = [None] * n
-        predictions: Dict[str, str] = {}
+        predictions_short: Dict[str, str] = {}
+        predictions_long: Dict[str, str] = {}
+        
+        # Load predictions from completed entries
         for q, entry in completed.items():
-            predictions[q] = entry.get("predicted_answer", "")
+            predictions_short[q] = entry.get("predicted_answer", "")
+            predictions_long[q] = entry.get("full_answer", "")
         
         pending: List[tuple] = []
+        matched_by_question = 0
+        matched_by_index = 0
         for i, example in enumerate(dataset):
             question = example[question_column]
             correct = example[answer_column]
-            if question in completed:
-                entry = completed[question]
-                sub_ems[i] = float(entry.get("sub_em", 0.0))
-                accs[i] = entry.get("acc")
+            entry = completed.get(question)
+            if entry is not None:
+                matched_by_question += 1
+            elif score_only and i < len(completed_rows):
+                # In score_only mode, allow positional alignment as a fallback when
+                # question text differs slightly (e.g., whitespace/punctuation changes).
+                entry = completed_rows[i]
+                matched_by_index += 1
+
+            if entry is not None:
+                # In score_only mode, recompute all scores fresh
+                if score_only:
+                    # Recompute sub_ems
+                    predicted_short = entry.get("predicted_answer", "")
+                    predicted_long = entry.get("full_answer", "")
+                    sub_ems_short[i] = compute_sub_em(predicted_short, correct)
+                    sub_ems_long[i] = compute_sub_em(predicted_long, correct)
+                    predictions_short[question] = predicted_short
+                    predictions_long[question] = predicted_long
+                    # Reset accs to recompute
+                    accs_short[i] = None
+                    accs_long[i] = None
+                else:
+                    # Reuse existing sub_ems when not score_only
+                    sub_ems_short[i] = float(entry.get("sub_em_short", 0.0))
+                    sub_ems_long[i] = float(entry.get("sub_em_long", 0.0))
+                    accs_short[i] = entry.get("acc_short")
+                    accs_long[i] = entry.get("acc_long")
                 pass_at_k_values[i] = entry.get("pass_at_k")
             else:
-                pending.append((i, question, correct))
+                if not score_only:
+                    pending.append((i, question, correct))
+
+        if score_only:
+            if not completed_rows:
+                raise ValueError(
+                    f"score_only=true but logfile not found or empty: {log_file}"
+                )
+            aligned_total = matched_by_question + matched_by_index
+            if aligned_total == 0:
+                raise ValueError(
+                    "score_only=true could not align dataset rows with evaluation_log.jsonl "
+                    "(no question matches and no positional overlap)."
+                )
+            logger.info(
+                "score_only alignment: matched_by_question=%d, matched_by_index=%d, total=%d",
+                matched_by_question,
+                matched_by_index,
+                aligned_total,
+            )
         
         def append_logs(entries: List[Dict[str, Any]]) -> None:
             with open(log_file, "a") as f:
@@ -190,8 +245,10 @@ class DatasetEvaluator:
                         "question": question,
                         "correct_answer": correct,
                         "predicted_answer": err_text,
-                        "sub_em": 0.0,
-                        "acc": None,
+                        "sub_em_short": 0.0,
+                        "sub_em_long": 0.0,
+                        "acc_short": None,
+                        "acc_long": None,
                         "pass_at_k": None,
                         "error": str(err),
                     }
@@ -200,31 +257,39 @@ class DatasetEvaluator:
                     except Exception as artifact_error:
                         logger.warning(f"Could not persist artifacts for question {i}: {artifact_error}")
                         entry["artifacts_error"] = str(artifact_error)
-                    sub_ems[i] = 0.0
+                    sub_ems_short[i] = 0.0
+                    sub_ems_long[i] = 0.0
                     pass_at_k_values[i] = None
-                    predictions[question] = err_text
+                    predictions_short[question] = err_text
+                    predictions_long[question] = err_text
                 else:
                     try:
-                        predicted = result.concise_answer or result.answer
-                        sub_em = compute_sub_em(predicted, correct)
+                        predicted_short = result.concise_answer or result.answer
+                        predicted_long = result.answer
+                        sub_em_short = compute_sub_em(predicted_short, correct)
+                        sub_em_long = compute_sub_em(predicted_long, correct)
                         pass_at_k = result.metadata.get("pass_at_k") if result.metadata else None
                         entry = {
                             "question": question,
                             "correct_answer": correct,
-                            "predicted_answer": predicted,
-                            "full_answer": result.answer,
-                            "sub_em": sub_em,
+                            "predicted_answer": predicted_short,
+                            "full_answer": predicted_long,
+                            "sub_em_short": sub_em_short,
+                            "sub_em_long": sub_em_long,
                             "pass_at_k": pass_at_k,
-                            "acc": None,
+                            "acc_short": None,
+                            "acc_long": None,
                         }
                         try:
                             entry["artifacts"] = _save_question_artifacts(artifacts_root, i, question, result)
                         except Exception as artifact_error:
                             logger.warning(f"Could not persist artifacts for question {i}: {artifact_error}")
                             entry["artifacts_error"] = str(artifact_error)
-                        sub_ems[i] = sub_em
+                        sub_ems_short[i] = sub_em_short
+                        sub_ems_long[i] = sub_em_long
                         pass_at_k_values[i] = pass_at_k
-                        predictions[question] = predicted
+                        predictions_short[question] = predicted_short
+                        predictions_long[question] = predicted_long
                     except Exception as e:
                         logger.error(f"Error processing question {i}: {e}")
                         err_text = f"Error: {e}"
@@ -232,8 +297,10 @@ class DatasetEvaluator:
                             "question": question,
                             "correct_answer": correct,
                             "predicted_answer": err_text,
-                            "sub_em": 0.0,
-                            "acc": None,
+                            "sub_em_short": 0.0,
+                            "sub_em_long": 0.0,
+                            "acc_short": None,
+                            "acc_long": None,
                             "pass_at_k": None,
                             "error": str(e),
                         }
@@ -242,11 +309,13 @@ class DatasetEvaluator:
                         except Exception as artifact_error:
                             logger.warning(f"Could not persist artifacts for question {i}: {artifact_error}")
                             entry["artifacts_error"] = str(artifact_error)
-                        sub_ems[i] = 0.0
+                        sub_ems_short[i] = 0.0
+                        sub_ems_long[i] = 0.0
                         pass_at_k_values[i] = None
-                        predictions[question] = err_text
+                        predictions_short[question] = err_text
+                        predictions_long[question] = err_text
                 out.append(entry)
-                logger.info(f"[{i+1}/{n}] Sub-EM: {sub_ems[i]:.1f} | Q: {question[:60]}...")
+                logger.info(f"[{i+1}/{n}] Sub-EM Short: {sub_ems_short[i]:.1f} | Sub-EM Long: {sub_ems_long[i]:.1f} | Q: {question[:60]}...")
             return out
         
         if pending:
@@ -326,41 +395,78 @@ class DatasetEvaluator:
                                 e,
                             )
         
-        # Compute Acc scores in batch (async concurrent)
-        acc_task_rows: List[tuple] = []
+        # Compute Acc scores in batch (async concurrent) for both short and long answers
+        acc_task_rows_short: List[tuple] = []
+        acc_task_rows_long: List[tuple] = []
         for i, example in enumerate(dataset):
-            if accs[i] is not None:
+            if accs_short[i] is not None and accs_long[i] is not None:
                 continue
             question = example[question_column]
             correct = example[answer_column]
-            predicted = predictions.get(question, "")
-            acc_task_rows.append((i, question, predicted, correct))
+            if accs_short[i] is None:
+                predicted_short = predictions_short.get(question, "")
+                acc_task_rows_short.append((i, question, predicted_short, correct))
+            if accs_long[i] is None:
+                predicted_long = predictions_long.get(question, "")
+                acc_task_rows_long.append((i, question, predicted_long, correct))
         
-        if acc_task_rows and self.system.client:
+        # In score_only mode we may skip answer generation, so force lazy
+        # system initialization to make sure evaluator client exists.
+        if self.system.client is None and hasattr(self.system, "_initialize"):
+            try:
+                self.system._initialize()
+            except Exception as e:
+                logger.error(f"Failed to initialize system for Acc scoring: {e}")
+
+        if self.system.client:
             from wemg.evaluation.metrics import compute_acc_batch
             acc_max = max_concurrent if max_concurrent is not None else 10
-            tasks = [(q, pred, cor) for _, q, pred, cor in acc_task_rows]
-            try:
-                acc_results = asyncio.run(
-                    compute_acc_batch(tasks, self.system.client, max_concurrent=acc_max)
-                )
-                for (idx, _, _, _), acc in zip(acc_task_rows, acc_results):
-                    accs[idx] = acc
-            except Exception as e:
-                logger.error(f"Acc batch failed: {e}")
-                from wemg.evaluation.metrics import compute_acc
-                for idx, question, predicted, correct in acc_task_rows:
-                    try:
-                        accs[idx] = asyncio.run(
-                            compute_acc(question, predicted, correct, self.system.client)
-                        )
-                    except Exception as e2:
-                        logger.error(f"Acc computation failed for question {idx}: {e2}")
-                        accs[idx] = 0.0
+            
+            # Compute short answer acc
+            if acc_task_rows_short:
+                tasks_short = [(q, pred, cor) for _, q, pred, cor in acc_task_rows_short]
+                try:
+                    acc_results_short = asyncio.run(
+                        compute_acc_batch(tasks_short, self.system.client, max_concurrent=acc_max)
+                    )
+                    for (idx, _, _, _), acc in zip(acc_task_rows_short, acc_results_short):
+                        accs_short[idx] = acc
+                except Exception as e:
+                    logger.error(f"Acc short batch failed: {e}")
+                    from wemg.evaluation.metrics import compute_acc
+                    for idx, question, predicted, correct in acc_task_rows_short:
+                        try:
+                            accs_short[idx] = asyncio.run(
+                                compute_acc(question, predicted, correct, self.system.client)
+                            )
+                        except Exception as e2:
+                            logger.error(f"Acc short computation failed for question {idx}: {e2}")
+                            accs_short[idx] = 0.0
+            
+            # Compute long answer acc
+            if acc_task_rows_long:
+                tasks_long = [(q, pred, cor) for _, q, pred, cor in acc_task_rows_long]
+                try:
+                    acc_results_long = asyncio.run(
+                        compute_acc_batch(tasks_long, self.system.client, max_concurrent=acc_max)
+                    )
+                    for (idx, _, _, _), acc in zip(acc_task_rows_long, acc_results_long):
+                        accs_long[idx] = acc
+                except Exception as e:
+                    logger.error(f"Acc long batch failed: {e}")
+                    from wemg.evaluation.metrics import compute_acc
+                    for idx, question, predicted, correct in acc_task_rows_long:
+                        try:
+                            accs_long[idx] = asyncio.run(
+                                compute_acc(question, predicted, correct, self.system.client)
+                            )
+                        except Exception as e2:
+                            logger.error(f"Acc long computation failed for question {idx}: {e2}")
+                            accs_long[idx] = 0.0
         
-        # Compute aggregate metrics
-        from wemg.evaluation.metrics import compute_aggregate_metrics
-        metrics = compute_aggregate_metrics(sub_ems, accs, pass_at_k_values)
+        # Compute aggregate metrics for both short and long answers
+        from wemg.evaluation.metrics import compute_aggregate_metrics_both
+        metrics = compute_aggregate_metrics_both(sub_ems_short, sub_ems_long, accs_short, accs_long, pass_at_k_values)
         
         # Save metrics
         metrics_file = output_dir / "metrics.json"
@@ -369,9 +475,15 @@ class DatasetEvaluator:
         
         summary_file = output_dir / "summary.txt"
         with open(summary_file, "w") as f:
-            f.write("WEMG Evaluation Results\n")
-            f.write("=" * 40 + "\n")
-            for k, v in metrics.items():
+            f.write("WEMG Evaluation Results (Short and Long Answer Versions)\n")
+            f.write("=" * 50 + "\n\n")
+            f.write("SHORT ANSWER METRICS:\n")
+            f.write("-" * 30 + "\n")
+            for k, v in metrics["short_answer"].items():
+                f.write(f"{k}: {v}\n")
+            f.write("\nLONG ANSWER METRICS:\n")
+            f.write("-" * 30 + "\n")
+            for k, v in metrics["long_answer"].items():
                 f.write(f"{k}: {v}\n")
         
         logger.info(f"Evaluation complete. Metrics saved to {metrics_file}")
@@ -384,41 +496,83 @@ class DatasetEvaluator:
         question_column: str = "question",
         answer_column: str = "answer",
         prediction_column: str = "predicted_answer",
+        long_prediction_column: Optional[str] = None,
     ) -> Dict:
-        """Score existing predictions without running WEMG."""
-        from wemg.evaluation.metrics import compute_sub_em, compute_aggregate_metrics, compute_acc_batch
+        """Score existing predictions without running WEMG.
         
-        sub_ems = []
-        accs = []
+        If long_prediction_column is provided, computes metrics for both short and long versions.
+        Otherwise, uses prediction_column for both.
+        """
+        from wemg.evaluation.metrics import (
+            compute_sub_em, compute_aggregate_metrics_both, compute_acc_batch
+        )
+        
+        sub_ems_short = []
+        sub_ems_long = []
+        accs_short = []
+        accs_long = []
+        
+        # If no long_prediction_column provided, use prediction_column for both
+        if long_prediction_column is None:
+            long_prediction_column = prediction_column
         
         for example in dataset:
             correct = example[answer_column]
-            predicted = example.get(prediction_column, "")
-            sub_ems.append(compute_sub_em(predicted, correct))
-            accs.append(None)
+            predicted_short = example.get(prediction_column, "")
+            predicted_long = example.get(long_prediction_column, "")
+            
+            sub_ems_short.append(compute_sub_em(predicted_short, correct))
+            sub_ems_long.append(compute_sub_em(predicted_long, correct))
+            accs_short.append(None)
+            accs_long.append(None)
         
         # Compute Acc if client available
         if self.system.client:
-            tasks = [
+            # Short answer acc
+            tasks_short = [
                 (example[question_column], example.get(prediction_column, ""), example[answer_column])
                 for example in dataset
             ]
             try:
-                acc_results = asyncio.run(compute_acc_batch(tasks, self.system.client))
-                for i, acc in enumerate(acc_results):
-                    accs[i] = acc
-            except Exception:
+                acc_results_short = asyncio.run(compute_acc_batch(tasks_short, self.system.client))
+                for i, acc in enumerate(acc_results_short):
+                    accs_short[i] = acc
+            except Exception as e:
+                logger.error(f"Acc short batch failed: {e}")
                 from wemg.evaluation.metrics import compute_acc
                 for i, example in enumerate(dataset):
                     try:
-                        accs[i] = asyncio.run(compute_acc(
+                        accs_short[i] = asyncio.run(compute_acc(
                             example[question_column], example.get(prediction_column, ""),
                             example[answer_column], self.system.client
                         ))
-                    except Exception:
-                        accs[i] = 0.0
+                    except Exception as e2:
+                        logger.error(f"Acc short failed for {i}: {e2}")
+                        accs_short[i] = 0.0
+            
+            # Long answer acc
+            tasks_long = [
+                (example[question_column], example.get(long_prediction_column, ""), example[answer_column])
+                for example in dataset
+            ]
+            try:
+                acc_results_long = asyncio.run(compute_acc_batch(tasks_long, self.system.client))
+                for i, acc in enumerate(acc_results_long):
+                    accs_long[i] = acc
+            except Exception as e:
+                logger.error(f"Acc long batch failed: {e}")
+                from wemg.evaluation.metrics import compute_acc
+                for i, example in enumerate(dataset):
+                    try:
+                        accs_long[i] = asyncio.run(compute_acc(
+                            example[question_column], example.get(long_prediction_column, ""),
+                            example[answer_column], self.system.client
+                        ))
+                    except Exception as e2:
+                        logger.error(f"Acc long failed for {i}: {e2}")
+                        accs_long[i] = 0.0
         
-        metrics = compute_aggregate_metrics(sub_ems, accs, [])
+        metrics = compute_aggregate_metrics_both(sub_ems_short, sub_ems_long, accs_short, accs_long, [])
         
         output_dir = Path(output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -426,3 +580,4 @@ class DatasetEvaluator:
             json.dump(metrics, f, indent=2)
         
         return metrics
+

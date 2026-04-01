@@ -152,25 +152,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             shuffle=shuffle,
         )
         evaluator = DatasetEvaluator(system)
-        if score_only:
-            metrics = evaluator.score_from_predictions(
-                ds,
-                output_path=str(output_path),
-                question_column=str(question_column),
-                answer_column=str(answer_column),
-                prediction_column=str(prediction_column),
-            )
-        else:
-            metrics = evaluator.evaluate(
-                ds,
-                output_path=str(output_path),
-                resume=resume,
-                question_column=str(question_column),
-                answer_column=str(answer_column),
-                max_concurrent=max_concurrent,
-                log_batch_size=log_batch_size,
-                clear_kb_cache_every_n_batches=clear_kb_cache_every_n_batches,
-            )
+        metrics = evaluator.evaluate(
+            ds,
+            output_path=str(output_path),
+            resume=resume,
+            score_only=score_only,
+            question_column=str(question_column),
+            answer_column=str(answer_column),
+            max_concurrent=max_concurrent,
+            log_batch_size=log_batch_size,
+            clear_kb_cache_every_n_batches=clear_kb_cache_every_n_batches,
+        )
         print("Done. Metrics:", metrics)
         return 0
     finally:

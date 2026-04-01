@@ -103,3 +103,54 @@ def compute_aggregate_metrics(
             metrics[f"pass_at_{k}"] = sum(1 for p in valid_pass if p <= k) / len(sub_ems)
     
     return metrics
+
+
+def compute_aggregate_metrics_both(
+    sub_ems_short: List[float],
+    sub_ems_long: List[float],
+    accs_short: List[float],
+    accs_long: List[float],
+    pass_at_k_values: List[Optional[int]],
+    max_k: int = 10,
+) -> Dict:
+    """Compute aggregate metrics for both short and long answer versions.
+    
+    Returns metrics dict with separate entries for short and long versions.
+    """
+    # Short answer metrics
+    valid_sub_ems_short = [s for s in sub_ems_short if s is not None]
+    valid_accs_short = [a for a in accs_short if a is not None]
+    valid_pass = [p for p in pass_at_k_values if p is not None]
+    
+    metrics_short = {
+        "mean_sub_em": sum(valid_sub_ems_short) / len(valid_sub_ems_short) if valid_sub_ems_short else 0.0,
+        "mean_acc": sum(valid_accs_short) / len(valid_accs_short) if valid_accs_short else 0.0,
+        "total_questions": len(sub_ems_short),
+        "valid_questions": len(valid_sub_ems_short),
+    }
+    
+    if valid_pass:
+        metrics_short["overall_pass_rate"] = len(valid_pass) / len(sub_ems_short)
+        for k in range(1, min(max_k + 1, max(valid_pass) + 1)):
+            metrics_short[f"pass_at_{k}"] = sum(1 for p in valid_pass if p <= k) / len(sub_ems_short)
+    
+    # Long answer metrics
+    valid_sub_ems_long = [s for s in sub_ems_long if s is not None]
+    valid_accs_long = [a for a in accs_long if a is not None]
+    
+    metrics_long = {
+        "mean_sub_em": sum(valid_sub_ems_long) / len(valid_sub_ems_long) if valid_sub_ems_long else 0.0,
+        "mean_acc": sum(valid_accs_long) / len(valid_accs_long) if valid_accs_long else 0.0,
+        "total_questions": len(sub_ems_long),
+        "valid_questions": len(valid_sub_ems_long),
+    }
+    
+    if valid_pass:
+        metrics_long["overall_pass_rate"] = len(valid_pass) / len(sub_ems_long)
+        for k in range(1, min(max_k + 1, max(valid_pass) + 1)):
+            metrics_long[f"pass_at_{k}"] = sum(1 for p in valid_pass if p <= k) / len(sub_ems_long)
+    
+    return {
+        "short_answer": metrics_short,
+        "long_answer": metrics_long,
+    }
