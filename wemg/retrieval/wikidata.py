@@ -40,6 +40,10 @@ WIKIPEDIA_API_TIMEOUT_SECONDS = 20
 DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND = 10
 _wiki_rate_lock = threading.Lock()
 _wiki_last_request_time: List[float] = [0.0]
+# Keep SPARQL traffic safely below Wikidata's 2 RPS robots policy.
+DEFAULT_MAX_SPARQL_REQUESTS_PER_SECOND = 1.8
+_sparql_rate_lock = threading.Lock()
+_sparql_last_request_time: List[float] = [0.0]
 WIKIPEDIA_DUMP_DATASET = "Hieuman/wiki23-processed"
 disable_progress_bars()
 
@@ -52,6 +56,17 @@ def _wikipedia_rate_limit(max_requests_per_second: float) -> None:
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
         _wiki_last_request_time[0] = time.monotonic()
+
+
+def _sparql_rate_limit(max_requests_per_second: float) -> None:
+    """Wait if needed so the next SPARQL request stays within Wikidata RPS limits."""
+    with _sparql_rate_lock:
+        now = time.monotonic()
+        min_interval = 1.0 / max(0.1, min(2.0, max_requests_per_second))
+        elapsed = now - _sparql_last_request_time[0]
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        _sparql_last_request_time[0] = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +396,7 @@ class WikidataClient:
         properties: Optional[List[str]] = None,
         property_labels: Optional[Dict[str, Dict[str, str]]] = None,
         max_wikipedia_requests_per_second: Optional[float] = None,
+        max_sparql_requests_per_second: Optional[float] = None,
         triple_cache_max_entries: int = 5000,
         redis_client=None,
     ):
@@ -391,11 +407,16 @@ class WikidataClient:
             if max_wikipedia_requests_per_second is not None
             else DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND
         )
+        self._max_sparql_rps = (
+            max_sparql_requests_per_second
+            if max_sparql_requests_per_second is not None
+            else DEFAULT_MAX_SPARQL_REQUESTS_PER_SECOND
+        )
         self._triple_cache_max_entries = max(1, int(triple_cache_max_entries))
         self._redis = redis_client
         self._redis_prefix = "wemg:triples"
         self._redis_ttl = 86400  # 24h
-        self._semaphore = threading.Semaphore(10)
+        self._semaphore = threading.Semaphore(2)
         self._cache_lock = threading.Lock()
         # Raw 1-hop triples per QID (pre-enrichment); shared across k-hop and find_path.
         self._outgoing_triples_cache: "OrderedDict[str, List[WikiTriple]]" = OrderedDict()
@@ -460,6 +481,29 @@ class WikidataClient:
     # ------------------------------------------------------------------
 
     def _sparql_query(self, sparql: str) -> List[Dict]:
+        def _is_http_429(exc: Exception) -> bool:
+            code = getattr(exc, "code", None)
+            if code == 429:
+                return True
+            return "HTTP Error 429" in str(exc)
+
+        def _parse_retry_after_seconds(exc: Exception) -> Optional[float]:
+            headers = getattr(exc, "headers", None)
+            if headers is None:
+                return None
+            raw = None
+            if hasattr(headers, "get"):
+                try:
+                    raw = headers.get("Retry-After")
+                except Exception:
+                    raw = None
+            if raw is None:
+                return None
+            try:
+                return max(0.0, float(raw))
+            except Exception:
+                return None
+
         with self._semaphore:
             client = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
             client.setTimeout(SPARQL_TIMEOUT_S)
@@ -468,13 +512,25 @@ class WikidataClient:
             client.addCustomHttpHeader("User-Agent", USER_AGENT)
             for attempt in range(MAX_RETRIES):
                 try:
+                    _sparql_rate_limit(self._max_sparql_rps)
                     results = client.query().convert()
                     return results.get("results", {}).get("bindings", [])
                 except Exception as e:
                     if attempt == MAX_RETRIES - 1:
                         logger.error(f"SPARQL query failed after {MAX_RETRIES} attempts: {e}")
                         return []
-                    time.sleep(RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1))
+                    delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1)
+                    if _is_http_429(e):
+                        retry_after = _parse_retry_after_seconds(e)
+                        if retry_after is not None:
+                            delay = retry_after
+                        logger.warning(
+                            "SPARQL request hit 429 (attempt %d/%d); retrying in %.2fs",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            delay,
+                        )
+                    time.sleep(delay)
         return []
 
     # ------------------------------------------------------------------

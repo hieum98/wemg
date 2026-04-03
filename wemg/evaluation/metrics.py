@@ -4,7 +4,6 @@ Pass@k values are computed from search metadata where ``pass_at_k`` marks
 the first step/iteration with evaluator rating > 8.0 (Acc > 0.8).
 """
 
-import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -62,17 +61,68 @@ async def compute_acc_batch(
     client,
     max_concurrent: int = 10,
 ) -> List[float]:
-    """Batch compute Acc scores with concurrency control.
-    
+    """Batch compute Acc scores via batched role execution.
+
     tasks: List of (question, predicted, correct_answers) tuples.
+
+        Notes:
+        - Uses a single batched evaluator call per chunk instead of launching many
+            single-input role calls.
+        - Fails fast if a chunk cannot be scored.
     """
-    semaphore = asyncio.Semaphore(max_concurrent)
-    
-    async def _one(question, predicted, correct):
-        async with semaphore:
-            return await compute_acc(question, predicted, correct, client)
-    
-    return await asyncio.gather(*[_one(q, p, c) for q, p, c in tasks])
+    if not tasks:
+        return []
+
+    from wemg.llm.roles import EVALUATOR, AnswerEvaluationInput, execute_role
+
+    chunk_size = max(1, max_concurrent)
+    scores: List[float] = [0.0] * len(tasks)
+
+    for start in range(0, len(tasks), chunk_size):
+        chunk = tasks[start : start + chunk_size]
+
+        inputs: List[AnswerEvaluationInput] = []
+        for question, predicted, correct_answers in chunk:
+            if isinstance(correct_answers, list):
+                correct_str = "; ".join(correct_answers)
+            else:
+                correct_str = correct_answers or "Not available"
+            inputs.append(
+                AnswerEvaluationInput(
+                    user_question=question,
+                    system_answer=predicted,
+                    correct_answer=correct_str,
+                )
+            )
+
+        try:
+            batched_results, _ = await execute_role(
+                client=client,
+                role=EVALUATOR,
+                input_data=inputs,
+                interaction_memory=None,
+                n=1,
+            )
+            for offset, result_list in enumerate(batched_results):
+                if result_list:
+                    try:
+                        scores[start + offset] = result_list[0].rating / 10.0
+                    except Exception:
+                        scores[start + offset] = 0.0
+                else:
+                    scores[start + offset] = 0.0
+        except Exception as e:
+            logger.error(
+                "Acc batch chunk failed for rows [%d, %d): %s",
+                start,
+                start + len(chunk),
+                e,
+            )
+            raise RuntimeError(
+                f"Acc batch scoring failed for chunk rows [{start}, {start + len(chunk)}): {e}"
+            ) from e
+
+    return scores
 
 
 def compute_aggregate_metrics(

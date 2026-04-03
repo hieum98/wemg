@@ -8,6 +8,7 @@ import hashlib
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,9 @@ class DatasetEvaluator:
             with open(log_file) as f:
                 for line in f:
                     entry = json.loads(line)
+                    if 'error' in entry:
+                        logger.warning(f"Existing log entry for question with error: {entry.get('question', 'unknown')[:60]}... Error: {entry['error']}. Ignoring this entry for resume/score_only purposes.")
+                        continue
                     completed_rows.append(entry)
                     completed[entry["question"]] = entry
             print(f"Loaded: {len(completed)} questions from logfile")
@@ -168,6 +172,7 @@ class DatasetEvaluator:
             predictions_long[q] = entry.get("full_answer", "")
         
         pending: List[tuple] = []
+        scored_indices: List[int] = []
         matched_by_question = 0
         matched_by_index = 0
         for i, example in enumerate(dataset):
@@ -183,6 +188,7 @@ class DatasetEvaluator:
                 matched_by_index += 1
 
             if entry is not None:
+                scored_indices.append(i)
                 # In score_only mode, recompute all scores fresh
                 if score_only:
                     # Recompute sub_ems
@@ -223,6 +229,18 @@ class DatasetEvaluator:
                 matched_by_index,
                 aligned_total,
             )
+
+        scored_index_set = set(scored_indices)
+
+        initial_done = n - len(pending)
+        progress_bar = tqdm(
+            total=n,
+            initial=initial_done,
+            desc="Evaluating",
+            unit="q",
+            dynamic_ncols=True,
+            leave=True,
+        )
         
         def append_logs(entries: List[Dict[str, Any]]) -> None:
             with open(log_file, "a") as f:
@@ -318,87 +336,93 @@ class DatasetEvaluator:
                 logger.info(f"[{i+1}/{n}] Sub-EM Short: {sub_ems_short[i]:.1f} | Sub-EM Long: {sub_ems_long[i]:.1f} | Q: {question[:60]}...")
             return out
         
-        if pending:
-            cfg_cap = min(self.system.cfg.llm.concurrency, 8)
-            if log_batch_size is not None:
-                chunk_size = max(1, log_batch_size)
-            elif max_concurrent is not None:
-                chunk_size = max(1, max_concurrent)
-            else:
-                chunk_size = max(1, cfg_cap)
-            total_pending = len(pending)
-            cache_clear_every = (
-                int(clear_kb_cache_every_n_batches)
-                if clear_kb_cache_every_n_batches is not None
-                else 0
-            )
-            if cache_clear_every < 0:
-                cache_clear_every = 0
-            for chunk_start in range(0, total_pending, chunk_size):
-                batch = pending[chunk_start : chunk_start + chunk_size]
-                questions = [p[1] for p in batch]
-                qids = [str(p[0]) for p in batch]
-                golds = [
-                    list(c) if isinstance(c, (list, tuple)) else (c if isinstance(c, str) else str(c))
-                    for _, _, c in batch
-                ]
-                mw = max_concurrent
-                if mw is not None:
-                    mw = max(1, min(mw, len(batch)))
-                chunk_index = (chunk_start // chunk_size) + 1
-                logger.info(
-                    "PROFSTEP eval stage=chunk_start chunk=%d/%d size=%d max_workers=%s",
-                    chunk_index,
-                    (total_pending + chunk_size - 1) // chunk_size,
-                    len(batch),
-                    str(mw),
+        try:
+            if pending:
+                cfg_cap = min(self.system.cfg.llm.concurrency, 8)
+                if log_batch_size is not None:
+                    chunk_size = max(1, log_batch_size)
+                elif max_concurrent is not None:
+                    chunk_size = max(1, max_concurrent)
+                else:
+                    chunk_size = max(1, cfg_cap)
+                total_pending = len(pending)
+                cache_clear_every = (
+                    int(clear_kb_cache_every_n_batches)
+                    if clear_kb_cache_every_n_batches is not None
+                    else 0
                 )
-                t_chunk = time.perf_counter()
-                results = self.system.answer_batch(
-                    questions,
-                    question_ids=qids,
-                    golden_answers=golds,
-                    max_workers=mw,
-                )
-                logger.info(
-                    "PROFSTEP eval stage=answer_batch_done chunk=%d elapsed_ms=%.1f",
-                    chunk_index,
-                    (time.perf_counter() - t_chunk) * 1000.0,
-                )
-                t_log = time.perf_counter()
-                entries = process_answer_results(batch, results)
-                append_logs(entries)
-                logger.info(
-                    "PROFSTEP eval stage=append_logs_done chunk=%d elapsed_ms=%.1f entries=%d",
-                    chunk_index,
-                    (time.perf_counter() - t_log) * 1000.0,
-                    len(entries),
-                )
+                if cache_clear_every < 0:
+                    cache_clear_every = 0
+                for chunk_start in range(0, total_pending, chunk_size):
+                    batch = pending[chunk_start : chunk_start + chunk_size]
+                    questions = [p[1] for p in batch]
+                    qids = [str(p[0]) for p in batch]
+                    golds = [
+                        list(c) if isinstance(c, (list, tuple)) else (c if isinstance(c, str) else str(c))
+                        for _, _, c in batch
+                    ]
+                    mw = max_concurrent
+                    if mw is not None:
+                        mw = max(1, min(mw, len(batch)))
+                    chunk_index = (chunk_start // chunk_size) + 1
+                    logger.info(
+                        "PROFSTEP eval stage=chunk_start chunk=%d/%d size=%d max_workers=%s",
+                        chunk_index,
+                        (total_pending + chunk_size - 1) // chunk_size,
+                        len(batch),
+                        str(mw),
+                    )
+                    t_chunk = time.perf_counter()
+                    results = self.system.answer_batch(
+                        questions,
+                        question_ids=qids,
+                        golden_answers=golds,
+                        max_workers=mw,
+                    )
+                    logger.info(
+                        "PROFSTEP eval stage=answer_batch_done chunk=%d elapsed_ms=%.1f",
+                        chunk_index,
+                        (time.perf_counter() - t_chunk) * 1000.0,
+                    )
+                    t_log = time.perf_counter()
+                    entries = process_answer_results(batch, results)
+                    append_logs(entries)
+                    progress_bar.update(len(batch))
+                    logger.info(
+                        "PROFSTEP eval stage=append_logs_done chunk=%d elapsed_ms=%.1f entries=%d",
+                        chunk_index,
+                        (time.perf_counter() - t_log) * 1000.0,
+                        len(entries),
+                    )
 
-                # Bound process memory in long-running eval by clearing Wikidata
-                # triple caches periodically between chunks.
-                if cache_clear_every > 0 and (chunk_index % cache_clear_every == 0):
-                    wikidata_client = getattr(self.system, "wikidata_client", None)
-                    if wikidata_client is not None and hasattr(
-                        wikidata_client, "clear_triple_caches"
-                    ):
-                        try:
-                            wikidata_client.clear_triple_caches()
-                            logger.info(
-                                "Cleared Wikidata triple caches after chunk %d",
-                                chunk_index,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to clear Wikidata triple caches at chunk %d: %s",
-                                chunk_index,
-                                e,
-                            )
+                    # Bound process memory in long-running eval by clearing Wikidata
+                    # triple caches periodically between chunks.
+                    if cache_clear_every > 0 and (chunk_index % cache_clear_every == 0):
+                        wikidata_client = getattr(self.system, "wikidata_client", None)
+                        if wikidata_client is not None and hasattr(
+                            wikidata_client, "clear_triple_caches"
+                        ):
+                            try:
+                                wikidata_client.clear_triple_caches()
+                                logger.info(
+                                    "Cleared Wikidata triple caches after chunk %d",
+                                    chunk_index,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to clear Wikidata triple caches at chunk %d: %s",
+                                    chunk_index,
+                                    e,
+                                )
+        finally:
+            progress_bar.close()
         
         # Compute Acc scores in batch (async concurrent) for both short and long answers
         acc_task_rows_short: List[tuple] = []
         acc_task_rows_long: List[tuple] = []
         for i, example in enumerate(dataset):
+            if score_only and i not in scored_index_set:
+                continue
             if accs_short[i] is not None and accs_long[i] is not None:
                 continue
             question = example[question_column]
@@ -421,52 +445,71 @@ class DatasetEvaluator:
         if self.system.client:
             from wemg.evaluation.metrics import compute_acc_batch
             acc_max = max_concurrent if max_concurrent is not None else 10
-            
-            # Compute short answer acc
-            if acc_task_rows_short:
-                tasks_short = [(q, pred, cor) for _, q, pred, cor in acc_task_rows_short]
+            acc_chunk_size = max(1, acc_max)
+            total_acc_tasks = len(acc_task_rows_short) + len(acc_task_rows_long)
+            acc_progress = tqdm(
+                total=total_acc_tasks,
+                desc="Scoring Acc",
+                unit="q",
+                dynamic_ncols=True,
+                leave=True,
+            )
+
+            def _compute_acc_rows_in_chunks(task_rows: List[tuple], target: List[Optional[float]], label: str) -> None:
+                if not task_rows:
+                    return
                 try:
-                    acc_results_short = asyncio.run(
-                        compute_acc_batch(tasks_short, self.system.client, max_concurrent=acc_max)
-                    )
-                    for (idx, _, _, _), acc in zip(acc_task_rows_short, acc_results_short):
-                        accs_short[idx] = acc
+                    for start in range(0, len(task_rows), acc_chunk_size):
+                        chunk_rows = task_rows[start : start + acc_chunk_size]
+                        chunk_tasks = [(q, pred, cor) for _, q, pred, cor in chunk_rows]
+                        chunk_scores = asyncio.run(
+                            compute_acc_batch(chunk_tasks, self.system.client, max_concurrent=acc_max)
+                        )
+                        for (idx, _, _, _), acc in zip(chunk_rows, chunk_scores):
+                            target[idx] = acc
+                        acc_progress.update(len(chunk_rows))
                 except Exception as e:
-                    logger.error(f"Acc short batch failed: {e}")
+                    logger.error(f"Acc {label} batch failed: {e}")
                     from wemg.evaluation.metrics import compute_acc
-                    for idx, question, predicted, correct in acc_task_rows_short:
+                    for idx, question, predicted, correct in task_rows:
                         try:
-                            accs_short[idx] = asyncio.run(
+                            target[idx] = asyncio.run(
                                 compute_acc(question, predicted, correct, self.system.client)
                             )
                         except Exception as e2:
-                            logger.error(f"Acc short computation failed for question {idx}: {e2}")
-                            accs_short[idx] = 0.0
-            
-            # Compute long answer acc
-            if acc_task_rows_long:
-                tasks_long = [(q, pred, cor) for _, q, pred, cor in acc_task_rows_long]
-                try:
-                    acc_results_long = asyncio.run(
-                        compute_acc_batch(tasks_long, self.system.client, max_concurrent=acc_max)
-                    )
-                    for (idx, _, _, _), acc in zip(acc_task_rows_long, acc_results_long):
-                        accs_long[idx] = acc
-                except Exception as e:
-                    logger.error(f"Acc long batch failed: {e}")
-                    from wemg.evaluation.metrics import compute_acc
-                    for idx, question, predicted, correct in acc_task_rows_long:
-                        try:
-                            accs_long[idx] = asyncio.run(
-                                compute_acc(question, predicted, correct, self.system.client)
-                            )
-                        except Exception as e2:
-                            logger.error(f"Acc long computation failed for question {idx}: {e2}")
-                            accs_long[idx] = 0.0
+                            logger.error(f"Acc {label} computation failed for question {idx}: {e2}")
+                            target[idx] = 0.0
+                        finally:
+                            acc_progress.update(1)
+
+            try:
+                _compute_acc_rows_in_chunks(acc_task_rows_short, accs_short, "short")
+                _compute_acc_rows_in_chunks(acc_task_rows_long, accs_long, "long")
+            finally:
+                acc_progress.close()
         
         # Compute aggregate metrics for both short and long answers
         from wemg.evaluation.metrics import compute_aggregate_metrics_both
-        metrics = compute_aggregate_metrics_both(sub_ems_short, sub_ems_long, accs_short, accs_long, pass_at_k_values)
+        if score_only:
+            metric_sub_ems_short = [sub_ems_short[i] for i in scored_indices]
+            metric_sub_ems_long = [sub_ems_long[i] for i in scored_indices]
+            metric_accs_short = [accs_short[i] for i in scored_indices]
+            metric_accs_long = [accs_long[i] for i in scored_indices]
+            metric_pass_at_k_values = [pass_at_k_values[i] for i in scored_indices]
+        else:
+            metric_sub_ems_short = sub_ems_short
+            metric_sub_ems_long = sub_ems_long
+            metric_accs_short = accs_short
+            metric_accs_long = accs_long
+            metric_pass_at_k_values = pass_at_k_values
+
+        metrics = compute_aggregate_metrics_both(
+            metric_sub_ems_short,
+            metric_sub_ems_long,
+            metric_accs_short,
+            metric_accs_long,
+            metric_pass_at_k_values,
+        )
         
         # Save metrics
         metrics_file = output_dir / "metrics.json"

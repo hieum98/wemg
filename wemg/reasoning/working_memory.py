@@ -237,7 +237,7 @@ class WorkingMemory:
         return _MemoryFormatter.format_lines(self.textual_memory)
 
     async def _arun_consolidation(self, client, question: str, raw_memory: str, interaction_memory=None):
-        from wemg.llm.roles import MEMORY_CONSOLIDATOR, MemoryConsolidationInput, MemoryConsolidationOutput, MemoryItem, execute_role
+        from wemg.llm.roles import MEMORY_CONSOLIDATOR, MemoryConsolidationInput, MemoryConsolidationOutput, MemoryItem, SourceType, execute_role
 
         responses, log = await execute_role(
             client=client,
@@ -249,7 +249,7 @@ class WorkingMemory:
         )
         if not responses:
             return MemoryConsolidationOutput(
-                consolidated_memory=[MemoryItem(content=raw_memory, provenance="system_prediction")]
+                consolidated_memory=[MemoryItem(content=raw_memory, provenance=SourceType.SYSTEM_PREDICTION.value)]
             ), log
         return responses[0], log
 
