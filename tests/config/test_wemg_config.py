@@ -72,6 +72,27 @@ def test_env_api_key_fills_llm_when_yaml_null(monkeypatch, tmp_path: Path):
     assert cfg.retriever.corpus.embedder.api_key == "secret-from-env"
 
 
+def test_from_yaml_loads_api_key_from_dotenv(monkeypatch, tmp_path: Path):
+    yaml_path = tmp_path / "c.yaml"
+    yaml_path.write_text(
+        yaml.safe_dump(
+            {
+                "llm": {"model_name": "m", "url": "http://localhost/v1", "api_key": None},
+                "retriever": {"type": "corpus", "corpus": {"corpus_path": "x", "index_path": "y"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("API_KEY=secret-from-dotenv\n", encoding="utf-8")
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    cfg = WEMGConfig.from_yaml(yaml_path)
+
+    assert cfg.llm.api_key == "secret-from-dotenv"
+    assert cfg.retriever.corpus.embedder.api_key == "secret-from-dotenv"
+
+
 def test_validate_config_missing_llm_key(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

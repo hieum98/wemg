@@ -104,6 +104,7 @@ Environment variables:
 - `API_KEY`: LLM key and related embedding keys if unset in config.
 - `SERPER_API_KEY`: web search key.
 - `REDIS_PASSWORD`: Redis password.
+- A repo-level `.env` file is loaded automatically when present.
 
 ## Evaluation
 

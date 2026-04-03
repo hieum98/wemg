@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Literal, Optional
 import yaml
 from pydantic import BaseModel
 
+_DOTENV_LOADED = False
+
 
 class LLMGenerationConfig(BaseModel):
     timeout: int = 300
@@ -198,6 +200,7 @@ class WEMGConfig(BaseModel):
         path: Optional[str | Path] = None,
         overrides: Optional[List[str]] = None,
     ) -> "WEMGConfig":
+        _load_dotenv_once()
         if path is None:
             path = get_default_config_path()
         path = Path(path)
@@ -220,6 +223,7 @@ class WEMGConfig(BaseModel):
 
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "WEMGConfig":
+        _load_dotenv_once()
         _resolve_env_vars(config_dict)
         return cls.model_validate(config_dict)
 
@@ -281,6 +285,27 @@ def _resolve_env_vars(data: Dict[str, Any]) -> None:
             "cache.password",
             data.get("cache", {}).get("password") or redis_password,
         )
+
+
+def _load_dotenv_once() -> None:
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    candidate_paths = [Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"]
+    seen: set[Path] = set()
+    for dotenv_path in candidate_paths:
+        dotenv_path = dotenv_path.resolve()
+        if dotenv_path in seen or not dotenv_path.is_file():
+            continue
+        seen.add(dotenv_path)
+        load_dotenv(dotenv_path, override=False)
 
 
 def get_default_config_path() -> Path:

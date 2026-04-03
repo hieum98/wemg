@@ -35,6 +35,7 @@ Notes:
 - `--config` selects a YAML config file; otherwise the default config is used.
 - Extra `key=value` pairs are interpreted as evaluation keys or forwarded as WEMG config overrides.
 - A leading `+` on keys is accepted for compatibility.
+- A repo-level `.env` file is loaded automatically before config validation.
 
 Example with overrides:
 
