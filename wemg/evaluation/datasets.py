@@ -74,6 +74,21 @@ def _get_known_dataset(name: str):
         to_remove_columns = set(data.column_names) - {"question", "answer"}
         return data.remove_columns(list(to_remove_columns))
 
+    if key in ("webqsp_sub", "cwq_sub"):
+        rog_name = "webqsp" if "webqsp" in key else "cwq"
+        data = load_dataset(f"rmanluo/RoG-{rog_name}", split="test")
+
+        def _a_entity_in_graph(example):
+            graph_nodes = set()
+            for triple in example["graph"]:
+                graph_nodes.add(triple[0])
+                graph_nodes.add(triple[2])
+            return any(e in graph_nodes for e in (example["a_entity"] or []))
+
+        filtered = data.filter(_a_entity_in_graph, num_proc=os.cpu_count())
+        to_remove = set(filtered.column_names) - {"question", "answer"}
+        return filtered.remove_columns(list(to_remove))
+
     if key == "qald_10":
         return load_dataset("Hieuman/qald_10_en", split="train")
 
