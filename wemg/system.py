@@ -200,12 +200,23 @@ class WEMGSystem:
         )
         return Reranker(client=reranker_client, top_k=r.top_k, instruction=r.instruction)
 
-    def _create_working_memory(self) -> WorkingMemory:
+    def _create_working_memory(self, wikidata_client=None) -> WorkingMemory:
         wm_cfg = self.cfg.memory.working_memory
         return WorkingMemory(
             max_textual_memory_tokens=wm_cfg.max_textual_memory_tokens,
-            wikidata_client=self.wikidata_client,
+            wikidata_client=wikidata_client or self.wikidata_client,
             annotate_steps=wm_cfg.annotate_steps,
+        )
+
+    def _create_embed_client(self):
+        """Return an LLMClient configured for embeddings (corpus embedder settings)."""
+        from wemg.llm.client import LLMClient
+        ec = self.cfg.retriever.corpus.embedder
+        return LLMClient(
+            model_name=ec.model_name,
+            url=ec.url,
+            api_key=ec.api_key or self.cfg.llm.api_key,
+            is_embedding=True,
         )
 
 
@@ -271,7 +282,13 @@ class WEMGSystem:
                 redis_client = None
         return WikidataClient(max_wikipedia_requests_per_second=max_rps, redis_client=redis_client)
     
-    def answer(self, question: str, question_id: str = None, golden_answer: Optional[str] = None) -> AnswerResult:
+    def answer(
+        self,
+        question: str,
+        question_id: str = None,
+        golden_answer: Optional[str] = None,
+        subgraph_cache_entry: Optional[Dict[str, Any]] = None,
+    ) -> AnswerResult:
         self._initialize()
         t_answer = time.perf_counter()
         logger.info(
@@ -279,18 +296,31 @@ class WEMGSystem:
             str(question_id),
             question[:120].replace("\n", " "),
         )
-        
+
+        # Optionally override the KB client with a per-question freebase subgraph.
+        kb_client = None
+        if (
+            self.cfg.node_generation.kb_source == "freebase_subgraph"
+            and subgraph_cache_entry is not None
+        ):
+            from wemg.retrieval.graph_retriever_client import GraphRetrieverClient
+            kb_client = GraphRetrieverClient(
+                reranker=self.reranker,
+                embed_client=self._create_embed_client(),
+            )
+            kb_client.load_from_cache(subgraph_cache_entry)
+
         if self.cfg.memory.interaction_memory.scope == "dataset" and self.interaction_memory:
             interaction_memory = self.interaction_memory
         else:
             interaction_memory = self._create_interaction_memory(collection_name=question_id)
-        
+
         node_gen_kwargs = self._get_node_gen_kwargs()
         strategy = self.cfg.search.strategy
-        
+
         if strategy == "cot":
-            working_memory = self._create_working_memory()
-            result = asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            working_memory = self._create_working_memory(wikidata_client=kb_client)
+            result = asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer, wikidata_client=kb_client))
             logger.info(
                 "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
                 strategy,
@@ -299,8 +329,8 @@ class WEMGSystem:
             )
             return result
         elif strategy == "mcts":
-            working_memory = self._create_working_memory()
-            result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer))
+            working_memory = self._create_working_memory(wikidata_client=kb_client)
+            result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer, wikidata_client=kb_client))
             logger.info(
                 "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
                 strategy,
@@ -310,11 +340,11 @@ class WEMGSystem:
             return result
         raise ValueError(f"Unknown strategy: {strategy}")
     
-    async def _answer_with_cot(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer):
+    async def _answer_with_cot(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer, wikidata_client=None):
         max_depth = self.cfg.search.cot.max_depth
         terminal_content, reasoning_path, pass_at_k = await cot_search(
             question=question, client=self.client, retriever=self.retriever,
-            wikidata_client=self.wikidata_client, reranker=self.reranker,
+            wikidata_client=wikidata_client or self.wikidata_client, reranker=self.reranker,
             working_memory=working_memory, interaction_memory=interaction_memory,
             max_depth=max_depth, correct_answers=golden_answer, **kwargs,
         )
@@ -330,14 +360,14 @@ class WEMGSystem:
             working_memory=working_memory,
         )
     
-    async def _answer_with_mcts(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer):
+    async def _answer_with_mcts(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer, wikidata_client=None):
         mcts_cfg = self.cfg.search.mcts
         et = mcts_cfg.early_termination
         t_mcts = time.perf_counter()
         logger.info("PROFSTEP system stage=mcts_search_start question_id=%s", str(question_id))
         best_content, root, pass_at_k = await mcts_search(
             question=question, client=self.client, retriever=self.retriever,
-            wikidata_client=self.wikidata_client, reranker=self.reranker,
+            wikidata_client=wikidata_client or self.wikidata_client, reranker=self.reranker,
             working_memory=working_memory, interaction_memory=interaction_memory,
             num_iterations=mcts_cfg.num_iterations, max_tree_depth=mcts_cfg.max_tree_depth,
             exploration_weight=mcts_cfg.exploration_weight,
@@ -379,6 +409,7 @@ class WEMGSystem:
         questions: List[str],
         question_ids: Optional[List[str]] = None,
         golden_answers: Optional[List] = None,
+        subgraph_cache_entries: Optional[List[Optional[Dict[str, Any]]]] = None,
         max_workers: Optional[int] = None,
         **kwargs,
     ) -> List[AnswerResult]:
@@ -395,6 +426,8 @@ class WEMGSystem:
             raise ValueError("question_ids length must match questions")
         if golden_answers is not None and len(golden_answers) != n:
             raise ValueError("golden_answers length must match questions")
+        if subgraph_cache_entries is not None and len(subgraph_cache_entries) != n:
+            raise ValueError("subgraph_cache_entries length must match questions")
 
         if max_workers is None:
             max_workers = min(n, self.cfg.llm.concurrency, 8)
@@ -412,7 +445,8 @@ class WEMGSystem:
                         ga = list(ga)
                     elif not isinstance(ga, str):
                         ga = str(ga)
-            return self.answer(q, question_id=qid, golden_answer=ga, **kwargs)
+            cache_entry = subgraph_cache_entries[idx] if subgraph_cache_entries is not None else None
+            return self.answer(q, question_id=qid, golden_answer=ga, subgraph_cache_entry=cache_entry, **kwargs)
 
         results: List[Optional[AnswerResult]] = [None] * n
         with ThreadPoolExecutor(max_workers=max_workers) as executor:

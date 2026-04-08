@@ -2,7 +2,7 @@
 
 import math
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 import pydantic
 from anytree import NodeMixin, RenderTree
 
@@ -20,6 +20,7 @@ class NodeType(Enum):
     USER_QUESTION = "USER_QUESTION"
     FINAL_ANSWER = "FINAL_ANSWER"
     SUB_QA_NODE = "SUBQUESTION"
+    SUB_QA_BATCH_NODE = "SUBQUESTION_BATCH"
     REPHRASED_QUESTION_NODE = "REPHRASE_QUESTION"
     SELF_CORRECTED_NODE = "SELF_CORRECT"
     SYNTHESIS_NODE = "SYNTHESIS"
@@ -27,7 +28,7 @@ class NodeType(Enum):
 
 class NodeState(pydantic.BaseModel):
     node_type: NodeType
-    content: Dict[str, str]
+    content: Dict[str, Any]
     
     @pydantic.model_validator(mode='after')
     def check_content(self) -> 'NodeState':
@@ -35,6 +36,7 @@ class NodeState(pydantic.BaseModel):
         validators = {
             NodeType.FINAL_ANSWER: lambda c: 'final_answer' in c,
             NodeType.SUB_QA_NODE: lambda c: 'sub_question' in c and 'sub_answer' in c,
+            NodeType.SUB_QA_BATCH_NODE: lambda c: 'sub_questions' in c and 'sub_answers' in c,
             NodeType.REPHRASED_QUESTION_NODE: lambda c: 'sub_question' in c,
             NodeType.SELF_CORRECTED_NODE: lambda c: 'sub_question' in c and 'sub_answer' in c,
             NodeType.SYNTHESIS_NODE: lambda c: 'synthesized_reasoning' in c,
@@ -49,6 +51,10 @@ class NodeState(pydantic.BaseModel):
         formatters = {
             NodeType.FINAL_ANSWER: lambda: f"Final Answer: {c['final_answer']}" + (f"\nReasoning: {c['reasoning']}" if 'reasoning' in c else ""),
             NodeType.SUB_QA_NODE: lambda: f"Sub Question: {c['sub_question']}\nSub Answer: {c['sub_answer']}" + (f"\nReasoning: {c['reasoning']}" if 'reasoning' in c else ""),
+            NodeType.SUB_QA_BATCH_NODE: lambda: '\n'.join(
+                f"Sub Question {i+1}: {q}\nSub Answer {i+1}: {a}"
+                for i, (q, a) in enumerate(zip(c.get('sub_questions', []), c.get('sub_answers', [])))
+            ),
             NodeType.REPHRASED_QUESTION_NODE: lambda: f"Rephrased Question: {c['sub_question']}",
             NodeType.SELF_CORRECTED_NODE: lambda: f"Sub Question: {c['sub_question']}\nSub Answer: {c['sub_answer']}" + (f"\nReasoning: {c['reasoning']}" if 'reasoning' in c else ""),
             NodeType.SYNTHESIS_NODE: lambda: c['synthesized_reasoning'],
@@ -111,7 +117,7 @@ class ReasoningNode(NodeMixin):
         trajectory = self.get_trajectory()
         parts = []
         for node in trajectory:
-            if node.node_type in [NodeType.SUB_QA_NODE, NodeType.SYNTHESIS_NODE]:
+            if node.node_type in [NodeType.SUB_QA_NODE, NodeType.SUB_QA_BATCH_NODE, NodeType.SYNTHESIS_NODE]:
                 parts.append(str(node))
             elif node.node_type == NodeType.SELF_CORRECTED_NODE and parts:
                 parts[-1] += f"\nSelf Corrected: {str(node)}"
@@ -153,6 +159,12 @@ class ReasoningNode(NodeMixin):
             if data.get("reasoning"):
                 parts.append(f"Reasoning: {data['reasoning']}")
             detail = " | ".join(parts)
+        elif self.node_type == NodeType.SUB_QA_BATCH_NODE:
+            pairs = [
+                f"Sub_Q{i+1}: {q} | Sub_A{i+1}: {a}"
+                for i, (q, a) in enumerate(zip(data.get('sub_questions', []), data.get('sub_answers', [])))
+            ]
+            detail = " || ".join(pairs)
         elif self.node_type == NodeType.REPHRASED_QUESTION_NODE:
             detail = f"Rephrase: {data.get('sub_question', '')}"
         elif self.node_type == NodeType.SELF_CORRECTED_NODE:
@@ -172,7 +184,9 @@ class ReasoningNode(NodeMixin):
 
     def _stable_id(self) -> str:
         """Stable identifier based on node type and content, depth-agnostic."""
-        key = (self.node_type.value, tuple(sorted(self.node_state.content.items())))
+        def _make_hashable(v):
+            return tuple(v) if isinstance(v, list) else v
+        key = (self.node_type.value, tuple(sorted((k, _make_hashable(v)) for k, v in self.node_state.content.items())))
         return f"{hash(key)}-{self.node_type.value}"
 
     def print_tree(self) -> None:
@@ -188,6 +202,7 @@ class ReasoningNode(NodeMixin):
             NodeType.FINAL_ANSWER: Fore.BLUE,
             NodeType.SELF_CORRECTED_NODE: Fore.MAGENTA,
             NodeType.SUB_QA_NODE: Fore.CYAN,
+            NodeType.SUB_QA_BATCH_NODE: Fore.CYAN,
             NodeType.SYNTHESIS_NODE: Fore.RED,
         }
 
@@ -262,6 +277,7 @@ class CoTNode(ReasoningNode):
 
 _MEMORY_NODE_TYPES = frozenset({
     NodeType.SUB_QA_NODE,
+    NodeType.SUB_QA_BATCH_NODE,
     NodeType.SELF_CORRECTED_NODE,
     NodeType.FINAL_ANSWER,
     NodeType.SYNTHESIS_NODE,
@@ -304,4 +320,14 @@ def make_subqa_state(user_question: str, sub_question: str, answer) -> NodeState
         "sub_question": sub_question,
         "sub_answer": answer.answer,
         "reasoning": answer.reasoning,
+    })
+
+
+def make_subqa_batch_state(user_question: str, sub_questions: List[str], answers: list) -> NodeState:
+    """Build a SUB_QA_BATCH_NODE NodeState from multiple sub-questions and their answer objects."""
+    return NodeState(node_type=NodeType.SUB_QA_BATCH_NODE, content={
+        "user_question": user_question,
+        "sub_questions": sub_questions,
+        "sub_answers": [a.answer for a in answers],
+        "reasonings": [a.reasoning for a in answers],
     })

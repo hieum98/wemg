@@ -80,6 +80,8 @@ node_generation:
   triple_pruning_top_k: 128
   azure_endpoint: null
   azure_key: null
+  kb_source: wikidata
+  freebase_subgraph_cache: null
 
 memory:
   working_memory:

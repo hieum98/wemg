@@ -231,7 +231,8 @@ class WikidataPathBetweenEntities(pydantic.BaseModel):
 # ---------------------------------------------------------------------------
 
 WIKIDATA_SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
-USER_AGENT = "WEMG/0.2.0"
+random_str = lambda n: "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=5)) # for user agent uniqueness to help with Wikidata rate limits (this is just a best effort and does not guarantee avoiding rate limits, but can help a bit by making it less likely to be identified as a single client across multiple runs)
+USER_AGENT = f"WEMG/0.2.0.{os.uname().nodename}.{random_str(10)}"
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2
 LIMIT_PER_QUERY = 100

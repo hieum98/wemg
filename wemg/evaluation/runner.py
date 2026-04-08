@@ -94,6 +94,57 @@ def _save_question_artifacts(
     return out
 
 
+def _load_freebase_subgraph_cache_index(cache_root: Path) -> Dict[str, str]:
+    """Load question -> entry_path map from split cache index.jsonl."""
+    index_path = cache_root / "index.jsonl"
+    if not cache_root.is_dir() or not index_path.is_file():
+        raise ValueError(
+            "freebase_subgraph cache must be a directory with index.jsonl "
+            f"(got: {cache_root})"
+        )
+
+    out: Dict[str, str] = {}
+    with open(index_path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                logger.warning("Invalid cache index JSON at line %d in %s", line_no, index_path)
+                continue
+            question = row.get("question")
+            entry_path = row.get("entry_path")
+            if not question or not entry_path:
+                logger.warning(
+                    "Skipping malformed cache index row at line %d in %s",
+                    line_no,
+                    index_path,
+                )
+                continue
+            out[str(question)] = str(entry_path)
+    return out
+
+
+def _load_freebase_subgraph_cache_entry(cache_root: Path, entry_relpath: str) -> Optional[Dict[str, Any]]:
+    """Load one split cache entry JSON by index-relative path."""
+    entry_path = cache_root / entry_relpath
+    if not entry_path.is_file():
+        logger.warning("Subgraph cache entry not found: %s", entry_path)
+        return None
+    try:
+        with open(entry_path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        logger.warning("Could not load subgraph cache entry %s: %s", entry_path, e)
+        return None
+    if not isinstance(payload, dict):
+        logger.warning("Subgraph cache entry is not a JSON object: %s", entry_path)
+        return None
+    return payload
+
+
 class DatasetEvaluator:
     """Evaluates WEMG on datasets with resume support."""
     
@@ -171,6 +222,35 @@ class DatasetEvaluator:
             predictions_short[q] = entry.get("predicted_answer", "")
             predictions_long[q] = entry.get("full_answer", "")
         
+        # ------------------------------------------------------------------
+        # Load subgraph cache (freebase_subgraph mode only)
+        # ------------------------------------------------------------------
+        subgraph_cache_index_by_question: Dict[str, str] = {}
+        subgraph_cache_entry_by_relpath: Dict[str, Dict[str, Any]] = {}
+        subgraph_cache_root: Optional[Path] = None
+        _ng = getattr(getattr(self.system, "cfg", None), "node_generation", None)
+        _kb_source = getattr(_ng, "kb_source", "wikidata")
+        _cache_path = getattr(_ng, "freebase_subgraph_cache", None)
+
+        if _kb_source == "freebase_subgraph":
+            if not _cache_path:
+                raise ValueError(
+                    "kb_source=freebase_subgraph requires node_generation.freebase_subgraph_cache "
+                    "to point to a split cache directory"
+                )
+            subgraph_cache_root = Path(_cache_path)
+            if subgraph_cache_root.is_file():
+                raise ValueError(
+                    "Monolithic JSONL cache is no longer supported for freebase_subgraph evaluation. "
+                    "Please migrate to split cache directory format (index.jsonl + entries/*.json)."
+                )
+            subgraph_cache_index_by_question = _load_freebase_subgraph_cache_index(subgraph_cache_root)
+            logger.info(
+                "Loaded freebase_subgraph cache index with %d entries from %s",
+                len(subgraph_cache_index_by_question),
+                subgraph_cache_root,
+            )
+
         pending: List[tuple] = []
         scored_indices: List[int] = []
         matched_by_question = 0
@@ -210,7 +290,8 @@ class DatasetEvaluator:
                 pass_at_k_values[i] = entry.get("pass_at_k")
             else:
                 if not score_only:
-                    pending.append((i, question, correct))
+                    cache_entry_relpath = subgraph_cache_index_by_question.get(question)
+                    pending.append((i, question, correct, cache_entry_relpath))
 
         if score_only:
             if not completed_rows:
@@ -249,12 +330,13 @@ class DatasetEvaluator:
                 f.flush()
         
         def process_answer_results(
-            batch: List[Tuple[int, str, Any]],
+            batch: List[tuple],
             results: List,
         ) -> List[Dict[str, Any]]:
             """Build log entries and update sub_ems / predictions for one answer_batch."""
             out: List[Dict[str, Any]] = []
-            for (i, question, correct), result in zip(batch, results):
+            for pending_item, result in zip(batch, results):
+                i, question, correct = pending_item[0], pending_item[1], pending_item[2]
                 err = result.metadata.get("error") if result.metadata else None
                 if err:
                     logger.error(f"Error processing question {i}: {err}")
@@ -359,8 +441,24 @@ class DatasetEvaluator:
                     qids = [str(p[0]) for p in batch]
                     golds = [
                         list(c) if isinstance(c, (list, tuple)) else (c if isinstance(c, str) else str(c))
-                        for _, _, c in batch
+                        for _, _, c, *_ in batch
                     ]
+                    cache_entry_relpaths = [p[3] if len(p) > 3 else None for p in batch]
+                    cache_entries: List[Optional[Dict[str, Any]]] = []
+                    for relpath in cache_entry_relpaths:
+                        if not relpath or subgraph_cache_root is None:
+                            cache_entries.append(None)
+                            continue
+                        loaded_entry = subgraph_cache_entry_by_relpath.get(relpath)
+                        if loaded_entry is None:
+                            loaded_entry = _load_freebase_subgraph_cache_entry(
+                                subgraph_cache_root,
+                                relpath,
+                            )
+                            if loaded_entry is not None:
+                                subgraph_cache_entry_by_relpath[relpath] = loaded_entry
+                        cache_entries.append(loaded_entry)
+                    use_cache = any(e is not None for e in cache_entries)
                     mw = max_concurrent
                     if mw is not None:
                         mw = max(1, min(mw, len(batch)))
@@ -377,6 +475,7 @@ class DatasetEvaluator:
                         questions,
                         question_ids=qids,
                         golden_answers=golds,
+                        subgraph_cache_entries=cache_entries if use_cache else None,
                         max_workers=mw,
                     )
                     logger.info(

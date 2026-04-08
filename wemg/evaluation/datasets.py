@@ -86,7 +86,7 @@ def _get_known_dataset(name: str):
             return any(e in graph_nodes for e in (example["a_entity"] or []))
 
         filtered = data.filter(_a_entity_in_graph, num_proc=os.cpu_count())
-        to_remove = set(filtered.column_names) - {"question", "answer"}
+        to_remove = set(filtered.column_names) - {"question", "answer", "graph", "q_entity"}
         return filtered.remove_columns(list(to_remove))
 
     if key == "qald_10":

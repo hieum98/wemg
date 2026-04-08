@@ -298,7 +298,7 @@ class NodeGenerator:
         triples, prune_log = await self._prune_triples(question, triples)
         entities = list(set(entities + self._collect_entities_from_triples(triples)))
 
-        assert self.wikidata_client is not None and isinstance(self.wikidata_client, WikidataClient), "WikidataClient must be provided"
+        assert self.wikidata_client is not None, "WikidataClient must be provided"
         all_entities = [self.working_memory.entity_dict.get(e.qid) if self.working_memory.entity_dict.get(e.qid) else e 
                         for e in entities]
         t0 = time.perf_counter()
@@ -367,7 +367,7 @@ class NodeGenerator:
         entity_linking_method = self.kwargs.get('entity_linking_method', 'llm')
         top_k_entities = self.kwargs.get('top_k_entities', 1)
         n_hops = self.kwargs.get('n_hops', 1)
-        assert self.wikidata_client is not None and isinstance(self.wikidata_client, WikidataClient), "WikidataClient must be provided"
+        assert self.wikidata_client is not None, "WikidataClient must be provided"
 
         known_entities = filter_entities_relevant_to_text(
             [e for e in self.working_memory.entity_dict.values() if isinstance(e, WikidataEntity)],

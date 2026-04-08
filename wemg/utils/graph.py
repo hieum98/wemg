@@ -11,10 +11,10 @@ import networkx as nx
 
 def get_node_id(entity: Any) -> str:
     """Get a string ID for an entity. Uses .qid for WikidataEntity, .id for Entity, else str()."""
-    if hasattr(entity, "qid"):
+    if hasattr(entity, "qid") and entity.qid:
         return entity.qid
-    elif hasattr(entity, "id"):
-        return str(entity.id) if entity.id else str(entity)
+    elif hasattr(entity, "id") and entity.id:
+        return str(entity.id)
     return str(entity)
 
 

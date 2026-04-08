@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 import yaml
 from pydantic import BaseModel
 
-_DOTENV_LOADED = False
+_DOTENV_LOADED_PATHS: set = set()
 
 
 class LLMGenerationConfig(BaseModel):
@@ -116,6 +116,8 @@ class NodeGenerationConfig(BaseModel):
     rerank_kb_documents: bool = True
     triple_pruning_delta: float = 0.05
     triple_pruning_top_k: int = 64
+    kb_source: Literal["wikidata", "freebase_subgraph"] = "wikidata"
+    freebase_subgraph_cache: Optional[str] = None
 
 
 class WorkingMemoryConfig(BaseModel):
@@ -288,23 +290,17 @@ def _resolve_env_vars(data: Dict[str, Any]) -> None:
 
 
 def _load_dotenv_once() -> None:
-    global _DOTENV_LOADED
-    if _DOTENV_LOADED:
-        return
-    _DOTENV_LOADED = True
-
     try:
         from dotenv import load_dotenv
     except ImportError:
         return
 
     candidate_paths = [Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"]
-    seen: set[Path] = set()
     for dotenv_path in candidate_paths:
         dotenv_path = dotenv_path.resolve()
-        if dotenv_path in seen or not dotenv_path.is_file():
+        if dotenv_path in _DOTENV_LOADED_PATHS or not dotenv_path.is_file():
             continue
-        seen.add(dotenv_path)
+        _DOTENV_LOADED_PATHS.add(dotenv_path)
         load_dotenv(dotenv_path, override=False)
 
 

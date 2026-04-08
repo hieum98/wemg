@@ -171,6 +171,38 @@ def test_validate_config_azure_entity_linking(monkeypatch, tmp_path: Path):
     assert any("azure" in e.lower() for e in errs)
 
 
+def test_node_generation_defaults_include_kb_source(wemg_config_path: Path):
+    """kb_source defaults to 'wikidata' and freebase_subgraph_cache to None."""
+    cfg = WEMGConfig.from_yaml(wemg_config_path)
+    assert cfg.node_generation.kb_source == "wikidata"
+    assert cfg.node_generation.freebase_subgraph_cache is None
+
+
+def test_node_generation_kb_source_override(wemg_config_path: Path):
+    cfg = WEMGConfig.from_yaml(
+        wemg_config_path,
+        overrides=["node_generation.kb_source=freebase_subgraph"],
+    )
+    assert cfg.node_generation.kb_source == "freebase_subgraph"
+
+
+def test_node_generation_freebase_subgraph_cache_override(wemg_config_path: Path):
+    cfg = WEMGConfig.from_yaml(
+        wemg_config_path,
+        overrides=["node_generation.freebase_subgraph_cache=./cache/test.jsonl"],
+    )
+    assert cfg.node_generation.freebase_subgraph_cache == "./cache/test.jsonl"
+
+
+def test_node_generation_kb_source_invalid_value_rejected(wemg_config_path: Path):
+    """Unknown kb_source values must raise a validation error."""
+    with pytest.raises(Exception):
+        WEMGConfig.from_yaml(
+            wemg_config_path,
+            overrides=["node_generation.kb_source=unknown_kb"],
+        )
+
+
 def test_wemg_system_rejects_invalid_config(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

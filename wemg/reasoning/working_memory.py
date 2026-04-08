@@ -531,7 +531,21 @@ class WorkingMemory:
             relation_label = str(triple.relation) if triple.relation else None
         elif isinstance(triple, WikiTriple):
             subject = self.add_node_to_graph_memory(triple.subject) if isinstance(triple.subject, WikidataEntity) else None
-            object_ = self.add_node_to_graph_memory(triple.object) if isinstance(triple.object, WikidataEntity) else None
+            if isinstance(triple.object, WikidataEntity):
+                object_ = self.add_node_to_graph_memory(triple.object)
+            elif triple.object is not None:
+                # Scalar literal (date, number, string) — store as a string-only node.
+                # Node key = scalar_str; get_node_id will recover it via str(entity) -> entity.name.
+                scalar_str = str(triple.object).strip()
+                if scalar_str:
+                    node_data = OpenIEEntity(id=None, name=scalar_str, description=None)
+                    if not self.graph_memory.has_node(scalar_str):
+                        self.graph_memory.add_node(scalar_str, data=node_data)
+                    object_ = node_data
+                else:
+                    object_ = None
+            else:
+                object_ = None
             if isinstance(triple.relation, WikidataProperty):
                 relation_label = triple.relation.label
         else:

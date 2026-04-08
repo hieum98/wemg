@@ -1,11 +1,12 @@
 """Chain-of-Thought reasoning."""
 
+import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
 from wemg.reasoning.nodes import (
     CoTNode, NodeType, NodeState,
-    make_final_answer_state, make_subqa_state,
+    make_final_answer_state, make_subqa_state, make_subqa_batch_state,
     add_node_content_to_memory,
 )
 from wemg.reasoning.generator import NodeGenerator, GenerationResult, merge_logs
@@ -26,13 +27,17 @@ async def generate_next_step(
     if current.depth > current.max_depth:
         node, result = await _generate_final_answer(current, generator)
     else:
-        node, result = await _generate_subqa(current, generator)
-    
+        node, result = await _generate_subqa_batch(current, generator)
+        if node is None:
+            if result:
+                log_to_interaction_memory(interaction_memory, result.log_data)
+            node, result = await _generate_final_answer(current, generator)
+
     if node and result:
         generator.update_working_memory(result, hop_depth=current.depth + 1)
         add_node_content_to_memory(node, working_memory)
         log_to_interaction_memory(interaction_memory, result.log_data)
-    
+
     return node
 
 
@@ -49,29 +54,58 @@ async def _generate_final_answer(current: CoTNode, gen: NodeGenerator) -> Tuple[
     return node, result
 
 
-async def _generate_subqa(current: CoTNode, gen: NodeGenerator) -> Tuple[Optional[CoTNode], GenerationResult]:
-    intermediate = current.node_state.content.get('sub_answer') if current.node_type == NodeType.SUB_QA_NODE else None
-    subquestions, should_direct, subq_log = await gen.generate_subquestion(current.user_question, intermediate_answer=intermediate)
-    
+async def _generate_subqa_batch(
+    current: CoTNode, gen: NodeGenerator
+) -> Tuple[Optional[CoTNode], GenerationResult]:
+    """Answer all subquestions from one generate_subquestion call in parallel.
+
+    Returns (batch_node, merged_result) on success, or (None, result) as a
+    fallback signal — caller will invoke _generate_final_answer instead.
+    """
+    if current.node_type == NodeType.SUB_QA_BATCH_NODE:
+        sub_answers = current.node_state.content.get('sub_answers', [])
+        intermediate = '\n'.join(sub_answers) if sub_answers else None
+    elif current.node_type == NodeType.SUB_QA_NODE:
+        intermediate = current.node_state.content.get('sub_answer')
+    else:
+        intermediate = None
+
+    subquestions, should_direct, subq_log = await gen.generate_subquestion(
+        current.user_question, intermediate_answer=intermediate
+    )
+
     if should_direct or not subquestions:
-        node, result = await _generate_final_answer(current, gen)
-        if result:
-            result.log_data = merge_logs(subq_log, result.log_data)
-        return node, result
-    
-    subquestion = subquestions[0]
-    result = await gen.generate_answer(subquestion, should_explore=True)
-    
-    if not result.answers:
-        return None, result
-    
+        return None, GenerationResult(log_data=subq_log)
+
+    # Answer all subquestions in parallel
+    results: List[GenerationResult] = await asyncio.gather(
+        *[gen.generate_answer(sq, should_explore=True) for sq in subquestions]
+    )
+
+    # Filter out failures
+    valid_pairs = [(sq, r) for sq, r in zip(subquestions, results) if r.answers]
+    if not valid_pairs:
+        return None, GenerationResult(log_data=subq_log)
+
+    valid_subqs = [sq for sq, _ in valid_pairs]
+    valid_results = [r for _, r in valid_pairs]
+
     node = CoTNode(
-        node_state=make_subqa_state(current.user_question, subquestion, result.answers[0]),
+        node_state=make_subqa_batch_state(
+            current.user_question, valid_subqs, [r.answers[0] for r in valid_results]
+        ),
         parent=current,
         max_depth=current.max_depth,
     )
-    result.log_data = merge_logs(subq_log, result.log_data)
-    return node, result
+
+    merged = GenerationResult(
+        answers=[r.answers[0] for r in valid_results],
+        retrieved_triples=[t for r in valid_results for t in r.retrieved_triples],
+        retrieved_entities=[e for r in valid_results for e in r.retrieved_entities],
+        information_items=[item for r in valid_results for item in r.information_items],
+        log_data=merge_logs(subq_log, *[r.log_data for r in valid_results]),
+    )
+    return node, merged
 
 
 async def cot_search(
@@ -129,6 +163,12 @@ def cot_get_answer(terminal_content: Optional[Dict], reasoning_path: List[CoTNod
             c = node.node_state.content
             if node.node_type == NodeType.SUB_QA_NODE:
                 steps.append(f"Q: {c.get('sub_question', 'N/A')}\nA: {c.get('sub_answer', 'N/A')}")
+            elif node.node_type == NodeType.SUB_QA_BATCH_NODE:
+                pairs = '\n'.join(
+                    f"Q: {q}\nA: {a}"
+                    for q, a in zip(c.get('sub_questions', []), c.get('sub_answers', []))
+                )
+                steps.append(pairs)
             elif node.node_type == NodeType.FINAL_ANSWER:
                 steps.append(f"Final Answer: {c.get('final_answer', 'N/A')}")
         full = '\n'.join(f"{i}. {s}" for i, s in enumerate(steps, 1))
