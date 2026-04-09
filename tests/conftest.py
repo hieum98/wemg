@@ -19,6 +19,7 @@ def pytest_configure(config):
         ("requires_redis", "needs reachable Redis for LLM cache"),
         ("requires_corpus", "needs corpus_path + FAISS index on disk"),
         ("requires_wikidata", "needs live Wikidata/Wikipedia APIs"),
+        ("requires_freebase", "needs live Freebase SPARQL endpoint"),
         ("requires_web_search", "needs web search (Serper or DDG)"),
         ("requires_reranker", "needs rerank HTTP endpoint from config"),
         ("slow_integration", "long-running real-system flows"),

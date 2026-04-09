@@ -367,7 +367,8 @@ class InteractionMemory:
             if count == 0:
                 self._role_count_cache[role] = 0
             return count
-        except Exception:
+        except Exception as e:
+            logger.warning("Role count lookup failed for %s; falling back to count=1: %s", role, e)
             return 1
 
     def get_examples(

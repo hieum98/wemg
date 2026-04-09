@@ -304,6 +304,7 @@ def _process_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
             text_lower = text.lower()
             for label, qid_cand in entity_to_qid.items():
                 if label.lower() == text_lower:
+                    logger.warning("Case-insensitive entity lookup fallback used for %r -> %s.", text, qid_cand)
                     q_entity_qids.append(qid_cand)
                     break
 

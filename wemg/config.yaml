@@ -82,6 +82,9 @@ node_generation:
   azure_key: null
   kb_source: wikidata
   freebase_subgraph_cache: null
+  freebase_sparql_url: "http://n0387:3001/sparql"
+  freebase_qid_to_mid_map_path: /home/hieum/uonlp/wemg/data/freebase/qid_to_mid.json
+  freebase_qid_to_mid_candidates: 5
 
 memory:
   working_memory:

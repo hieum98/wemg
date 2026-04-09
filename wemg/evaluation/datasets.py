@@ -42,6 +42,43 @@ def _is_hf_dataset_dir(path: Path) -> bool:
     return (path / "dataset_info.json").exists() or (path / "state.json").exists()
 
 
+def _get_local_grailqa_dev_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "GrailQA_v1.0" / "grailqa_v1.0_dev.json"
+
+
+def _extract_grailqa_answers(raw_answer) -> list[str]:
+    values: list[str] = []
+
+    if isinstance(raw_answer, dict):
+        entity_name = raw_answer.get("entity_name")
+        if isinstance(entity_name, str) and entity_name.strip():
+            values.append(entity_name.strip())
+        elif isinstance(entity_name, list):
+            values.extend(
+                item.strip()
+                for item in entity_name
+                if isinstance(item, str) and item.strip()
+            )
+        answer_argument = raw_answer.get("answer_argument")
+        if isinstance(answer_argument, str) and answer_argument.strip():
+            values.append(answer_argument.strip())
+
+    elif isinstance(raw_answer, list):
+        for item in raw_answer:
+            if not isinstance(item, dict):
+                continue
+            entity_name = item.get("entity_name")
+            if isinstance(entity_name, str) and entity_name.strip():
+                values.append(entity_name.strip())
+                continue
+            answer_argument = item.get("answer_argument")
+            if isinstance(answer_argument, str) and answer_argument.strip():
+                values.append(answer_argument.strip())
+
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(values))
+
+
 def _get_known_dataset(name: str):
     """Load and preprocess known evaluation datasets (aligned with main ``evaluate.py``)."""
     from datasets import load_dataset
@@ -95,15 +132,26 @@ def _get_known_dataset(name: str):
     if key == "hotpotqa_adv":
         return load_dataset("Hieuman/Hotpotqa-adv", split="train")
 
-    if key == "grail_qa":
-        data = load_dataset("Hieuman/grail_qa", split="validation")
+    if key in ("grail_qa", "grailqa"):
+        local_dev_path = _get_local_grailqa_dev_path()
+        if local_dev_path.exists():
+            logger.info("Loading GrailQA dev set from local path: %s", local_dev_path)
+            data = load_dataset("json", data_files=str(local_dev_path), split="train")
+        else:
+            logger.warning(
+                "Local GrailQA dev set not found at %s; falling back to HuggingFace dataset.",
+                local_dev_path,
+            )
+            data = load_dataset("Hieuman/grail_qa", split="validation")
+
         data = data.map(
             lambda x: {
                 "question": x["question"],
-                "answer": x["answer"].get("entity_name", []),
+                "answer": _extract_grailqa_answers(x.get("answer")),
+                "level": x.get("level", "unknown"),  # "i.i.d.", "compositional", "zero-shot"
             }
         )
-        to_remove_columns = set(data.column_names) - {"question", "answer"}
+        to_remove_columns = set(data.column_names) - {"question", "answer", "level"}
         return data.remove_columns(list(to_remove_columns))
 
     # Text QA datasets

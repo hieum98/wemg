@@ -163,6 +163,7 @@ class DatasetEvaluator:
         score_only: bool = False,
         question_column: str = "question",
         answer_column: str = "answer",
+        level_column: str = "level",
         max_concurrent: Optional[int] = None,
         log_batch_size: Optional[int] = None,
         clear_kb_cache_every_n_batches: Optional[int] = 1,
@@ -214,6 +215,7 @@ class DatasetEvaluator:
         accs_short: List[Optional[float]] = [None] * n
         accs_long: List[Optional[float]] = [None] * n
         pass_at_k_values: List[Optional[int]] = [None] * n
+        levels: List[str] = ["unknown"] * n
         predictions_short: Dict[str, str] = {}
         predictions_long: Dict[str, str] = {}
         
@@ -258,6 +260,8 @@ class DatasetEvaluator:
         for i, example in enumerate(dataset):
             question = example[question_column]
             correct = example[answer_column]
+            level = example.get(level_column, "unknown") if hasattr(example, "get") else "unknown"
+            levels[i] = level
             entry = completed.get(question)
             if entry is not None:
                 matched_by_question += 1
@@ -291,7 +295,7 @@ class DatasetEvaluator:
             else:
                 if not score_only:
                     cache_entry_relpath = subgraph_cache_index_by_question.get(question)
-                    pending.append((i, question, correct, cache_entry_relpath))
+                    pending.append((i, question, correct, cache_entry_relpath, level))
 
         if score_only:
             if not completed_rows:
@@ -337,6 +341,7 @@ class DatasetEvaluator:
             out: List[Dict[str, Any]] = []
             for pending_item, result in zip(batch, results):
                 i, question, correct = pending_item[0], pending_item[1], pending_item[2]
+                level = pending_item[4] if len(pending_item) > 4 else "unknown"
                 err = result.metadata.get("error") if result.metadata else None
                 if err:
                     logger.error(f"Error processing question {i}: {err}")
@@ -350,6 +355,7 @@ class DatasetEvaluator:
                         "acc_short": None,
                         "acc_long": None,
                         "pass_at_k": None,
+                        "level": level,
                         "error": str(err),
                     }
                     try:
@@ -379,6 +385,7 @@ class DatasetEvaluator:
                             "pass_at_k": pass_at_k,
                             "acc_short": None,
                             "acc_long": None,
+                            "level": level,
                         }
                         try:
                             entry["artifacts"] = _save_question_artifacts(artifacts_root, i, question, result)
@@ -402,6 +409,7 @@ class DatasetEvaluator:
                             "acc_short": None,
                             "acc_long": None,
                             "pass_at_k": None,
+                            "level": level,
                             "error": str(e),
                         }
                         try:
@@ -588,19 +596,21 @@ class DatasetEvaluator:
                 acc_progress.close()
         
         # Compute aggregate metrics for both short and long answers
-        from wemg.evaluation.metrics import compute_aggregate_metrics_both
+        from wemg.evaluation.metrics import compute_aggregate_metrics_both, compute_aggregate_metrics_by_level
         if score_only:
             metric_sub_ems_short = [sub_ems_short[i] for i in scored_indices]
             metric_sub_ems_long = [sub_ems_long[i] for i in scored_indices]
             metric_accs_short = [accs_short[i] for i in scored_indices]
             metric_accs_long = [accs_long[i] for i in scored_indices]
             metric_pass_at_k_values = [pass_at_k_values[i] for i in scored_indices]
+            metric_levels = [levels[i] for i in scored_indices]
         else:
             metric_sub_ems_short = sub_ems_short
             metric_sub_ems_long = sub_ems_long
             metric_accs_short = accs_short
             metric_accs_long = accs_long
             metric_pass_at_k_values = pass_at_k_values
+            metric_levels = levels
 
         metrics = compute_aggregate_metrics_both(
             metric_sub_ems_short,
@@ -609,6 +619,17 @@ class DatasetEvaluator:
             metric_accs_long,
             metric_pass_at_k_values,
         )
+
+        # Per-level breakdown (populated when level field is present, e.g. GrailQA)
+        if any(l != "unknown" for l in metric_levels):
+            metrics["by_level"] = compute_aggregate_metrics_by_level(
+                metric_sub_ems_short,
+                metric_sub_ems_long,
+                metric_accs_short,
+                metric_accs_long,
+                metric_levels,
+                metric_pass_at_k_values,
+            )
         
         # Save metrics
         metrics_file = output_dir / "metrics.json"

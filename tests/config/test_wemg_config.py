@@ -194,6 +194,18 @@ def test_node_generation_freebase_subgraph_cache_override(wemg_config_path: Path
     assert cfg.node_generation.freebase_subgraph_cache == "./cache/test.jsonl"
 
 
+def test_node_generation_freebase_qid_to_mid_overrides(wemg_config_path: Path):
+    cfg = WEMGConfig.from_yaml(
+        wemg_config_path,
+        overrides=[
+            "node_generation.freebase_qid_to_mid_map_path=./cache/qid2mid.json",
+            "node_generation.freebase_qid_to_mid_candidates=9",
+        ],
+    )
+    assert cfg.node_generation.freebase_qid_to_mid_map_path == "./cache/qid2mid.json"
+    assert cfg.node_generation.freebase_qid_to_mid_candidates == 9
+
+
 def test_node_generation_kb_source_invalid_value_rejected(wemg_config_path: Path):
     """Unknown kb_source values must raise a validation error."""
     with pytest.raises(Exception):

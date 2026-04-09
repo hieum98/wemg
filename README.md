@@ -106,6 +106,71 @@ Environment variables:
 - `REDIS_PASSWORD`: Redis password.
 - A repo-level `.env` file is loaded automatically when present.
 
+## Self-hosted Wikidata endpoint (recommended)
+
+For large retrieval workloads (or conversion scripts that map Freebase IDs to Wikidata IDs), use a local SPARQL endpoint instead of the public Wikidata Query Service.
+
+References:
+
+- qEndpoint Wikidata image: <https://github.com/the-qa-company/qEndpoint#qacompanyqendpoint-wikidata>
+- Freebase/Wikidata conversion notebook: <https://github.com/yuancu/freebase-wikidata-convert/blob/main/conversion.ipynb>
+
+### 1. Start a local Wikidata endpoint with Docker
+
+Truthy dump (smaller):
+
+```bash
+docker run -p 1234:1234 --name qendpoint-wikidata --env MEM_SIZE=6G qacompany/qendpoint-wikidata
+```
+
+Full Wikidata dump (larger):
+
+```bash
+docker run -p 1234:1234 --name qendpoint-wikidata --env MEM_SIZE=10G --env HDT_BASE=wikidata_all qacompany/qendpoint-wikidata
+```
+
+Notes:
+
+- Keep `MEM_SIZE >= 6G` for truthy and `>= 10G` for full dumps.
+- First startup can take a long time because the HDT index is downloaded and initialized.
+- Disk usage is large; plan capacity before running.
+
+### 2. Verify endpoint is reachable
+
+```bash
+curl -H 'Accept: application/sparql-results+json' \
+  http://localhost:1234/api/endpoint/sparql \
+  --data-urlencode 'query=SELECT * WHERE { ?s ?p ?o } LIMIT 5'
+```
+
+The qEndpoint web UI is available at <http://localhost:1234>.
+
+### 3. Use local endpoint in conversion scripts
+
+The conversion flow in `freebase-wikidata-convert/conversion.ipynb` initializes:
+
+```python
+EntityConverter("http://localhost:1234/api/endpoint/sparql")
+```
+
+This is strongly recommended for bulk Freebase→Wikidata ID conversion. The public endpoint (`https://query.wikidata.org/sparql`) is much slower and may rate-limit large jobs.
+
+### 4. Point WEMG retrieval to local endpoint (optional)
+
+Current Wikidata SPARQL requests in WEMG default to the public endpoint constant in `wemg/retrieval/wikidata.py`.
+
+If you want WEMG itself to query your local qEndpoint instance, update that endpoint to:
+
+```text
+http://localhost:1234/api/endpoint/sparql
+```
+
+After changing it, run tests:
+
+```bash
+conda run -n wemg pytest tests/retrieval/test_wikidata.py
+```
+
 ## Evaluation
 
 Run evaluation:

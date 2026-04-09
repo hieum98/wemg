@@ -1,9 +1,12 @@
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
+import logging
 
 import yaml
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 _DOTENV_LOADED_PATHS: set = set()
 
@@ -116,8 +119,11 @@ class NodeGenerationConfig(BaseModel):
     rerank_kb_documents: bool = True
     triple_pruning_delta: float = 0.05
     triple_pruning_top_k: int = 64
-    kb_source: Literal["wikidata", "freebase_subgraph"] = "wikidata"
+    kb_source: Literal["wikidata", "freebase_subgraph", "freebase_live"] = "wikidata"
     freebase_subgraph_cache: Optional[str] = None
+    freebase_sparql_url: str = "http://n0387:3001/sparql"
+    freebase_qid_to_mid_map_path: Optional[str] = None
+    freebase_qid_to_mid_candidates: int = 5
 
 
 class WorkingMemoryConfig(BaseModel):
@@ -293,6 +299,7 @@ def _load_dotenv_once() -> None:
     try:
         from dotenv import load_dotenv
     except ImportError:
+        logger.warning("python-dotenv is not installed; skipping .env loading fallback.")
         return
 
     candidate_paths = [Path.cwd() / ".env", Path(__file__).resolve().parent.parent / ".env"]

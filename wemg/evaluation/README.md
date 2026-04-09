@@ -127,6 +127,68 @@ Inspect profile:
 conda run -n wemg python -m pstats results/profiling/eval.prof
 ```
 
+## Freebase
+
+### Infrastructure setup
+
+**1 — Freebase Virtuoso DB** (53 GB; ~100 GB RAM required at runtime)
+
+```bash
+conda activate wemg
+# Install once (skip if already installed)
+conda install -c conda-forge virtuoso-opensource
+
+cd /home/hieum/uonlp/wemg
+# Choose any local directory for the Freebase DB files
+mkdir -p data/freebase
+# Download virtuoso_db.zip from https://www.dropbox.com/s/q38g0fwx1a3lz8q/virtuoso_db.zip
+curl -L "https://www.dropbox.com/s/q38g0fwx1a3lz8q/virtuoso_db.zip?dl=1" -o data/freebase/virtuoso_db.zip
+unzip -o data/freebase/virtuoso_db.zip -d data/freebase
+
+# Start via WEMG wrapper (HTTP SPARQL on :3001)
+python -m wemg.retrieval.virtuoso start 3001 -d data/freebase/virtuoso_db
+
+# Check server status
+python -m wemg.retrieval.virtuoso status 3001
+
+# To stop
+python -m wemg.retrieval.virtuoso stop 3001
+```
+
+**2 — QID→MID mapping file** (required for Wikidata-search bridge)
+
+Use the notebook helper in `draft.ipynb` to build `qid_to_mid.json` from
+`fid2qid.pkl` (online source), then point config to that map:
+
+```bash
+node_generation.freebase_qid_to_mid_map_path=/path/to/qid_to_mid.json
+node_generation.freebase_qid_to_mid_candidates=5
+```
+
+### Run evaluation
+
+```bash
+conda run -n wemg python -m wemg.evaluation.evaluate \
+  dataset_name_or_path=grail_qa \
+  node_generation.kb_source=freebase_live \
+  node_generation.freebase_sparql_url=http://localhost:3001/sparql \
+  node_generation.freebase_qid_to_mid_map_path=/path/to/qid_to_mid.json \
+  node_generation.freebase_qid_to_mid_candidates=5 \
+  output_path=results/grailqa_freebase_live
+```
+
+`metrics.json` will contain a `by_level` key with `overall`, `i.i.d.`, `compositional`, and `zero-shot` sub-metrics.
+
+### Methodological difference from KBQA-o1
+
+KBQA-o1 does **not** perform text-to-MID entity discovery at inference time.
+Its entity candidates are **gold MIDs pre-extracted from gold SPARQL annotations** during preprocessing (`data_process.py` → `prompt_function()` → `entities` field).
+The LLM only selects *which* gold MID to start with — it does not discover entities from question text.
+The `ELQ_SERVICE_URL` in KBQA-o1's config is unused dead code (never called at inference).
+
+WEMG performs **text→MID entity discovery** via LLM NER → Wikidata search → QID→MID map → SPARQL.
+This difference should be noted when comparing results: KBQA-o1 has privileged access to gold entities; WEMG does not.
+
 ## Notes
 
 - Resume logic uses exact `question` string matches.

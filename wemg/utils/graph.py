@@ -1,5 +1,6 @@
 """Graph utilities for textualization and visualization."""
 
+import logging
 import os
 import json
 from pathlib import Path
@@ -7,6 +8,8 @@ from collections import deque
 from typing import Any, Callable, List, Optional, Set, Tuple, Union
 
 import networkx as nx
+
+logger = logging.getLogger(__name__)
 
 
 def get_node_id(entity: Any) -> str:
@@ -453,7 +456,8 @@ def visualize_graph(
 
     try:
         pos = nx.spring_layout(graph, k=1, iterations=50)
-    except Exception:
+    except Exception as e:
+        logger.warning("spring_layout failed; falling back to circular_layout: %s", e)
         pos = nx.circular_layout(graph)
 
     nx.draw_networkx_nodes(graph, pos, node_color="lightblue", node_size=1000, alpha=0.9)

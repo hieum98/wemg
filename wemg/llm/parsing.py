@@ -104,7 +104,7 @@ def extract_info_from_text(
                     )
             return extracted_info
     except (json.JSONDecodeError, ValueError):
-        pass
+                logger.warning("Direct JSON parse failed; falling back to embedded JSON and regex extraction.")
 
     # Strategy 2: find JSON objects within text
     json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"

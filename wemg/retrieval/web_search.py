@@ -128,7 +128,7 @@ def crawl_page(url: str, timeout: int = 10) -> str:
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text
     except Exception as e:
-        logger.warning(f"Failed to crawl {url}: {e}")
+        logger.warning("Failed to crawl %s; falling back to empty text: %s", url, e)
         return ""
 
 

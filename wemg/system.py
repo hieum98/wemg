@@ -253,6 +253,8 @@ class WEMGSystem:
             "azure_endpoint": ng.azure_endpoint,
             "azure_key": ng.azure_key,
             "max_crawl_requests_per_second": self.cfg.retriever.web_search.max_crawl_requests_per_second,
+            "freebase_qid_to_mid_map_path": ng.freebase_qid_to_mid_map_path,
+            "freebase_qid_to_mid_candidates": ng.freebase_qid_to_mid_candidates,
         }
 
     def _create_wikidata_client(self) -> WikidataClient:
@@ -309,6 +311,14 @@ class WEMGSystem:
                 embed_client=self._create_embed_client(),
             )
             kb_client.load_from_cache(subgraph_cache_entry)
+        elif self.cfg.node_generation.kb_source == "freebase_live":
+            from wemg.retrieval.freebase_client import FreebaseClient
+            kb_client = FreebaseClient(
+                sparql_url=self.cfg.node_generation.freebase_sparql_url,
+                wikidata_client=self.wikidata_client,
+                qid_to_mid_map_path=self.cfg.node_generation.freebase_qid_to_mid_map_path,
+                qid_to_mid_candidates=self.cfg.node_generation.freebase_qid_to_mid_candidates,
+            )
 
         if self.cfg.memory.interaction_memory.scope == "dataset" and self.interaction_memory:
             interaction_memory = self.interaction_memory

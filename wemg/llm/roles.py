@@ -903,6 +903,7 @@ def parse_response(role: Role, response) -> Optional[pydantic.BaseModel]:
             return role.output_model(**response)
         except Exception:
             logger.error("Failed to parse response into %s. Response dict: %s", role.output_model.__name__, response)
+            logger.warning("Falling back to partial-field parsing for %s.", role.output_model.__name__)
             try:
                 return role.output_model(
                     **{key: response.get(key) for key in role.output_model.model_fields}

@@ -27,10 +27,11 @@ T = TypeVar("T")
 try:
     from wikibase_rest_api_client import Client as WikibaseClient
     from wikibase_rest_api_client.api.items import get_item as wb_get_item
-    from wikibase_rest_api_client.api.search import search_entities as wb_search
+    from wikibase_rest_api_client.api.search import search_item as wb_search
     WIKIBASE_AVAILABLE = True
 except ImportError:
     WIKIBASE_AVAILABLE = False
+    logger.warning("wikibase_rest_api_client is not installed; Wikibase-backed fallbacks are disabled.")
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_API_BATCH_SIZE = 50
@@ -193,7 +194,7 @@ class WikiTriple(pydantic.BaseModel):
             try:
                 data["object"] = WikidataEntity.model_validate(obj)
             except Exception:
-                pass  # object can be a literal string value
+                logger.warning("Could not reconstruct WikiTriple object as WikidataEntity; preserving literal payload.")
         return data
 
     def __hash__(self):
@@ -208,7 +209,7 @@ class WikiTriple(pydantic.BaseModel):
         return hash(self) == hash(other)
 
     def __str__(self):
-        return f"Subject: {self.subject}\nRelation: {self.relation}\nObject: {self.object}"
+        return f"Subject: {self.subject} - Relation: {self.relation} - Object: {self.object}"
 
 
 class WikidataPathBetweenEntities(pydantic.BaseModel):
@@ -432,8 +433,8 @@ class WikidataClient:
                 self._wikibase_client = WikibaseClient(
                     base_url="https://www.wikidata.org/w/rest.php/wikibase/v0"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to initialize Wikibase client; continuing without it: %s", e)
 
     def _lru_get(
         self,
@@ -451,8 +452,8 @@ class WikidataClient:
                     triples = [WikiTriple.model_validate(t) for t in json.loads(raw)]
                     self._lru_set(cache, key, triples)
                     return triples
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Redis cache read failed for %s; falling back to in-memory cache: %s", key, e)
         return None
 
     def _lru_set(
@@ -469,8 +470,8 @@ class WikidataClient:
             try:
                 raw = json.dumps([t.model_dump() for t in value])
                 self._redis.setex(f"{self._redis_prefix}:{key}", self._redis_ttl, raw)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Redis cache write failed for %s; keeping in-memory cache only: %s", key, e)
 
     def clear_triple_caches(self) -> None:
         """Clear in-process Wikidata triple caches."""

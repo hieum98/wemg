@@ -204,3 +204,41 @@ def compute_aggregate_metrics_both(
         "short_answer": metrics_short,
         "long_answer": metrics_long,
     }
+
+
+def compute_aggregate_metrics_by_level(
+    sub_ems_short: List[float],
+    sub_ems_long: List[float],
+    accs_short: List[Optional[float]],
+    accs_long: List[Optional[float]],
+    levels: List[str],
+    pass_at_k_values: List[Optional[int]],
+    max_k: int = 10,
+) -> Dict:
+    """Compute per-level metrics (overall + i.i.d. / compositional / zero-shot).
+
+    Returns a dict with keys ``overall``, ``i.i.d.``, ``compositional``, ``zero-shot``.
+    Each value has the same shape as ``compute_aggregate_metrics_both``.
+    Levels with no examples are omitted.
+    """
+    known_levels = ["i.i.d.", "compositional", "zero-shot"]
+    result: Dict = {}
+
+    result["overall"] = compute_aggregate_metrics_both(
+        sub_ems_short, sub_ems_long, accs_short, accs_long, pass_at_k_values, max_k
+    )
+
+    for lvl in known_levels:
+        idxs = [i for i, l in enumerate(levels) if l == lvl]
+        if not idxs:
+            continue
+        result[lvl] = compute_aggregate_metrics_both(
+            [sub_ems_short[i] for i in idxs],
+            [sub_ems_long[i] for i in idxs],
+            [accs_short[i] for i in idxs],
+            [accs_long[i] for i in idxs],
+            [pass_at_k_values[i] for i in idxs],
+            max_k,
+        )
+
+    return result

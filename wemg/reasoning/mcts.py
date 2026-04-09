@@ -238,7 +238,8 @@ async def evaluate(
             s3 = 5.0
         
         return ((s1 + s2 + s3) / 3.0 - 5.0) / 5.0
-    except Exception:
+    except Exception as e:
+        logger.warning("Verifier reward computation failed; falling back to neutral reward 0.0: %s", e)
         return 0.0
 
 

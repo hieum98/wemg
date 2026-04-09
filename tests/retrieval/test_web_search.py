@@ -1,5 +1,7 @@
 """Web search and crawl (real Serper or DDG)."""
 
+import logging
+
 import pytest
 
 from wemg.retrieval.web_search import WebSearchOutput, WebSearchTool, crawl_page
@@ -32,3 +34,11 @@ def test_crawl_page_valid_url():
 def test_crawl_page_invalid_url():
     text = crawl_page("https://nonexistent-domain-xyz-12345.invalid", timeout=2)
     assert text == "" or isinstance(text, str)
+
+
+def test_crawl_page_invalid_url_logs_warning(caplog):
+    with caplog.at_level(logging.WARNING):
+        text = crawl_page("https://nonexistent-domain-xyz-12345.invalid", timeout=2)
+
+    assert text == ""
+    assert "falling back to empty text" in caplog.text

@@ -1,17 +1,23 @@
 """Reasoning tree nodes for MCTS and CoT search strategies."""
 
+import logging
 import math
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 import pydantic
 from anytree import NodeMixin, RenderTree
 
+logger = logging.getLogger(__name__)
+
 try:
     from colorama import Fore, Style, init
     init(autoreset=True)
 except ImportError:
+    logger.warning("colorama is not installed; falling back to plain node rendering.")
+
     class Fore:
         GREEN = YELLOW = BLUE = MAGENTA = CYAN = RED = ""
+
     class Style:
         RESET_ALL = ""
 
