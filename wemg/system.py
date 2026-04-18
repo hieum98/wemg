@@ -292,12 +292,6 @@ class WEMGSystem:
         subgraph_cache_entry: Optional[Dict[str, Any]] = None,
     ) -> AnswerResult:
         self._initialize()
-        t_answer = time.perf_counter()
-        logger.info(
-            "PROFSTEP system stage=answer_start question_id=%s question=%s",
-            str(question_id),
-            question[:120].replace("\n", " "),
-        )
 
         # Optionally override the KB client with a per-question freebase subgraph.
         kb_client = None
@@ -331,22 +325,10 @@ class WEMGSystem:
         if strategy == "cot":
             working_memory = self._create_working_memory(wikidata_client=kb_client)
             result = asyncio.run(self._answer_with_cot(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer, wikidata_client=kb_client))
-            logger.info(
-                "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
-                strategy,
-                (time.perf_counter() - t_answer) * 1000.0,
-                str(question_id),
-            )
             return result
         elif strategy == "mcts":
             working_memory = self._create_working_memory(wikidata_client=kb_client)
             result = asyncio.run(self._answer_with_mcts(question, question_id, working_memory, interaction_memory, node_gen_kwargs, golden_answer, wikidata_client=kb_client))
-            logger.info(
-                "PROFSTEP system stage=answer_done strategy=%s elapsed_ms=%.1f question_id=%s",
-                strategy,
-                (time.perf_counter() - t_answer) * 1000.0,
-                str(question_id),
-            )
             return result
         raise ValueError(f"Unknown strategy: {strategy}")
     
@@ -373,8 +355,6 @@ class WEMGSystem:
     async def _answer_with_mcts(self, question, question_id, working_memory, interaction_memory, kwargs, golden_answer, wikidata_client=None):
         mcts_cfg = self.cfg.search.mcts
         et = mcts_cfg.early_termination
-        t_mcts = time.perf_counter()
-        logger.info("PROFSTEP system stage=mcts_search_start question_id=%s", str(question_id))
         best_content, root, pass_at_k = await mcts_search(
             question=question, client=self.client, retriever=self.retriever,
             wikidata_client=wikidata_client or self.wikidata_client, reranker=self.reranker,
@@ -390,23 +370,10 @@ class WEMGSystem:
             semantic_sufficiency_count=et.semantic_sufficiency_count,
             **kwargs,
         )
-        logger.info(
-            "PROFSTEP system stage=mcts_search_done question_id=%s elapsed_ms=%.1f pass_at_k=%s",
-            str(question_id),
-            (time.perf_counter() - t_mcts) * 1000.0,
-            str(pass_at_k),
-        )
 
         if self.cfg.output.show_search_tree:
             root.print_tree()
-        t_final = time.perf_counter()
-        logger.info("PROFSTEP system stage=get_answer_start question_id=%s", str(question_id))
         full_answer, concise_answer = await get_answer(root, self.client, interaction_memory, working_memory=working_memory)
-        logger.info(
-            "PROFSTEP system stage=get_answer_done question_id=%s elapsed_ms=%.1f",
-            str(question_id),
-            (time.perf_counter() - t_final) * 1000.0,
-        )
         return AnswerResult(
             question=question, answer=full_answer, concise_answer=concise_answer,
             search_tree=root if self.cfg.output.include_reasoning else None,

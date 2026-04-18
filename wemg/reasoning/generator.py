@@ -245,10 +245,6 @@ class NodeGenerator:
         5. Return (documents, triples, entities, log_data)
         """
         q_short = question[:120].replace("\n", " ")
-        t_explore_start = time.perf_counter()
-        logger.info("PROFSTEP explore stage=start question=%s", q_short)
-
-        t0 = time.perf_counter()
         query_input = QueryGeneratorInput(input_text=question)
         responses, query_log = await execute_role(
             client=self.client, role=QUERY_GENERATOR, input_data=query_input,
@@ -256,25 +252,11 @@ class NodeGenerator:
         )
         queries = responses[0].queries if responses else [question]
         queries = list(set(queries))
-        logger.info(
-            "PROFSTEP explore stage=query_generator elapsed_ms=%.1f queries=%d question=%s",
-            (time.perf_counter() - t0) * 1000.0,
-            len(queries),
-            q_short,
-        )
 
-        t0 = time.perf_counter()
         tasks = [self._retrieve_from_web(q) for q in queries]
         web_results = await asyncio.gather(*tasks)
         documents = list(set(sum(web_results, [])))
-        logger.info(
-            "PROFSTEP explore stage=web_retrieval elapsed_ms=%.1f docs=%d question=%s",
-            (time.perf_counter() - t0) * 1000.0,
-            len(documents),
-            q_short,
-        )
         
-        t0 = time.perf_counter()
         tasks = [self._retrieve_from_kb(q) for q in queries]
         results = await asyncio.gather(*tasks)
         triples = []
@@ -284,13 +266,6 @@ class NodeGenerator:
             triples.extend(t)
             entities.extend(e)
             kb_log = merge_logs(kb_log, l)
-        logger.info(
-            "PROFSTEP explore stage=kb_retrieval elapsed_ms=%.1f triples=%d entities=%d question=%s",
-            (time.perf_counter() - t0) * 1000.0,
-            len(triples),
-            len(entities),
-            q_short,
-        )
 
         entities = list(set(entities))
         triples = list(set(triples))
@@ -301,14 +276,7 @@ class NodeGenerator:
         assert self.wikidata_client is not None, "WikidataClient must be provided"
         all_entities = [self.working_memory.entity_dict.get(e.qid) if self.working_memory.entity_dict.get(e.qid) else e 
                         for e in entities]
-        t0 = time.perf_counter()
         all_entities = await self.wikidata_client.aenrich_entities(all_entities, get_details=True)
-        logger.info(
-            "PROFSTEP explore stage=enrich_entities elapsed_ms=%.1f entities=%d question=%s",
-            (time.perf_counter() - t0) * 1000.0,
-            len(all_entities),
-            q_short,
-        )
 
         kb_documents = []
         for entity in all_entities:
@@ -316,28 +284,12 @@ class NodeGenerator:
                 kb_documents.append(entity.wikipedia_content)
         kb_documents = list(set(kb_documents))
 
-        t0 = time.perf_counter()
         if self.reranker and self.kwargs.get("rerank_kb_documents", True) and kb_documents:
             top_kb = self.reranker.rerank(question, kb_documents)
         else:
             top_kb = kb_documents
-        logger.info(
-            "PROFSTEP explore stage=rerank_kb_documents elapsed_ms=%.1f kb_docs=%d top_docs=%d question=%s",
-            (time.perf_counter() - t0) * 1000.0,
-            len(kb_documents),
-            len(top_kb),
-            q_short,
-        )
         documents = list(set(documents + top_kb))
         all_log = merge_logs(query_log, kb_log, prune_log)
-        logger.info(
-            "PROFSTEP explore stage=done elapsed_ms=%.1f docs=%d triples=%d entities=%d question=%s",
-            (time.perf_counter() - t_explore_start) * 1000.0,
-            len(documents),
-            len(triples),
-            len(all_entities),
-            q_short,
-        )
         return documents, triples, all_entities, all_log
     
     async def _retrieve_from_web(self, query: str) -> List[str]:

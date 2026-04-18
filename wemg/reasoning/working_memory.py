@@ -380,23 +380,9 @@ class WorkingMemory:
         Step 3: graph → text (textualize graph triples → add as RETRIEVAL items).
         Step 4: Consolidate again if new graph triples were added (text now enriched).
         """
-        t_sync = time.perf_counter()
         if self.textual_memory:
-            logger.info(
-                "PROFSTEP wm stage=sync_start text_items=%d graph_nodes=%d question=%s",
-                len(self.textual_memory),
-                self.graph_memory.number_of_nodes(),
-                question[:120].replace("\n", " "),
-            )
-
             # Step 1: Consolidate
-            t0 = time.perf_counter()
             await self._aconsolidate_textual_memory(client, question=question, interaction_memory=interaction_memory)
-            logger.info(
-                "PROFSTEP wm stage=consolidate_done elapsed_ms=%.1f text_items=%d",
-                (time.perf_counter() - t0) * 1000.0,
-                len(self.textual_memory),
-            )
 
         # Step 2: text → graph
         if self.textual_memory:
@@ -406,7 +392,6 @@ class WorkingMemory:
                 text_blob,
             )
             link_kwargs = self._entity_link_kwargs(kwargs)
-            t0 = time.perf_counter()
             link_result, parse_result = await asyncio.gather(
                 self._link_entities_async(client, text_blob, known, interaction_memory, **link_kwargs),
                 parse_graph_from_text(
@@ -416,11 +401,6 @@ class WorkingMemory:
                     known_entities=list(known) if known else None,
                 ),
             )
-            logger.info(
-                "PROFSTEP wm stage=link_parse_done elapsed_ms=%.1f text_items=%d",
-                (time.perf_counter() - t0) * 1000.0,
-                len(self.textual_memory),
-            )
             linked_entities, link_log = link_result
             relations, parse_log = parse_result
             for entity in linked_entities:
@@ -429,23 +409,9 @@ class WorkingMemory:
             for triple in self._enhance_relations(relations):
                 self.add_edge_to_graph_memory(triple)
             log_to_interaction_memory(interaction_memory, merge_logs(link_log, parse_log))
-            logger.info(
-                "PROFSTEP wm stage=graph_update_done linked_entities=%d relations=%d graph_nodes=%d graph_edges=%d",
-                len(linked_entities),
-                len(relations),
-                self.graph_memory.number_of_nodes(),
-                self.graph_memory.number_of_edges(),
-            )
             new_edges = set(self.graph_memory.edges()) - edges_before
             if new_edges:
-                t0 = time.perf_counter()
                 await _aprune_graph_edges(client, question, self.graph_memory, new_edges, interaction_memory)
-                logger.info(
-                    "PROFSTEP wm stage=graph_prune_done elapsed_ms=%.1f graph_nodes=%d graph_edges=%d",
-                    (time.perf_counter() - t0) * 1000.0,
-                    self.graph_memory.number_of_nodes(),
-                    self.graph_memory.number_of_edges(),
-                )
 
         if self.graph_memory.number_of_nodes() > 0:
             self.deduplicate_graph()
@@ -458,18 +424,7 @@ class WorkingMemory:
 
         # Step 4: Consolidate again if graph triples enriched the text
         if len(self.textual_memory) > n_before:
-            t0 = time.perf_counter()
             await self._aconsolidate_textual_memory(client, question=question, interaction_memory=interaction_memory)
-            logger.info(
-                "PROFSTEP wm stage=consolidate2_done elapsed_ms=%.1f text_items=%d",
-                (time.perf_counter() - t0) * 1000.0,
-                len(self.textual_memory),
-            )
-
-        logger.info(
-            "PROFSTEP wm stage=sync_done elapsed_ms=%.1f",
-            (time.perf_counter() - t_sync) * 1000.0,
-        )
 
     def add_node_to_graph_memory(self, node):
         from wemg.llm.roles import Entity as OpenIEEntity

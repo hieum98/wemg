@@ -21,22 +21,22 @@ mkdir -p results/logs
 
 datasets=(
     # "cwq"
-    "webqsp"
-    # "webqsp_sub"
-    # "cwq_sub"
-    # "2wiki"
-    # "hotpotqa"
+    # "webqsp"
+    "webqsp_sub"
+    "cwq_sub"
+    "2wiki"
+    "hotpotqa"
     "musique"
-    # "bamboogle"
-    "frames"
+    "bamboogle"
+    # "frames"
 )
 
 dataset_name_or_path="${datasets[$SLURM_ARRAY_TASK_ID]}"
 model_name="${MODEL_NAME:-Qwen3-8B}"
-search_strategy="${SEARCH_STRATEGY:-mcts}"
+search_strategy="${SEARCH_STRATEGY:-cot}"
 max_concurrent="${MAX_CONCURRENT:-8}"
-max_examples="${MAX_EXAMPLES:-300}"
-output_path="results/wemg-v5/${model_name}/${dataset_name_or_path}"
+max_examples="${MAX_EXAMPLES:-200}"
+output_path="results/wemg-v5/${model_name}/cot/${dataset_name_or_path}"
 
 kb_source="${KB_SOURCE:-wikidata}"
 freebase_subgraph_cache="${FREEBASE_SUBGRAPH_CACHE:-}"

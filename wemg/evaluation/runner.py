@@ -471,14 +471,6 @@ class DatasetEvaluator:
                     if mw is not None:
                         mw = max(1, min(mw, len(batch)))
                     chunk_index = (chunk_start // chunk_size) + 1
-                    logger.info(
-                        "PROFSTEP eval stage=chunk_start chunk=%d/%d size=%d max_workers=%s",
-                        chunk_index,
-                        (total_pending + chunk_size - 1) // chunk_size,
-                        len(batch),
-                        str(mw),
-                    )
-                    t_chunk = time.perf_counter()
                     results = self.system.answer_batch(
                         questions,
                         question_ids=qids,
@@ -486,21 +478,9 @@ class DatasetEvaluator:
                         subgraph_cache_entries=cache_entries if use_cache else None,
                         max_workers=mw,
                     )
-                    logger.info(
-                        "PROFSTEP eval stage=answer_batch_done chunk=%d elapsed_ms=%.1f",
-                        chunk_index,
-                        (time.perf_counter() - t_chunk) * 1000.0,
-                    )
-                    t_log = time.perf_counter()
                     entries = process_answer_results(batch, results)
                     append_logs(entries)
                     progress_bar.update(len(batch))
-                    logger.info(
-                        "PROFSTEP eval stage=append_logs_done chunk=%d elapsed_ms=%.1f entries=%d",
-                        chunk_index,
-                        (time.perf_counter() - t_log) * 1000.0,
-                        len(entries),
-                    )
 
                     # Bound process memory in long-running eval by clearing Wikidata
                     # triple caches periodically between chunks.

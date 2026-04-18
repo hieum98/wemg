@@ -53,7 +53,7 @@ reranker:
   instruction: null
 
 search:
-  strategy: "mcts"
+  strategy: "cot"
   mcts:
     num_iterations: 20
     max_tree_depth: 10
