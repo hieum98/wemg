@@ -47,6 +47,9 @@ class LLMClient:
         self.max_tokens = generation_kwargs.get("max_tokens", 8192)
         self.max_input_tokens = generation_kwargs.get("max_input_tokens", 32768)
         self.top_k = generation_kwargs.get("top_k", 20)
+        self.min_p = generation_kwargs.get("min_p", 0.0)
+        self.presence_penalty = generation_kwargs.get("presence_penalty", 0.0)
+        self.repetition_penalty = generation_kwargs.get("repetition_penalty", 1.0)
         self.enable_thinking = generation_kwargs.get("enable_thinking", True)
         self.random_seed = generation_kwargs.get("random_seed", None)
 
@@ -78,11 +81,17 @@ class LLMClient:
                 },
             }
 
+        # Jinja2 template checks `enable_thinking is false` (strict boolean), so
+        # passing None or a truthy non-False value keeps thinking enabled.
+        # Must pass the Python bool False explicitly to trigger the empty-think prefix.
+        chat_template_kwargs: Dict[str, Any] = {"enable_thinking": bool(enable_thinking)}
+
         return {
             "model": self.model_name,
             "temperature": kwargs.get("temperature", self.temperature),
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             "top_p": kwargs.get("top_p", self.top_p),
+            "presence_penalty": kwargs.get("presence_penalty", self.presence_penalty),
             "n": kwargs.get("n", self.num_samples),
             "seed": kwargs.get("random_seed", self.random_seed),
             "response_format": response_format,
@@ -91,9 +100,9 @@ class LLMClient:
             "top_logprobs": kwargs.get("top_logprobs", None),
             "extra_body": {
                 "top_k": kwargs.get("top_k", self.top_k),
-                "chat_template_kwargs": {
-                    "enable_thinking": True if enable_thinking else None,
-                },
+                "min_p": kwargs.get("min_p", self.min_p),
+                "repetition_penalty": kwargs.get("repetition_penalty", self.repetition_penalty),
+                "chat_template_kwargs": chat_template_kwargs,
             },
         }
 

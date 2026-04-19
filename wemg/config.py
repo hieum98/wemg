@@ -16,9 +16,12 @@ class LLMGenerationConfig(BaseModel):
     temperature: float = 0.8
     n: int = 1
     top_p: float = 0.95
+    min_p: float = 0.0
     max_tokens: int = 32768
     max_input_tokens: int = 65536
     top_k: int = 20
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
     enable_thinking: bool = True
     random_seed: Optional[int] = None
 

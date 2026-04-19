@@ -322,13 +322,25 @@ def live_reranker(wemg_config):
     from wemg.retrieval.reranker import Reranker
 
     r = wemg_config.reranker
+    gen = wemg_config.llm.generation
     client = LLMClient(
         model_name=r.model_name,
         url=r.url,
         api_key=r.api_key,
         concurrency=r.concurrency,
-        temperature=0.0,
-        max_tokens=1,
+        max_retries=wemg_config.llm.max_retries,
+        timeout=gen.timeout,
+        temperature=gen.temperature,
+        n=gen.n,
+        top_p=gen.top_p,
+        min_p=gen.min_p,
+        max_tokens=gen.max_tokens,
+        max_input_tokens=gen.max_input_tokens,
+        top_k=gen.top_k,
+        presence_penalty=gen.presence_penalty,
+        repetition_penalty=gen.repetition_penalty,
+        enable_thinking=gen.enable_thinking,
+        random_seed=gen.random_seed,
         cache_config={"enabled": False},
     )
     reranker = Reranker(client=client, top_k=r.top_k, instruction=r.instruction)
@@ -349,13 +361,25 @@ def optional_live_reranker(wemg_config):
     from wemg.retrieval.reranker import Reranker
 
     r = wemg_config.reranker
+    gen = wemg_config.llm.generation
     client = LLMClient(
         model_name=r.model_name,
         url=r.url,
         api_key=r.api_key,
         concurrency=r.concurrency,
-        temperature=0.0,
-        max_tokens=1,
+        max_retries=wemg_config.llm.max_retries,
+        timeout=gen.timeout,
+        temperature=gen.temperature,
+        n=gen.n,
+        top_p=gen.top_p,
+        min_p=gen.min_p,
+        max_tokens=gen.max_tokens,
+        max_input_tokens=gen.max_input_tokens,
+        top_k=gen.top_k,
+        presence_penalty=gen.presence_penalty,
+        repetition_penalty=gen.repetition_penalty,
+        enable_thinking=gen.enable_thinking,
+        random_seed=gen.random_seed,
         cache_config={"enabled": False},
     )
     reranker = Reranker(client=client, top_k=r.top_k, instruction=r.instruction)

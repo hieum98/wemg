@@ -13,13 +13,25 @@ def test_reranker_empty_documents(wemg_config):
     requires_reranker_config(wemg_config)
     requires_llm_credentials(wemg_config)
     r = wemg_config.reranker
+    gen = wemg_config.llm.generation
     client = LLMClient(
         model_name=r.model_name,
         url=r.url,
         api_key=r.api_key,
-        concurrency=1,
-        temperature=0.0,
-        max_tokens=1,
+        concurrency=r.concurrency,
+        max_retries=wemg_config.llm.max_retries,
+        timeout=gen.timeout,
+        temperature=gen.temperature,
+        n=gen.n,
+        top_p=gen.top_p,
+        min_p=gen.min_p,
+        max_tokens=gen.max_tokens,
+        max_input_tokens=gen.max_input_tokens,
+        top_k=gen.top_k,
+        presence_penalty=gen.presence_penalty,
+        repetition_penalty=gen.repetition_penalty,
+        enable_thinking=gen.enable_thinking,
+        random_seed=gen.random_seed,
         cache_config={"enabled": False},
     )
     try:
@@ -35,14 +47,25 @@ def test_reranker_orders_by_relevance(wemg_config):
     requires_reranker_config(wemg_config)
     requires_llm_credentials(wemg_config)
     r = wemg_config.reranker
+    gen = wemg_config.llm.generation
     client = LLMClient(
         model_name=r.model_name,
         url=r.url,
         api_key=r.api_key,
         concurrency=r.concurrency,
-        temperature=0.0,
-        max_tokens=1,
-        max_retries=2,
+        max_retries=wemg_config.llm.max_retries,
+        timeout=gen.timeout,
+        temperature=gen.temperature,
+        n=gen.n,
+        top_p=gen.top_p,
+        min_p=gen.min_p,
+        max_tokens=gen.max_tokens,
+        max_input_tokens=gen.max_input_tokens,
+        top_k=gen.top_k,
+        presence_penalty=gen.presence_penalty,
+        repetition_penalty=gen.repetition_penalty,
+        enable_thinking=gen.enable_thinking,
+        random_seed=gen.random_seed,
         cache_config={"enabled": False},
     )
     try:
@@ -67,13 +90,25 @@ def test_reranker_top_k_override(wemg_config):
     requires_reranker_config(wemg_config)
     requires_llm_credentials(wemg_config)
     r = wemg_config.reranker
+    gen = wemg_config.llm.generation
     client = LLMClient(
         model_name=r.model_name,
         url=r.url,
         api_key=r.api_key,
-        concurrency=1,
-        temperature=0.0,
-        max_tokens=1,
+        concurrency=r.concurrency,
+        max_retries=wemg_config.llm.max_retries,
+        timeout=gen.timeout,
+        temperature=gen.temperature,
+        n=gen.n,
+        top_p=gen.top_p,
+        min_p=gen.min_p,
+        max_tokens=gen.max_tokens,
+        max_input_tokens=gen.max_input_tokens,
+        top_k=gen.top_k,
+        presence_penalty=gen.presence_penalty,
+        repetition_penalty=gen.repetition_penalty,
+        enable_thinking=gen.enable_thinking,
+        random_seed=gen.random_seed,
         cache_config={"enabled": False},
     )
     try:

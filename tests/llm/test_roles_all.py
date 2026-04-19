@@ -92,13 +92,25 @@ def _structured_query_prompt():
 
 def _make_client(wemg_config):
     requires_llm_credentials(wemg_config)
+    gen = wemg_config.llm.generation
     return LLMClient(
         model_name=wemg_config.llm.model_name,
         url=wemg_config.llm.url,
         api_key=wemg_config.llm.api_key,
-        max_retries=1,
-        max_tokens=min(wemg_config.llm.generation.max_tokens, 8192),
-        temperature=0.0,
+        concurrency=wemg_config.llm.concurrency,
+        max_retries=wemg_config.llm.max_retries,
+        timeout=gen.timeout,
+        temperature=gen.temperature,
+        n=gen.n,
+        top_p=gen.top_p,
+        min_p=gen.min_p,
+        max_tokens=gen.max_tokens,
+        max_input_tokens=gen.max_input_tokens,
+        top_k=gen.top_k,
+        presence_penalty=gen.presence_penalty,
+        repetition_penalty=gen.repetition_penalty,
+        enable_thinking=gen.enable_thinking,
+        random_seed=gen.random_seed,
         cache_config={"enabled": False},
     )
 
