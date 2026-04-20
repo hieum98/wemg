@@ -6,9 +6,9 @@
 #SBATCH --partition=gpulong,memorylong,cisds
 #SBATCH --ntasks=1
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=30
-#SBATCH --mem=256G
-#SBATCH --array=0-8
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=128G
+#SBATCH --array=0-1
 
 set -euo pipefail
 set +u
@@ -22,21 +22,21 @@ mkdir -p results/logs
 datasets=(
     # "cwq"
     # "webqsp"
-    "webqsp_sub"
-    "cwq_sub"
-    "2wiki"
-    "hotpotqa"
-    "musique"
+    # "webqsp_sub"
+    # "cwq_sub"
+    # "2wiki"
+    # "hotpotqa"
+    # "musique"
     "bamboogle"
     # "frames"
 )
 
 dataset_name_or_path="${datasets[$SLURM_ARRAY_TASK_ID]}"
-model_name="${MODEL_NAME:-Qwen3-8B}"
-search_strategy="${SEARCH_STRATEGY:-cot}"
+model_name="${MODEL_NAME:-Qwen3.5-4B}"
+search_strategy="${SEARCH_STRATEGY:-mcts}"
 max_concurrent="${MAX_CONCURRENT:-8}"
 max_examples="${MAX_EXAMPLES:-200}"
-output_path="results/wemg-v5/${model_name}/cot/${dataset_name_or_path}"
+output_path="results/wemg-v5/${model_name}/${search_strategy}/${dataset_name_or_path}"
 
 kb_source="${KB_SOURCE:-wikidata}"
 freebase_subgraph_cache="${FREEBASE_SUBGRAPH_CACHE:-}"

@@ -11,8 +11,8 @@ llm:
     n: 1
     top_p: 0.95
     min_p: 0.0
-    max_tokens: 32768
-    max_input_tokens: 65536
+    max_tokens: 65536
+    max_input_tokens: 131072
     top_k: 20
     presence_penalty: 1.5
     repetition_penalty: 1.0
