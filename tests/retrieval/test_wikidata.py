@@ -1,4 +1,10 @@
-"""Tests for Wikidata models and WikidataClient using real Wikidata/Wikipedia APIs."""
+"""Tests for Wikidata models and WikidataClient using real Wikidata/Wikipedia APIs.
+
+Public WDQS (``query.wikidata.org``) often returns HTTP 429 when overloaded; tests
+that call SPARQL then ``pytest.skip``. Prefer running this module alone or with
+low parallelism (e.g. ``pytest -n0``) and/or off-peak retries for a full green run.
+Entity metadata paths use the Action API where possible to reduce WDQS load.
+"""
 
 import pytest
 

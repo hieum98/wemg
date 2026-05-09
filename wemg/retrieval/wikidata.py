@@ -2,6 +2,7 @@
 k-hop triple traversal, and path finding."""
 
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -14,7 +15,7 @@ from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
 from urllib.error import HTTPError
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from datasets import disable_progress_bars
 import pydantic
@@ -24,6 +25,58 @@ from SPARQLWrapper import SPARQLWrapper, JSON, POST
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def _wikidata_timing(
+    op: str,
+    duration_s: float,
+    *,
+    kind: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    rows: Optional[int] = None,
+    http_status: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Structured INFO log for production latency analysis (Phase 0)."""
+    parts = ["wikidata_timing", f"op={op}", f"duration_ms={duration_s * 1000.0:.1f}"]
+    if kind is not None:
+        parts.append(f"kind={kind}")
+    if batch_size is not None:
+        parts.append(f"batch_size={batch_size}")
+    if rows is not None:
+        parts.append(f"rows={rows}")
+    if http_status is not None:
+        parts.append(f"http_status={http_status}")
+    err = error if error else "-"
+    if len(err) > 200:
+        err = err[:197] + "..."
+    parts.append(f"error={err}")
+    logger.info(" ".join(parts))
+
+
+def _sparql_query_kind(sparql: str) -> str:
+    """Coarse label for WDQS query shapes (for timing logs)."""
+    if "wikibase:mwapi" in sparql:
+        if 'mwapi:type "property"' in sparql:
+            return "mwapi_property_search"
+        return "mwapi_item_search"
+    if "VALUES ?seed" in sparql:
+        compact = " ".join(sparql.split())
+        if "?subject ?relation ?seed" in compact:
+            return "khop_incoming_batch"
+        if "?seed ?relation ?object" in compact:
+            return "khop_outgoing_batch"
+        return "khop_seed_batch"
+    if "VALUES ?entity" in sparql and "entityLabel" in sparql:
+        return "entity_batch"
+    if "VALUES ?property" in sparql and "propertyLabel" in sparql:
+        return "property_batch"
+    compact = " ".join(sparql.split())
+    if "SELECT ?relation ?object WHERE" in compact and "wd:Q" in sparql:
+        return "triples_outgoing"
+    if "SELECT ?subject ?relation WHERE" in compact and "?subject ?relation wd:" in compact:
+        return "triples_incoming"
+    return "other"
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_API_BATCH_SIZE = 50
@@ -70,32 +123,46 @@ def _sparql_retry_sleep_seconds(exc: BaseException, attempt: int) -> float:
     \"Aggressively rate-limiting to 1 req / min\" (per-IP or per-fingerprint).
     Retrying after only a few seconds keeps you over quota; honor Retry-After
     or wait at least ~one minute when that policy is indicated.
+
+    WDQS sometimes sends Retry-After of ~1000s; sleeping that long is harmful
+    for tests and interactive use, so values above 120s abort retries by
+    re-raising *exc*.
     """
     jitter = random.uniform(0, 2)
     generic = RETRY_BASE_DELAY * (2 ** attempt) + jitter
 
-    if isinstance(exc, HTTPError) and exc.code == 429:
+    def _retry_after_seconds(hdrs: Any) -> Optional[float]:
+        if not hdrs:
+            return None
+        ra = hdrs.get("Retry-After") if hasattr(hdrs, "get") else None
+        if ra is None:
+            return None
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            return None
+
+    hdrs = None
+    if isinstance(exc, HTTPError) and exc.code == 429 and exc.headers:
         hdrs = exc.headers
-        if hdrs:
-            ra = hdrs.get("Retry-After")
-            if ra is not None:
-                try:
-                    return float(ra) + random.uniform(0, 1)
-                except ValueError:
-                    pass
+    if hdrs is None:
+        hdrs = getattr(exc, "headers", None)
+
+    ra_sec = _retry_after_seconds(hdrs)
+    if ra_sec is not None:
+        if ra_sec > 120.0:
+            logger.warning(
+                "WDQS Retry-After is %.1fs (capped at 120s); aborting retries.",
+                ra_sec,
+            )
+            raise exc
+        return ra_sec
+
+    if isinstance(exc, HTTPError) and exc.code == 429:
         hint = (getattr(exc, "reason", None) or str(exc) or "").lower()
         if "1 req" in hint and "min" in hint:
             return 60.0 + jitter
         return max(generic, 30.0 + jitter)
-
-    retry_after = getattr(exc, "headers", None)
-    if retry_after is not None:
-        ra = retry_after.get("Retry-After") if hasattr(retry_after, "get") else None
-        if ra is not None:
-            try:
-                return float(ra) + random.uniform(0, 1)
-            except (TypeError, ValueError):
-                pass
 
     return generic
 
@@ -263,7 +330,15 @@ class WikidataPathBetweenEntities(pydantic.BaseModel):
 WIKIDATA_SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
 # Wikibase REST item search (v1). wikibase-rest-api-client's search_item still targets removed v0 / wrong rewrite.
 WIKIDATA_REST_SEARCH_ITEMS_URL = "https://www.wikidata.org/w/rest.php/wikibase/v1/search/items"
+WIKIDATA_ACTION_API_URL = "https://www.wikidata.org/w/api.php"
 REST_SEARCH_TIMEOUT_S = 60
+WIKIDATA_WB_API_TIMEOUT_S = 60
+# wbgetentities allows up to 50 ids per request; keep aligned with BATCH_SIZE chunks.
+WBGETENTITIES_MAX_IDS_PER_REQUEST = 50
+# Action API response caches (Phase 4): stable Wikidata metadata; search is shorter TTL.
+ACTION_API_ENTITY_CACHE_TTL_SEC = 86400 * 3
+ACTION_API_SEARCH_CACHE_TTL_SEC = 86400
+ACTION_API_SEARCH_MEMORY_MAX_ENTRIES = 2000
 random_str = lambda n: "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=5)) # for user agent uniqueness to help with Wikidata rate limits (this is just a best effort and does not guarantee avoiding rate limits, but can help a bit by making it less likely to be identified as a single client across multiple runs)
 USER_AGENT = f"WEMG/0.2.0.{os.uname().nodename}.{random_str(10)}"
 MAX_RETRIES = 3
@@ -434,6 +509,10 @@ class WikidataClient:
         max_sparql_requests_per_second: Optional[float] = None,
         triple_cache_max_entries: int = 5000,
         redis_client=None,
+        *,
+        use_action_api_for_entities: bool = True,
+        cache_action_api_responses: bool = True,
+        entity_metadata_cache_max_entries: int = 5000,
     ):
         self.properties = properties or list(DEFAULT_PROPERTIES)
         self.property_labels = dict(property_labels or PROPERTY_LABELS)
@@ -459,6 +538,18 @@ class WikidataClient:
         self._wikipedia_dump_dataset, self._wikidump_url_index = self._load_wikipedia_dump_dataset()
         # Cache canonical_url -> content to avoid re-scanning for the same URLs across MCTS iterations.
         self._wikidump_content_cache: Dict[str, Optional[str]] = {}
+        self._use_action_api_for_entities = bool(use_action_api_for_entities)
+        self._cache_action_api_responses = bool(cache_action_api_responses)
+        self._entity_metadata_cache_max = max(64, int(entity_metadata_cache_max_entries))
+        self._entity_metadata_redis_prefix = "wemg:wbentity:en"
+        self._entity_metadata_ttl = ACTION_API_ENTITY_CACHE_TTL_SEC
+        self._wbsearch_redis_prefix = "wemg:wbsearch:item:en"
+        self._wbsearch_ttl = ACTION_API_SEARCH_CACHE_TTL_SEC
+        self._action_api_cache_lock = threading.Lock()
+        self._entity_metadata_memory: "OrderedDict[str, WikidataEntity]" = OrderedDict()
+        self._wbsearch_memory: "OrderedDict[str, List[WikidataEntity]]" = OrderedDict()
+        self._action_api_session_lock = threading.Lock()
+        self._action_api_session: Optional[requests.Session] = None
 
     def _lru_get(
         self,
@@ -503,11 +594,352 @@ class WikidataClient:
             self._outgoing_triples_cache.clear()
             self._bidirectional_triples_cache.clear()
 
+    def clear_action_api_caches(self) -> None:
+        """Clear in-process Action API LRU caches (wbgetentities / wbsearchentities).
+
+        Does not delete Redis keys; restart or TTL expiry clears shared Redis cache.
+        """
+        with self._action_api_cache_lock:
+            self._entity_metadata_memory.clear()
+            self._wbsearch_memory.clear()
+
+    def _entity_metadata_cache_get(self, qid: str) -> Optional[WikidataEntity]:
+        if not self._cache_action_api_responses:
+            return None
+        with self._action_api_cache_lock:
+            ent = self._entity_metadata_memory.get(qid)
+            if ent is not None:
+                self._entity_metadata_memory.move_to_end(qid)
+                return ent
+        if self._redis:
+            try:
+                rkey = f"{self._entity_metadata_redis_prefix}:{qid}"
+                raw = self._redis.get(rkey)
+                if not raw:
+                    return None
+                payload = json.loads(raw)
+                ent = WikidataEntity.model_validate(payload)
+                with self._action_api_cache_lock:
+                    self._entity_metadata_memory[qid] = ent
+                    self._entity_metadata_memory.move_to_end(qid)
+                    while len(self._entity_metadata_memory) > self._entity_metadata_cache_max:
+                        self._entity_metadata_memory.popitem(last=False)
+                return ent
+            except Exception as e:
+                logger.warning("Redis wbentity cache read failed for %s: %s", qid, e)
+        return None
+
+    def _entity_metadata_cache_set(self, qid: str, entity: WikidataEntity) -> None:
+        if not self._cache_action_api_responses:
+            return
+        with self._action_api_cache_lock:
+            self._entity_metadata_memory[qid] = entity
+            self._entity_metadata_memory.move_to_end(qid)
+            while len(self._entity_metadata_memory) > self._entity_metadata_cache_max:
+                self._entity_metadata_memory.popitem(last=False)
+        if self._redis:
+            try:
+                rkey = f"{self._entity_metadata_redis_prefix}:{qid}"
+                self._redis.setex(
+                    rkey,
+                    self._entity_metadata_ttl,
+                    json.dumps(entity.model_dump()),
+                )
+            except Exception as e:
+                logger.warning("Redis wbentity cache write failed for %s: %s", qid, e)
+
+    @staticmethod
+    def _wbsearch_items_cache_digest(text: str, num_results: int) -> str:
+        # Must match the limit passed to the Action API (caps at 50).
+        limit_eff = max(1, min(int(num_results), 50))
+        norm = (text or "").strip()
+        blob = f"item|en|{norm}|{limit_eff}".encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
+
+    def _wbsearch_items_cache_get(self, digest: str) -> Optional[List[WikidataEntity]]:
+        if not self._cache_action_api_responses:
+            return None
+        with self._action_api_cache_lock:
+            hit = self._wbsearch_memory.get(digest)
+            if hit is not None:
+                self._wbsearch_memory.move_to_end(digest)
+                return list(hit)
+        if self._redis:
+            try:
+                rkey = f"{self._wbsearch_redis_prefix}:{digest}"
+                raw = self._redis.get(rkey)
+                if not raw:
+                    return None
+                rows = json.loads(raw)
+                if not isinstance(rows, list):
+                    return None
+                out = [WikidataEntity.model_validate(x) for x in rows]
+                with self._action_api_cache_lock:
+                    self._wbsearch_memory[digest] = out
+                    self._wbsearch_memory.move_to_end(digest)
+                    while len(self._wbsearch_memory) > ACTION_API_SEARCH_MEMORY_MAX_ENTRIES:
+                        self._wbsearch_memory.popitem(last=False)
+                return list(out)
+            except Exception as e:
+                logger.warning("Redis wbsearch cache read failed: %s", e)
+        return None
+
+    def _wbsearch_items_cache_set(self, digest: str, entities: List[WikidataEntity]) -> None:
+        if not self._cache_action_api_responses:
+            return
+        snapshot = list(entities)
+        with self._action_api_cache_lock:
+            self._wbsearch_memory[digest] = snapshot
+            self._wbsearch_memory.move_to_end(digest)
+            while len(self._wbsearch_memory) > ACTION_API_SEARCH_MEMORY_MAX_ENTRIES:
+                self._wbsearch_memory.popitem(last=False)
+        if self._redis:
+            try:
+                rkey = f"{self._wbsearch_redis_prefix}:{digest}"
+                raw = json.dumps([e.model_dump() for e in snapshot])
+                self._redis.setex(rkey, self._wbsearch_ttl, raw)
+            except Exception as e:
+                logger.warning("Redis wbsearch cache write failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Wikidata Action API (wbgetentities)
+    # ------------------------------------------------------------------
+
+    def _get_wikidata_action_session(self) -> requests.Session:
+        with self._action_api_session_lock:
+            if self._action_api_session is None:
+                sess = requests.Session()
+                sess.headers.update({"User-Agent": USER_AGENT})
+                self._action_api_session = sess
+            return self._action_api_session
+
+    @staticmethod
+    def _resolve_wb_entity_payload(
+        qid: str,
+        entities_block: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Follow wbgetentities redirect stubs to leaf item JSON."""
+        seen: Set[str] = set()
+        cur = qid
+        for _ in range(8):
+            if cur not in entities_block:
+                return None
+            payload = entities_block[cur]
+            if not isinstance(payload, dict):
+                return None
+            if payload.get("missing") == "" or payload.get("missing") is True:
+                return None
+            tgt = payload.get("redirect")
+            if not tgt:
+                return payload
+            if tgt in seen:
+                return None
+            seen.add(cur)
+            cur = str(tgt).strip().upper()
+        return None
+
+    @staticmethod
+    def _wikipedia_url_from_enwiki_sitelink(enwiki: Any) -> Optional[str]:
+        """Build canonical en.wikipedia.org URL from wbgetentities sitelink.
+
+        The Action API often returns ``title`` (+ ``site``) without ``url``; SPARQL
+        OPTIONAL previously supplied schema.org article URLs.
+        """
+        if isinstance(enwiki, str) and enwiki.strip():
+            return enwiki.strip()
+        if not isinstance(enwiki, dict):
+            return None
+        raw_url = enwiki.get("url")
+        if isinstance(raw_url, str) and raw_url.strip():
+            return raw_url.strip()
+        title = enwiki.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return None
+        slug = title.strip().replace(" ", "_")
+        return f"https://en.wikipedia.org/wiki/{quote(slug, safe='')}"
+
+    @staticmethod
+    def _entity_from_wb_payload(payload: Dict[str, Any]) -> Optional[WikidataEntity]:
+        if not isinstance(payload, dict):
+            return None
+        qid_val = payload.get("id")
+        if not qid_val or not isinstance(qid_val, str):
+            return None
+        qid_val = qid_val.strip().upper()
+        if not re.fullmatch(r"Q\d+", qid_val):
+            return None
+
+        label = None
+        labels = payload.get("labels") or {}
+        en_lab = labels.get("en") if isinstance(labels, dict) else None
+        if isinstance(en_lab, dict):
+            label = en_lab.get("value")
+        elif isinstance(en_lab, str):
+            label = en_lab
+        if isinstance(label, str) and label.startswith("Q") and label[1:].isdigit():
+            label = None
+
+        description = None
+        descs = payload.get("descriptions") or {}
+        en_desc = descs.get("en") if isinstance(descs, dict) else None
+        if isinstance(en_desc, dict):
+            description = en_desc.get("value")
+        elif isinstance(en_desc, str):
+            description = en_desc
+
+        aliases: List[str] = []
+        alias_block = payload.get("aliases") or {}
+        en_aliases = alias_block.get("en") if isinstance(alias_block, dict) else None
+        if isinstance(en_aliases, list):
+            for a in en_aliases:
+                if isinstance(a, dict) and a.get("value"):
+                    aliases.append(str(a["value"]).strip())
+                elif isinstance(a, str) and a.strip():
+                    aliases.append(a.strip())
+
+        sitelinks = payload.get("sitelinks")
+        enwiki = sitelinks.get("enwiki") if isinstance(sitelinks, dict) else None
+        wikipedia_url = WikidataClient._wikipedia_url_from_enwiki_sitelink(enwiki)
+
+        return WikidataEntity(
+            qid=qid_val,
+            label=label or None,
+            description=description or None,
+            aliases=aliases,
+            url=f"https://www.wikidata.org/wiki/{qid_val}",
+            wikipedia_url=wikipedia_url,
+        )
+
+    def _wbgetentities_request(self, qids: List[str]) -> Dict[str, WikidataEntity]:
+        """Single wbgetentities HTTP request. *qids* must be non-empty normalized IDs."""
+        if not qids:
+            return {}
+        ids_param = "|".join(qids)
+        params = {
+            "action": "wbgetentities",
+            "ids": ids_param,
+            "props": "labels|descriptions|aliases|sitelinks",
+            "languages": "en",
+            "format": "json",
+            "redirects": "yes",
+        }
+        t_api = time.perf_counter()
+        try:
+            resp = self._get_wikidata_action_session().get(
+                WIKIDATA_ACTION_API_URL,
+                params=params,
+                timeout=WIKIDATA_WB_API_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            _wikidata_timing(
+                "wbgetentities",
+                time.perf_counter() - t_api,
+                batch_size=len(qids),
+                error=str(e),
+            )
+            raise
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            msg = err.get("info", err) if isinstance(err, dict) else err
+            _wikidata_timing(
+                "wbgetentities",
+                time.perf_counter() - t_api,
+                batch_size=len(qids),
+                error=str(msg),
+            )
+            raise RuntimeError(f"wbgetentities API error: {msg}")
+        entities_block = data.get("entities") if isinstance(data, dict) else None
+        if not isinstance(entities_block, dict):
+            entities_block = {}
+        out: Dict[str, WikidataEntity] = {}
+        for qid in qids:
+            payload = self._resolve_wb_entity_payload(qid, entities_block)
+            if not payload:
+                continue
+            ent = self._entity_from_wb_payload(payload)
+            if ent:
+                out[qid] = ent
+        _wikidata_timing(
+            "wbgetentities",
+            time.perf_counter() - t_api,
+            batch_size=len(qids),
+            rows=len(out),
+        )
+        return out
+
+    def _get_entities_batch_via_action_api(self, qids: List[str]) -> Dict[str, WikidataEntity]:
+        chunk = min(BATCH_SIZE, WBGETENTITIES_MAX_IDS_PER_REQUEST)
+        merged: Dict[str, WikidataEntity] = {}
+        for start in range(0, len(qids), chunk):
+            batch = qids[start : start + chunk]
+            to_fetch: List[str] = []
+            for q in batch:
+                cached = self._entity_metadata_cache_get(q)
+                if cached is not None:
+                    merged[q] = cached
+                else:
+                    to_fetch.append(q)
+            if not to_fetch:
+                continue
+            part = self._wbgetentities_request(to_fetch)
+            for k, v in part.items():
+                merged[k] = v
+                self._entity_metadata_cache_set(k, v)
+        return merged
+
+    def _get_entities_batch_via_sparql(self, qids: List[str]) -> Dict[str, WikidataEntity]:
+        entity_map: Dict[str, WikidataEntity] = {}
+        for start in range(0, len(qids), BATCH_SIZE):
+            batch = qids[start : start + BATCH_SIZE]
+            values_clause = " ".join(f"wd:{q}" for q in batch)
+            sparql = f"""
+            SELECT ?entity ?entityLabel ?entityDescription ?entityAltLabel ?article
+            WHERE {{
+              VALUES ?entity {{ {values_clause} }}
+              OPTIONAL {{
+                ?article schema:about ?entity ;
+                         schema:isPartOf <https://en.wikipedia.org/> .
+              }}
+              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
+            }}
+            """
+            for row in self._sparql_query(sparql):
+                uri = row.get("entity", {}).get("value", "")
+                if "/entity/" not in uri:
+                    continue
+                qid_val = uri.split("/")[-1].upper()
+
+                label = row.get("entityLabel", {}).get("value", "")
+                if label.startswith("Q") and label[1:].isdigit():
+                    label = ""
+
+                description = row.get("entityDescription", {}).get("value", "")
+
+                alt_label = row.get("entityAltLabel", {}).get("value", "")
+                aliases = [a.strip() for a in alt_label.split(",") if a.strip()] if alt_label else []
+
+                wikipedia_url = row.get("article", {}).get("value")
+
+                if qid_val not in entity_map:
+                    entity_map[qid_val] = WikidataEntity(
+                        qid=qid_val,
+                        label=label or None,
+                        description=description or None,
+                        aliases=aliases,
+                        url=f"https://www.wikidata.org/wiki/{qid_val}",
+                        wikipedia_url=wikipedia_url,
+                    )
+        return entity_map
+
     # ------------------------------------------------------------------
     # SPARQL execution
     # ------------------------------------------------------------------
 
     def _sparql_query(self, sparql: str) -> List[Dict]:
+        kind = _sparql_query_kind(sparql)
+        t_wall = time.perf_counter()
         with self._semaphore:
             # SPARQLWrapper defaults to GET; WDQS matches draft.ipynb/W3C examples better via URL-encoded POST.
             # Pass agent= to avoid stacking User-Agent with the library default on urllib.Request.
@@ -523,13 +955,33 @@ class WikidataClient:
                 _sparql_rate_limit(self._max_sparql_rps)
                 try:
                     results = client.query().convert()
-                    return results.get("results", {}).get("bindings", [])
+                    bindings = results.get("results", {}).get("bindings", [])
+                    _wikidata_timing(
+                        "sparql",
+                        time.perf_counter() - t_wall,
+                        kind=kind,
+                        rows=len(bindings),
+                    )
+                    return bindings
                 except Exception as e:
                     if attempt == MAX_RETRIES - 1:
                         logger.error(f"SPARQL query failed after {MAX_RETRIES} attempts: {e}")
+                        _wikidata_timing(
+                            "sparql",
+                            time.perf_counter() - t_wall,
+                            kind=kind,
+                            rows=0,
+                            error=str(e),
+                        )
                         return []
                     sleep_s = _sparql_retry_sleep_seconds(e, attempt)
                     if isinstance(e, HTTPError) and e.code == 429:
+                        _wikidata_timing(
+                            "sparql_429",
+                            0.0,
+                            kind=kind,
+                            http_status=429,
+                        )
                         logger.warning(
                             "WDQS returned 429; sleeping %.1fs then retry %d/%d (%s)",
                             sleep_s,
@@ -648,6 +1100,9 @@ class WikidataClient:
         if not title_to_canonical:
             return
 
+        t_wiki = time.perf_counter()
+        num_titles = len(title_to_canonical)
+
         def _get_session() -> requests.Session:
             session = getattr(session_local, "session", None)
             if session is None:
@@ -710,6 +1165,14 @@ class WikidataClient:
                     for raw_url in canonical_to_raw.get(canonical_url, []):
                         for e in by_url.get(raw_url, []):
                             e.wikipedia_content = content
+
+        filled = sum(1 for e in entities if e and e.wikipedia_content)
+        _wikidata_timing(
+            "wikipedia_fetch",
+            time.perf_counter() - t_wiki,
+            batch_size=num_titles,
+            rows=filled,
+        )
 
     @staticmethod
     def _canonicalize_wikipedia_url(url: str) -> Optional[str]:
@@ -952,6 +1415,7 @@ class WikidataClient:
 
     def _rest_v1_search_entities(self, text: str, num_results: int) -> List[WikidataEntity]:
         """Item search via Wikibase REST v1 JSON API."""
+        t0 = time.perf_counter()
         try:
             resp = requests.get(
                 WIKIDATA_REST_SEARCH_ITEMS_URL,
@@ -963,10 +1427,23 @@ class WikidataClient:
             payload = resp.json()
         except Exception as e:
             logger.debug("Wikidata REST v1 search failed: %s", e)
+            _wikidata_timing(
+                "rest_item_search",
+                time.perf_counter() - t0,
+                batch_size=num_results,
+                rows=0,
+                error=str(e),
+            )
             return []
 
         rows = payload.get("results") if isinstance(payload, dict) else None
         if not rows:
+            _wikidata_timing(
+                "rest_item_search",
+                time.perf_counter() - t0,
+                batch_size=num_results,
+                rows=0,
+            )
             return []
 
         entities: List[WikidataEntity] = []
@@ -996,12 +1473,113 @@ class WikidataClient:
                     url=f"https://www.wikidata.org/wiki/{qid}",
                 )
             )
-        return entities[:num_results]
+        entities = entities[:num_results]
+        _wikidata_timing(
+            "rest_item_search",
+            time.perf_counter() - t0,
+            batch_size=num_results,
+            rows=len(entities),
+        )
+        return entities
+
+    def _wbsearchentities_search_items(self, text: str, num_results: int) -> List[WikidataEntity]:
+        """Item text search via Action API ``wbsearchentities`` (avoids WDQS mwapi)."""
+        if not text or not str(text).strip():
+            return []
+        limit = max(1, min(int(num_results), 50))
+        digest = self._wbsearch_items_cache_digest(text, limit)
+        cached = self._wbsearch_items_cache_get(digest)
+        if cached is not None:
+            _wikidata_timing(
+                "wbsearchentities_cache",
+                0.0,
+                batch_size=num_results,
+                rows=len(cached),
+            )
+            return cached[:num_results]
+
+        params = {
+            "action": "wbsearchentities",
+            "search": text,
+            "language": "en",
+            "type": "item",
+            "limit": limit,
+            "format": "json",
+            "uselang": "en",
+        }
+        t0 = time.perf_counter()
+        try:
+            resp = self._get_wikidata_action_session().get(
+                WIKIDATA_ACTION_API_URL,
+                params=params,
+                timeout=WIKIDATA_WB_API_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            _wikidata_timing(
+                "wbsearchentities",
+                time.perf_counter() - t0,
+                batch_size=num_results,
+                error=str(e),
+            )
+            raise
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            msg = err.get("info", err) if isinstance(err, dict) else err
+            _wikidata_timing(
+                "wbsearchentities",
+                time.perf_counter() - t0,
+                batch_size=num_results,
+                error=str(msg),
+            )
+            raise RuntimeError(f"wbsearchentities API error: {msg}")
+        rows = data.get("search") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            rows = []
+        entities: List[WikidataEntity] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            qid = row.get("id")
+            if not isinstance(qid, str) or not qid.strip():
+                continue
+            qid = qid.strip().upper()
+            if not re.fullmatch(r"Q\d+", qid):
+                continue
+            label = row.get("label")
+            if not isinstance(label, str):
+                label = None
+            desc = row.get("description")
+            if not isinstance(desc, str):
+                desc = None
+            entities.append(
+                WikidataEntity(
+                    qid=qid,
+                    label=label,
+                    description=desc,
+                    url=f"https://www.wikidata.org/wiki/{qid}",
+                )
+            )
+        entities = entities[:num_results]
+        _wikidata_timing(
+            "wbsearchentities",
+            time.perf_counter() - t0,
+            batch_size=num_results,
+            rows=len(entities),
+        )
+        self._wbsearch_items_cache_set(digest, entities)
+        return entities
 
     def _search_entity_by_text(self, text: str, num_results: int = 1) -> List[WikidataEntity]:
         found = self._rest_v1_search_entities(text, num_results=num_results)
         if found:
             return found
+
+        try:
+            return self._wbsearchentities_search_items(text, num_results)
+        except Exception as e:
+            logger.warning("wbsearchentities failed; using SPARQL mwapi fallback: %s", e)
 
         text_escaped = json.dumps(text)
         sparql = f"""
@@ -1042,52 +1620,42 @@ class WikidataClient:
         if not qids:
             return {}
 
+        t0 = time.perf_counter()
+        normalized = [_normalize_qid(q) for q in qids]
+        order = list(dict.fromkeys(q for q in normalized if q))
+        if not order:
+            _wikidata_timing(
+                "entity_batch_total",
+                time.perf_counter() - t0,
+                batch_size=0,
+                rows=0,
+            )
+            return {}
+
         entity_map: Dict[str, WikidataEntity] = {}
+        if self._use_action_api_for_entities:
+            try:
+                entity_map = self._get_entities_batch_via_action_api(order)
+            except Exception as e:
+                logger.warning("wbgetentities failed; will try SPARQL for missing QIDs: %s", e)
+                entity_map = {}
 
-        for start in range(0, len(qids), BATCH_SIZE):
-            batch = qids[start : start + BATCH_SIZE]
-            values_clause = " ".join(f"wd:{q}" for q in batch)
-            sparql = f"""
-            SELECT ?entity ?entityLabel ?entityDescription ?entityAltLabel ?article
-            WHERE {{
-              VALUES ?entity {{ {values_clause} }}
-              OPTIONAL {{
-                ?article schema:about ?entity ;
-                         schema:isPartOf <https://en.wikipedia.org/> .
-              }}
-              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
-            }}
-            """
-            for row in self._sparql_query(sparql):
-                uri = row.get("entity", {}).get("value", "")
-                if "/entity/" not in uri:
-                    continue
-                qid_val = uri.split("/")[-1].upper()
-
-                label = row.get("entityLabel", {}).get("value", "")
-                if label.startswith("Q") and label[1:].isdigit():
-                    label = ""
-
-                description = row.get("entityDescription", {}).get("value", "")
-
-                alt_label = row.get("entityAltLabel", {}).get("value", "")
-                aliases = [a.strip() for a in alt_label.split(",") if a.strip()] if alt_label else []
-
-                wikipedia_url = row.get("article", {}).get("value")
-
-                if qid_val not in entity_map:
-                    entity_map[qid_val] = WikidataEntity(
-                        qid=qid_val,
-                        label=label or None,
-                        description=description or None,
-                        aliases=aliases,
-                        url=f"https://www.wikidata.org/wiki/{qid_val}",
-                        wikipedia_url=wikipedia_url,
-                    )
+        missing = [q for q in order if q not in entity_map]
+        if missing:
+            sparql_map = self._get_entities_batch_via_sparql(missing)
+            for k, v in sparql_map.items():
+                if k not in entity_map:
+                    entity_map[k] = v
 
         if get_details:
             self._fetch_wikipedia_contents_concurrent(list(entity_map.values()))
 
+        _wikidata_timing(
+            "entity_batch_total",
+            time.perf_counter() - t0,
+            batch_size=len(order),
+            rows=len(entity_map),
+        )
         return entity_map
 
     def search_entities(

@@ -86,8 +86,11 @@ def test_sparql_query_429_uses_retry_after(monkeypatch):
             return {"results": {"bindings": [{"x": {"value": "ok"}}]}}
 
     class FakeSPARQLWrapper:
-        def __init__(self, endpoint: str):
+        def __init__(self, endpoint: str, *args, **kwargs):
             self.endpoint = endpoint
+
+        def setMethod(self, method):
+            return None
 
         def setTimeout(self, timeout: int):
             return None
@@ -124,8 +127,11 @@ def test_sparql_query_calls_rate_limiter(monkeypatch):
             return {"results": {"bindings": []}}
 
     class FakeSPARQLWrapper:
-        def __init__(self, endpoint: str):
+        def __init__(self, endpoint: str, *args, **kwargs):
             self.endpoint = endpoint
+
+        def setMethod(self, method):
+            return None
 
         def setTimeout(self, timeout: int):
             return None
