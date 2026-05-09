@@ -13,25 +13,17 @@ import time
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
+from urllib.error import HTTPError
 from urllib.parse import unquote
 
 from datasets import disable_progress_bars
 import pydantic
 import requests
-from SPARQLWrapper import SPARQLWrapper, JSON
+from SPARQLWrapper import SPARQLWrapper, JSON, POST
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-
-try:
-    from wikibase_rest_api_client import Client as WikibaseClient
-    from wikibase_rest_api_client.api.items import get_item as wb_get_item
-    from wikibase_rest_api_client.api.search import search_item as wb_search
-    WIKIBASE_AVAILABLE = True
-except ImportError:
-    WIKIBASE_AVAILABLE = False
-    logger.warning("wikibase_rest_api_client is not installed; Wikibase-backed fallbacks are disabled.")
 
 WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
 WIKIPEDIA_API_BATCH_SIZE = 50
@@ -69,6 +61,43 @@ def _sparql_rate_limit(max_requests_per_second: float) -> None:
         if elapsed < min_interval:
             time.sleep(min_interval - elapsed)
         _sparql_last_request_time[0] = time.monotonic()
+
+
+def _sparql_retry_sleep_seconds(exc: BaseException, attempt: int) -> float:
+    """Backoff before retrying WDQS.
+
+    During WDQS instability Wikimedia returns HTTP 429 with rules such as
+    \"Aggressively rate-limiting to 1 req / min\" (per-IP or per-fingerprint).
+    Retrying after only a few seconds keeps you over quota; honor Retry-After
+    or wait at least ~one minute when that policy is indicated.
+    """
+    jitter = random.uniform(0, 2)
+    generic = RETRY_BASE_DELAY * (2 ** attempt) + jitter
+
+    if isinstance(exc, HTTPError) and exc.code == 429:
+        hdrs = exc.headers
+        if hdrs:
+            ra = hdrs.get("Retry-After")
+            if ra is not None:
+                try:
+                    return float(ra) + random.uniform(0, 1)
+                except ValueError:
+                    pass
+        hint = (getattr(exc, "reason", None) or str(exc) or "").lower()
+        if "1 req" in hint and "min" in hint:
+            return 60.0 + jitter
+        return max(generic, 30.0 + jitter)
+
+    retry_after = getattr(exc, "headers", None)
+    if retry_after is not None:
+        ra = retry_after.get("Retry-After") if hasattr(retry_after, "get") else None
+        if ra is not None:
+            try:
+                return float(ra) + random.uniform(0, 1)
+            except (TypeError, ValueError):
+                pass
+
+    return generic
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +261,9 @@ class WikidataPathBetweenEntities(pydantic.BaseModel):
 # ---------------------------------------------------------------------------
 
 WIKIDATA_SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
+# Wikibase REST item search (v1). wikibase-rest-api-client's search_item still targets removed v0 / wrong rewrite.
+WIKIDATA_REST_SEARCH_ITEMS_URL = "https://www.wikidata.org/w/rest.php/wikibase/v1/search/items"
+REST_SEARCH_TIMEOUT_S = 60
 random_str = lambda n: "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=5)) # for user agent uniqueness to help with Wikidata rate limits (this is just a best effort and does not guarantee avoiding rate limits, but can help a bit by making it less likely to be identified as a single client across multiple runs)
 USER_AGENT = f"WEMG/0.2.0.{os.uname().nodename}.{random_str(10)}"
 MAX_RETRIES = 3
@@ -427,14 +459,6 @@ class WikidataClient:
         self._wikipedia_dump_dataset, self._wikidump_url_index = self._load_wikipedia_dump_dataset()
         # Cache canonical_url -> content to avoid re-scanning for the same URLs across MCTS iterations.
         self._wikidump_content_cache: Dict[str, Optional[str]] = {}
-        self._wikibase_client = None
-        if WIKIBASE_AVAILABLE:
-            try:
-                self._wikibase_client = WikibaseClient(
-                    base_url="https://www.wikidata.org/w/rest.php/wikibase/v0"
-                )
-            except Exception as e:
-                logger.warning("Failed to initialize Wikibase client; continuing without it: %s", e)
 
     def _lru_get(
         self,
@@ -485,11 +509,16 @@ class WikidataClient:
 
     def _sparql_query(self, sparql: str) -> List[Dict]:
         with self._semaphore:
-            client = SPARQLWrapper(WIKIDATA_SPARQL_ENDPOINT)
+            # SPARQLWrapper defaults to GET; WDQS matches draft.ipynb/W3C examples better via URL-encoded POST.
+            # Pass agent= to avoid stacking User-Agent with the library default on urllib.Request.
+            client = SPARQLWrapper(
+                WIKIDATA_SPARQL_ENDPOINT,
+                returnFormat=JSON,
+                agent=USER_AGENT,
+            )
+            client.setMethod(POST)
             client.setTimeout(SPARQL_TIMEOUT_S)
             client.setQuery(sparql)
-            client.setReturnFormat(JSON)
-            client.addCustomHttpHeader("User-Agent", USER_AGENT)
             for attempt in range(MAX_RETRIES):
                 _sparql_rate_limit(self._max_sparql_rps)
                 try:
@@ -499,17 +528,18 @@ class WikidataClient:
                     if attempt == MAX_RETRIES - 1:
                         logger.error(f"SPARQL query failed after {MAX_RETRIES} attempts: {e}")
                         return []
-                    # Respect Retry-After header on 429 if present.
-                    retry_after = None
-                    if hasattr(e, "headers"):
-                        retry_after = e.headers.get("Retry-After")
-                    if retry_after is not None:
-                        try:
-                            time.sleep(float(retry_after))
-                        except ValueError:
-                            time.sleep(RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1))
+                    sleep_s = _sparql_retry_sleep_seconds(e, attempt)
+                    if isinstance(e, HTTPError) and e.code == 429:
+                        logger.warning(
+                            "WDQS returned 429; sleeping %.1fs then retry %d/%d (%s)",
+                            sleep_s,
+                            attempt + 2,
+                            MAX_RETRIES,
+                            getattr(e, "reason", None) or e,
+                        )
                     else:
-                        time.sleep(RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 1))
+                        logger.debug("SPARQL query attempt failed: %s; retry in %.1fs", e, sleep_s)
+                    time.sleep(sleep_s)
         return []
 
     # ------------------------------------------------------------------
@@ -920,38 +950,58 @@ class WikidataClient:
     # Entity search / retrieval
     # ------------------------------------------------------------------
 
+    def _rest_v1_search_entities(self, text: str, num_results: int) -> List[WikidataEntity]:
+        """Item search via Wikibase REST v1 JSON API."""
+        try:
+            resp = requests.get(
+                WIKIDATA_REST_SEARCH_ITEMS_URL,
+                params={"q": text, "language": "en", "limit": num_results},
+                headers={"User-Agent": USER_AGENT},
+                timeout=REST_SEARCH_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            logger.debug("Wikidata REST v1 search failed: %s", e)
+            return []
+
+        rows = payload.get("results") if isinstance(payload, dict) else None
+        if not rows:
+            return []
+
+        entities: List[WikidataEntity] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            qid = item.get("id")
+            if not qid:
+                continue
+            label = None
+            dl = item.get("display-label") or item.get("display_label")
+            if isinstance(dl, dict):
+                label = dl.get("value")
+            elif isinstance(dl, str):
+                label = dl
+            desc = None
+            dobj = item.get("description")
+            if isinstance(dobj, dict):
+                desc = dobj.get("value")
+            elif isinstance(dobj, str):
+                desc = dobj
+            entities.append(
+                WikidataEntity(
+                    qid=qid,
+                    label=label,
+                    description=desc,
+                    url=f"https://www.wikidata.org/wiki/{qid}",
+                )
+            )
+        return entities[:num_results]
+
     def _search_entity_by_text(self, text: str, num_results: int = 1) -> List[WikidataEntity]:
-        if WIKIBASE_AVAILABLE and self._wikibase_client:
-            try:
-                response = wb_search.sync(
-                    client=self._wikibase_client,
-                    search=text,
-                    language="en",
-                    limit=num_results,
-                )
-                items = (
-                    response
-                    if isinstance(response, list)
-                    else getattr(response, "results", []) or []
-                )
-                entities: List[WikidataEntity] = []
-                for item in items:
-                    qid = getattr(item, "id", None) or (
-                        item.get("id") if isinstance(item, dict) else None
-                    )
-                    if qid:
-                        entities.append(WikidataEntity(
-                            qid=qid,
-                            label=getattr(item, "label", None)
-                            or (item.get("label") if isinstance(item, dict) else None),
-                            description=getattr(item, "description", None)
-                            or (item.get("description") if isinstance(item, dict) else None),
-                            url=f"https://www.wikidata.org/wiki/{qid}",
-                        ))
-                if entities:
-                    return entities[:num_results]
-            except Exception as e:
-                logger.debug(f"wikibase_rest_api_client search failed: {e}")
+        found = self._rest_v1_search_entities(text, num_results=num_results)
+        if found:
+            return found
 
         text_escaped = json.dumps(text)
         sparql = f"""
@@ -1045,8 +1095,14 @@ class WikidataClient:
         query: Union[str, List[str]],
         num_results: int = 1,
         get_details: bool = True,
+        *,
+        is_qids: bool = False,
     ) -> Union[List[WikidataEntity], List[List[WikidataEntity]]]:
-        """Search for Wikidata entities by text query or QID(s)."""
+        """Search for Wikidata entities by text query or QID(s).
+
+        When *is_qids* is True (e.g. Azure linking), strings that are not valid QIDs
+        yield empty lists instead of running label search.
+        """
         is_single = isinstance(query, str)
         queries = [query] if is_single else list(query)
 
@@ -1057,7 +1113,7 @@ class WikidataClient:
             qid = _normalize_qid(q)
             if qid:
                 qid_entries.append((i, qid))
-            else:
+            elif not is_qids:
                 text_entries.append((i, q))
 
         # Batch fetch all QIDs in one call (or few if over BATCH_SIZE)
@@ -1747,9 +1803,15 @@ class WikidataClient:
         query: Union[str, List[str]],
         num_results: int = 1,
         get_details: bool = True,
+        *,
+        is_qids: bool = False,
     ) -> Union[List[WikidataEntity], List[List[WikidataEntity]]]:
         return await asyncio.to_thread(
-            self.search_entities, query, num_results, get_details,
+            self.search_entities,
+            query,
+            num_results,
+            get_details,
+            is_qids=is_qids,
         )
 
     async def aget_k_hop_triples(

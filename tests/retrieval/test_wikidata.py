@@ -63,6 +63,18 @@ def test_wikidata_client_search_entities_by_qid():
     assert ent.description is None or isinstance(ent.description, str)
 
 
+def test_search_entities_is_qids_skips_text_search():
+    """is_qids=True must not run REST label search for non-QID strings."""
+    client = _make_client()
+    results = client.search_entities(
+        "totally-not-a-qid-string",
+        num_results=3,
+        get_details=False,
+        is_qids=True,
+    )
+    assert results == []
+
+
 def test_search_entities_text_query_real():
     """Text query search should return plausible entities with valid IDs and URLs."""
     client = _make_client()
