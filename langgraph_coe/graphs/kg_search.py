@@ -46,7 +46,6 @@ class KGSearchState(TypedDict, total=False):
 
 def _build_ner_user_message(state: KGSearchState) -> str:
     parts = [
-        f"original_question:\n{state.get('original_query', '')}",
         f"subquery:\n{state.get('subquery', '')}",
     ]
     if state.get("context"):
@@ -60,10 +59,9 @@ def _build_triple_user_message(state: KGSearchState) -> str:
     qids = state.get("qids_for_triples") or []
     return "\n\n".join(
         [
-            f"original_question:\n{state.get('original_query', '')}",
             f"subquery:\n{state.get('subquery', '')}",
             f"context:\n{state.get('context', '')}",
-            f"seed_qids (use these in fetch_and_prune_subgraph):\n{', '.join(qids)}",
+            f"seed_qids:\n{', '.join(qids)}",
         ]
     )
 

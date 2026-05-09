@@ -1,5 +1,11 @@
-from typing import Dict, Optional
-from pydantic import BaseModel
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import yaml
+from pydantic import BaseModel, Field
 
 class TierConfig(BaseModel):
     """LLM configuration for one tier."""
@@ -92,3 +98,36 @@ class WikidataConfig(BaseModel):
     reranker_model: Optional[str] = "Qwen3-Reranker-4B"
     pruning_top_k: int = 64      # max triples kept after Stage A
     pruning_delta: float = 0.05  # score tolerance below the top score
+
+
+class LangGraphCoeConfig(BaseModel):
+    """Root settings for ``langgraph_coe`` loaded from ``config.yaml``."""
+
+    llm: LLMConfig = Field(default_factory=LLMConfig)
+    wikidata: WikidataConfig = Field(default_factory=WikidataConfig)
+    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    retriever: RetrieverConfig = Field(default_factory=RetrieverConfig)
+    reranker: RerankerConfig = Field(default_factory=RerankerConfig)
+
+    @staticmethod
+    def default_yaml_path() -> Path:
+        return Path(__file__).resolve().parent / "config.yaml"
+
+    @classmethod
+    def from_yaml(cls, path: Optional[Path | str] = None, *, merge_api_key_env: bool = True) -> LangGraphCoeConfig:
+        """Load from YAML; when *path* is omitted, use ``default_yaml_path()`` if it exists."""
+
+        p = Path(path) if path is not None else cls.default_yaml_path()
+        raw: Dict[str, Any] | None = None
+        if p.is_file():
+            with p.open(encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+        merged = cls.model_validate(raw or {})
+        if merge_api_key_env:
+            key = merged.llm.api_key or os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
+            merged.llm.api_key = key
+            if not merged.retriever.corpus.embedder.api_key:
+                merged.retriever.corpus.embedder.api_key = key
+            if not merged.reranker.api_key:
+                merged.reranker.api_key = key or "EMPTY"
+        return merged
