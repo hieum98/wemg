@@ -48,33 +48,53 @@ _wikidata_client: Optional[WikidataClient] = None
 _wikidata_config: Optional[WikidataConfig] = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-question async-task-local state via ContextVar
+# Per-question mutable state.
 #
-# ContextVar is the correct primitive here: each asyncio.Task inherits a copy
-# of the context at the moment it is created, so parallel questions in
-# agent.batch() or asyncio.gather() are fully isolated from each other.
+# LangChain's BaseTool.ainvoke runs the tool coroutine in a child Task with its
+# own copy of the parent's context (via ``asyncio.create_task(coro, context=...)``).
+# Plain ContextVar assignments inside the tool do NOT propagate back to the
+# parent, which breaks state that has to accumulate across sequential tool
+# calls (e.g. the hop-budget counter).
+#
+# The fix is to bind a single mutable ``_SessionState`` object via ContextVar.
+# Child tasks INHERIT the same object reference, so mutations to its fields
+# propagate via shared identity. Concurrent agent runs (e.g.
+# ``asyncio.gather`` of distinct questions) each call ``reset_wikidata_session()``
+# inside their own task, which rebinds the ContextVar to a fresh object — that
+# rebinding stays local to the rebinding task, so isolation is preserved.
 # ──────────────────────────────────────────────────────────────────────────────
 
-# QIDs already explored in this question's traversal.
-_cv_visited_qids: ContextVar[Set[str]] = ContextVar(
-    "wikidata_visited_qids", default=None  # type: ignore[arg-type]
+
+class _SessionState:
+    """Per-question mutable state shared via ContextVar object identity."""
+
+    __slots__ = ("visited", "hop_count")
+
+    def __init__(self) -> None:
+        self.visited: Set[str] = set()
+        self.hop_count: int = 0
+
+
+_cv_session: ContextVar[Optional[_SessionState]] = ContextVar(
+    "wikidata_session", default=None
 )
 
-# How many fetch_and_prune_subgraph calls have been made for this question.
-_cv_hop_count: ContextVar[int] = ContextVar("wikidata_hop_count", default=0)
-
-# Name -> QID cache persistent during the whole run (across questions)
-entity_cache = {}   
+# Name -> QID cache persistent during the whole run (across questions).
+entity_cache: Dict[str, str] = {}
 
 _PRUNE_BATCH_SIZE = 16
 
 
+def _get_session() -> _SessionState:
+    s = _cv_session.get(None)
+    if s is None:
+        s = _SessionState()
+        _cv_session.set(s)
+    return s
+
+
 def _get_visited() -> Set[str]:
-    v = _cv_visited_qids.get(None)
-    if v is None:
-        v = set()
-        _cv_visited_qids.set(v)
-    return v
+    return _get_session().visited
 
 
 def init_wikidata(config: WikidataConfig) -> None:
@@ -82,25 +102,22 @@ def init_wikidata(config: WikidataConfig) -> None:
     global _wikidata_client, _wikidata_config
     _wikidata_config = config
     _wikidata_client = WikidataClient(
-        properties=list(DEFAULT_PROPERTIES),
-        property_labels=dict(PROPERTY_LABELS),
-        max_wikipedia_requests_per_second=config.max_wikipedia_rps,
-        max_sparql_requests_per_second=config.max_sparql_rps,
-        triple_cache_max_entries=config.triple_cache_max_entries,
+        max_sparql_rps=config.max_sparql_rps,
+        max_wikipedia_rps=config.max_wikipedia_rps,
+        lru_capacity=config.triple_cache_max_entries,
     )
     logger.info("WikidataClient initialised (max_hops=%d)", config.max_hops)
 
 
 def reset_wikidata_session() -> None:
-    """Reset per-question ContextVar state for the current async Task.
+    """Reset per-question state for the current async Task.
 
-    Call this at the start of every new question (e.g. at the top of kb_node).
-    Because we use ContextVar each parallel Task already has its own copy, but
-    calling reset ensures a fresh slate even when Tasks are reused (e.g. in a
-    thread pool).
+    Call at the start of every new question (e.g. at the top of ``kb_node``)
+    and inside any newly-spawned ``asyncio.gather`` child whose state must be
+    isolated from siblings. Rebinds the ContextVar to a fresh ``_SessionState``
+    object; sibling tasks keep their own object.
     """
-    _cv_visited_qids.set(set())
-    _cv_hop_count.set(0)
+    _cv_session.set(_SessionState())
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -212,18 +229,12 @@ async def link_entities(entity_names: List[str]) -> List[Dict[str, str]]:
 
     if to_resolve:
         try:
-            results = await _wikidata_client.asearch_entities(
-                to_resolve, num_results=1, get_details=True
-            )
-            if results and isinstance(results[0], list):
+            results = await _wikidata_client.link_entities(to_resolve, top_k=1)
+            # link_entities for list input returns list[list[WikidataEntity]]
+            if results and isinstance(results, list) and isinstance(results[0], list):
                 for name, candidates in zip(to_resolve, results):
                     if candidates:
-                        entity = candidates[0]
-                        entity_cache[name] = entity.qid
-            elif results:
-                for name, entity in zip(to_resolve, results):
-                    if isinstance(entity, WikidataEntity):
-                        entity_cache[name] = entity.qid
+                        entity_cache[name] = candidates[0].qid
         except Exception as exc:
             logger.warning("Entity linking failed: %s", exc)
 
@@ -250,8 +261,9 @@ async def _fetch_and_prune_subgraph_core(
     if _wikidata_client is None or _wikidata_config is None:
         raise RuntimeError("Wikidata not initialised. Call init_wikidata first.")
 
-    visited = _get_visited()
-    hop_count = _cv_hop_count.get(0)
+    session = _get_session()
+    visited = session.visited
+    hop_count = session.hop_count
 
     if hop_count >= _wikidata_config.max_hops:
         return [
@@ -272,10 +284,10 @@ async def _fetch_and_prune_subgraph_core(
         return ["[No valid QIDs provided.]"]
 
     visited.update(new_qids)
-    _cv_hop_count.set(hop_count + 1)
+    session.hop_count = hop_count + 1
 
     try:
-        raw_results = await _wikidata_client.aget_k_hop_triples(
+        raw_results = await _wikidata_client.get_k_hop_triples(
             new_qids, k=1, bidirectional=False, enrich=True
         )
     except Exception as exc:
@@ -352,13 +364,13 @@ async def enrich_entities(qids: List[str]) -> List[WikidataEntity]:
     if _wikidata_client is None:
         raise RuntimeError("Wikidata not initialised. Call init_wikidata first.")
 
-    seed_entities = [WikidataEntity(qid=q) for q in qids if q]
-    if not seed_entities:
+    valid_qids = [q for q in qids if q]
+    if not valid_qids:
         return []
 
     try:
-        enriched = await _wikidata_client.aenrich_entities(
-            seed_entities, get_details=True
+        enriched = await _wikidata_client.enrich_entities(
+            valid_qids, get_details=True
         )
     except Exception as exc:
         logger.error("Entity enrichment failed for %s: %s", qids, exc)
