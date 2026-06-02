@@ -97,7 +97,7 @@ def _get_visited() -> Set[str]:
     return _get_session().visited
 
 
-def init_wikidata(config: WikidataConfig) -> None:
+def init_wikidata(config: WikidataConfig, *, cache: Any = None) -> None:
     """Initialise the Wikidata client once at startup."""
     global _wikidata_client, _wikidata_config
     _wikidata_config = config
@@ -105,6 +105,7 @@ def init_wikidata(config: WikidataConfig) -> None:
         max_sparql_rps=config.max_sparql_rps,
         max_wikipedia_rps=config.max_wikipedia_rps,
         lru_capacity=config.triple_cache_max_entries,
+        cache=cache,
     )
     logger.info("WikidataClient initialised (max_hops=%d)", config.max_hops)
 

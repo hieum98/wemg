@@ -1,28 +1,36 @@
-"""Consolidated role definitions and the execute_role function.
+"""Role definitions for langgraph_coe.
 
-All Pydantic I/O models, system prompts, Role instances, and execution logic
-from the original base_role.py, generator.py, evaluator.py, extractor.py,
-open_ie.py, pruner.py, and base_role_execution.py.
+Each ``Role`` bundles a name, system prompt, Pydantic input model, and Pydantic
+output model. ``langgraph_coe/llm.py:RoleModelRegistry`` maps the role's name
+to a tier (``heavy`` / ``medium`` / ``light``); see ``config.py:LLMConfig``.
+
+Active callers today live in Phase 1–3 subgraphs. A handful of roles
+(``QUESTION_REPHRASER``, ``REASONING_SYNTHESIZER``, ``EVALUATOR``,
+``EXTRACTOR``) are kept without a current caller — their prompts are tuned
+and they fit planned use cases (alternative MCTS expansion strategies,
+offline answer evaluation harness, standalone information extraction). Roles
+fully dropped from the port (``QUERY_GENERATOR``, ``MAJORITY_VOTER``,
+``CONSENSUS_EVALUATOR``) are listed in ``implementation_plan.md`` §3.6.
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import List, Optional, Type
 
 import pydantic
+
 
 class WikidataEntity(pydantic.BaseModel):
     qid: str
     label: str
     description: str = ""
 
+
 logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-
 # Role dataclass
 # =============================================================================
 
@@ -36,7 +44,6 @@ class Role:
 
 
 # =============================================================================
-
 # Generator I/O Models
 # =============================================================================
 
@@ -56,6 +63,16 @@ class SubquestionGenerationInput(pydantic.BaseModel):
 class SubquestionGenerationOutput(pydantic.BaseModel):
     is_answerable: bool = pydantic.Field(..., description="If the main question can be answered with context.")
     subquestions: Optional[List[str]] = pydantic.Field(None, description="Generated subquestions which are atomic, self-contained and diverse.")
+    needs_kg: Optional[List[bool]] = pydantic.Field(
+        None,
+        description=(
+            "Parallel array to `subquestions` (same length and order). "
+            "True if subquestions[i] targets a specific named entity's relation or "
+            "attribute and should additionally query the knowledge graph; False if it "
+            "is best served by document retrieval alone (no named entity, or a "
+            "definitional / conceptual gap)."
+        ),
+    )
 
 
 class AnswerGenerationInput(pydantic.BaseModel):
@@ -63,7 +80,12 @@ class AnswerGenerationInput(pydantic.BaseModel):
     context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
 
     def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+        # Context-first ordering: in every batched call site (CoT ``gen_subanswers``,
+        # MCTS ``_gen_subqa``) the same ``context`` is reused across all S subquestions
+        # while ``question`` varies. Emitting the shared context block first lets
+        # SGLang RadixAttention serve it from the prefix cache on S-1 of the S calls
+        # (§3a). Reordering is prompt-shape only; the model sees the same fields.
+        return f"context:\n{self.context}\n\nquestion:\n{self.question}"
 
 
 class AnswerGenerationOutput(pydantic.BaseModel):
@@ -73,15 +95,26 @@ class AnswerGenerationOutput(pydantic.BaseModel):
     confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
-class QueryGeneratorInput(pydantic.BaseModel):
-    input_text: str = pydantic.Field(..., description="Input text to deconstruct into queries.")
+class WebResearcherInput(pydantic.BaseModel):
+    subquery: str = pydantic.Field(..., description="Sub-question to investigate on the web.")
+    research_budget: int = pydantic.Field(..., description="Maximum number of web queries to issue.")
 
     def __str__(self):
         return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
 
 
-class QueryGeneratorOutput(pydantic.BaseModel):
-    queries: List[str] = pydantic.Field(..., description="Generated search queries.")
+class WebResearchResult(pydantic.BaseModel):
+    title: str = pydantic.Field(..., description="Result page title.")
+    url: str = pydantic.Field(..., description="Canonical result URL.")
+    snippet: str = pydantic.Field(..., description="Short search snippet from the provider.")
+    full_text: str = pydantic.Field("", description="Optional crawled body text.")
+
+
+class WebResearcherOutput(pydantic.BaseModel):
+    results: List[WebResearchResult] = pydantic.Field(
+        ...,
+        description="Deduplicated web findings relevant to the subquery.",
+    )
 
 
 class SelfCorrectionInput(pydantic.BaseModel):
@@ -125,31 +158,8 @@ class ReasoningSynthesizeOutput(pydantic.BaseModel):
     confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
-class Query(pydantic.BaseModel):
-    subject: str = pydantic.Field(..., description="Subject entity in the query.")
-    relation: str = pydantic.Field(..., description="Relation to query.")
-    reasoning: Optional[str] = pydantic.Field(None, description="Reasoning for inclusion.")
-
-    def __hash__(self):
-        return hash((self.subject, self.relation))
-
-
-class QueryGraphGeneratorInput(pydantic.BaseModel):
-    input_text: str = pydantic.Field(..., description="Input to deconstruct.")
-    entities: Optional[List[str]] = pydantic.Field(None, description="Entities to focus on.")
-    relations: Optional[List[str]] = pydantic.Field(None, description="Relations to use.")
-
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
-
-
-class QueryGraphGeneratorOutput(pydantic.BaseModel):
-    queries: List[Query] = pydantic.Field(..., description="Generated structured queries.")
-
-
 # =============================================================================
-
-# Evaluator I/O Models
+# Evaluation I/O Models
 # =============================================================================
 
 
@@ -167,20 +177,26 @@ class AnswerEvaluationOutput(pydantic.BaseModel):
     reasoning: str = pydantic.Field(..., description="Reasoning behind the rating.")
 
 
-class MajorityVoteInput(pydantic.BaseModel):
-    question: str = pydantic.Field(..., description="The question.")
-    answers: List[str] = pydantic.Field(..., description="List of candidate answers.")
+# =============================================================================
+# Extractor I/O Models
+# =============================================================================
+
+
+class ExtractionInput(pydantic.BaseModel):
+    question: str = pydantic.Field(..., description="The user's question.")
+    raw_data: str = pydantic.Field(..., description="Raw text to analyze.")
 
     def __str__(self):
-        answers_str = "\n\n".join(f"{i+1}.\n {a}" for i, a in enumerate(self.answers))
-        return f"question:\n{self.question}\n\nanswers:\n{answers_str}"
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
 
 
-class MajorityVoteOutput(pydantic.BaseModel):
-    final_answer: str = pydantic.Field(..., description="Final answer by majority voting.")
-    concise_answer: str = pydantic.Field(..., description="Concise version.")
-    reasoning: str = pydantic.Field(..., description="Reasoning behind the final answer.")
-    confidence_level: str = pydantic.Field(..., description="Confidence level")
+class ExtractionOutput(pydantic.BaseModel):
+    relevant_information: List[str] = pydantic.Field(..., description="Self-contained information that is (directly or indirectly) relevant to the question.")
+
+
+# =============================================================================
+# Synthesis & Verification I/O Models
+# =============================================================================
 
 
 class FinalAnswerSynthesisInput(pydantic.BaseModel):
@@ -210,20 +226,6 @@ class FinalAnswerSynthesisOutput(pydantic.BaseModel):
     confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
-class ConsensusEvaluationInput(pydantic.BaseModel):
-    question: str = pydantic.Field(..., description="The question to be answered.")
-    candidate_answers: List[str] = pydantic.Field(..., description="Candidate answers.")
-
-    def __str__(self):
-        candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
-        return f"question:\n{self.question}\n\ncandidate_answers:\n{candidates_str}"
-
-
-class ConsensusEvaluationOutput(pydantic.BaseModel):
-    rating: float = pydantic.Field(..., ge=0.0, le=10.0, description="Rating from 0.0 to 10.0.")
-    reasoning: str = pydantic.Field(..., description="Reasoning behind the rating.")
-
-
 class AnswerVerificationInput(pydantic.BaseModel):
     question: str
     candidate_answer: str
@@ -239,26 +241,13 @@ class AnswerVerificationOutput(pydantic.BaseModel):
 
 
 # =============================================================================
-
-# Extractor I/O Models
+# Memory & Open IE I/O Models
 # =============================================================================
 
 
 class SourceType(Enum):
     SYSTEM_PREDICTION = "System Prediction"
     RETRIEVAL = "Retrieval"
-
-
-class ExtractionInput(pydantic.BaseModel):
-    question: str = pydantic.Field(..., description="The user's question.")
-    raw_data: str = pydantic.Field(..., description="Raw text to analyze.")
-
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
-
-
-class ExtractionOutput(pydantic.BaseModel):
-    relevant_information: List[str] = pydantic.Field(..., description="Self-contained information that is (directly or indirectly) relevant to the question.")
 
 
 class MemoryItem(pydantic.BaseModel):
@@ -277,12 +266,6 @@ class MemoryConsolidationInput(pydantic.BaseModel):
 
 class MemoryConsolidationOutput(pydantic.BaseModel):
     consolidated_memory: List[MemoryItem] = pydantic.Field(..., description="Refined memory items.")
-
-
-# =============================================================================
-
-# Open IE I/O Models
-# =============================================================================
 
 
 class Entity(pydantic.BaseModel):
@@ -348,8 +331,8 @@ class Relation(pydantic.BaseModel):
         if not isinstance(other, Relation):
             return False
         same_subject = self.subject_id==other.subject_id if self.subject_id and other.subject_id else self.subject == other.subject
-        same_object = self.object_id==other.object_id if self.object_id and other.object_id else self.object == other.object 
-        
+        same_object = self.object_id==other.object_id if self.object_id and other.object_id else self.object == other.object
+
         return (same_subject and same_object
                 and self.relation == other.relation)
 
@@ -378,8 +361,28 @@ class RelationExtractionOutput(pydantic.BaseModel):
     relations: List[Relation] = pydantic.Field(..., description="Extracted relationships.")
 
 
-# =============================================================================
+class OpenIEInput(pydantic.BaseModel):
+    text: str = pydantic.Field(..., description="Text to extract entities and relations from.")
+    known_entities: Optional[List[WikidataEntity]] = pydantic.Field(
+        None,
+        description="Optional reference list of known entities with Wikidata QIDs. Use only when certain; never guess IDs.",
+    )
 
+    def __str__(self):
+        if self.known_entities:
+            known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
+            known_entities_str = "\n".join(known_entities_str)
+            return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
+        else:
+            return f"Text:\n{self.text}"
+
+
+class OpenIEOutput(pydantic.BaseModel):
+    entities: List[Entity] = pydantic.Field(..., description="Extracted named entities.")
+    relations: List[Relation] = pydantic.Field(..., description="Extracted relationships.")
+
+
+# =============================================================================
 # Pruner I/O Models
 # =============================================================================
 
@@ -392,12 +395,12 @@ class TriplePruneInput(pydantic.BaseModel):
         triples_str = "\n".join(f"- [{i}]. {t}" for i, t in enumerate(self.triples))
         return f"Question:\n{self.question}\n---\nTriples:\n{triples_str}"
 
+
 class TriplePruneOutput(pydantic.BaseModel):
     keep_indices: List[int] = pydantic.Field(..., description="0-based indices of triples to keep.")
 
 
 # =============================================================================
-
 # System Prompts -- Generator
 # =============================================================================
 
@@ -431,10 +434,29 @@ Preserve the geographic or categorical scope of the main question. Do NOT silent
 - BAD: Main Q = "third oldest university in the world" → subQ = "oldest university in England" ← narrows to England
 - GOOD: subQ = "three oldest surviving universities in the world and their founding dates"
 
+## Retrieval-Ready Phrasing
+Each subquestion is issued verbatim as a dense-retrieval query against a knowledge corpus and the web. Phrase it the way a relevant source document would phrase the same fact, not as a Socratic question that no one would type into a search box.
+- Prefer concrete noun phrases plus the missing predicate to verbose interrogatives.
+- Use full proper names (no pronouns, no abbreviations) so the embedding lands near the entity's article opening.
+- BAD: "Could you tell me what the height of the tower is?"
+- GOOD: "Eiffel Tower height in meters"
+
+## Temporal Grounding
+If the main question contains "current", "now", "today", or a present-tense superlative ("tallest", "fastest", "longest", "oldest surviving", "richest"), anchor at least one subquestion with an explicit recency marker (e.g. "as of 2026" or the relevant year). Stale snapshots in the corpus otherwise win the embedding match.
+- BAD: "tallest building in the world"
+- GOOD: "tallest building in the world as of 2026"
+
+## Knowledge-Graph Routing
+For each subquestion, decide whether it should additionally hit the structured knowledge graph (Wikidata). Emit a parallel `needs_kg` boolean array, same length and order as `subquestions`.
+- Set **true** when the subquestion asks for a **relation or attribute of a specific named entity** (person, place, organization, work, event) — e.g. "Eiffel Tower height in meters", "director of Inception", "capital of France". These resolve cleanly to graph triples and benefit from multi-hop traversal.
+- Set **false** when the subquestion has **no named entity** or seeks a **definitional / conceptual / procedural** answer — e.g. "mechanism of photosynthesis", "difference between TCP and UDP". The knowledge graph returns nothing useful here; document retrieval covers it.
+- When in doubt, prefer **true** — document retrieval always runs regardless, so a false negative on an entity question is the costlier error.
+
 ## Output Format
 Respond with a JSON object with exactly these keys:
 - is_answerable: boolean — true if the main question can be answered from the provided context alone
 - subquestions: array of strings, or null — up to 5 strategic subquestions; null or [] if is_answerable is true
+- needs_kg: array of booleans, or null — parallel to `subquestions` (same length and order); null or [] if is_answerable is true
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
@@ -513,75 +535,34 @@ Respond with a single JSON object with exactly these keys:
 - confidence_level: string — short label for how strong the step_conclusion is given the context
 """
 
-GENERATE_QUERIES_PROMPT = """You are a Reasoning Engine that deconstructs user input into precise, self-contained search queries.
+WEB_RESEARCHER_PROMPT = """You are a focused web research agent for multi-hop QA.
 
-## Principles:
-1. Self-Contained: Each query understandable without original input.
-2. Atomic: One single fact per query.
-3. Essential & Non-Redundant: Every query necessary and unique.
+Your input has:
+- subquery: the specific question to answer now
+- research_budget: maximum number of search attempts you are allowed
 
-## Instructions:
-1. Parse the Input: 
-    - If the input is a question: Identify its type (e.g., factual, comparative, causal, temporal), key entities, and the required reasoning steps. 
-    - If the input is a statement: Deconstruct it into its core, verifiable claims. Identify the key entities and the asserted relationships between them. 
-2. Generate Strategic Queries: Formulate a list of search queries that are necessary to answer/verify the input. Each query is a building block to reach the final answer that follows the guiding principles above. The goal is to provide the user with all the search components they would need to solve the problem from scratch.
-3. Ensure Self-Containment: Each query must be understandable and answerable on its own. Make sure each query is self-contained and does not rely on the original input, other queries, or any external context. Rewrite queries that are not self-contained.
-4. Review for Completeness and Non-Redundancy: Ensure that the set of queries collectively covers all necessary information to answer/verify the input without any overlap or unnecessary duplication.
-5. Rank Verification: If the question asks for a ranked entity ("Nth X", "highest", "most", "record holder", "largest", "oldest", etc.), always generate at least one query that verifies the rank directly — not just the properties of a candidate entity. Example: Q="third largest river by discharge" → include "list of rivers by discharge volume" or "what is the third largest river by discharge", not only "Ganges-Brahmaputra discharge volume" (which only confirms a candidate without establishing the rank).
-6. Temporal Grounding: If the input contains "current", "now", "today", or a present-tense superlative ("tallest", "fastest", "longest", "oldest surviving"), add "as of [current year]" to at least one query to avoid stale results from outdated sources.
-7. Fallback Queries: Add 1–2 fallback queries using common aliases, shortened names, or alternative phrasings for the same facts — so that retrieval succeeds if the primary phrasing returns no results. Fallback queries seek the same information via different wording, not new facts. Example: primary = "Frederica of Mecklenburg-Strelitz birthplace" → fallback = "Queen Frederica birthplace".
+Your goal is to collect high-signal evidence with iterative queries while respecting budget.
 
-## Output Format:
-Respond with a JSON object with exactly these keys:
-- queries: array of strings — each string is one self-contained search query
+Process:
+1. Start with one precise query for the subquery.
+2. If early results are noisy, issue a refined query (add entities, dates, aliases, or constraints).
+3. Stop early when additional searches are unlikely to add new evidence.
+4. Avoid duplicate URLs and near-duplicate pages.
+
+Output schema requirements:
+- title: page title
+- url: stable URL
+- snippet: concise summary of the supporting claim
+- full_text: optional extracted body text (empty string if unavailable)
+
+Return only findings that are directly relevant to the subquery and suitable as retrieval evidence.
 """
 
 
 # =============================================================================
-
-# System Prompts -- Evaluator
+# System Prompts -- Synthesis & Verification
 # =============================================================================
 
-
-JUDGE_ANSWER_PROMPT_V2 = """You are an expert evaluator. Your task is to rate the system_answer on a scale from 0.0 to 10.0 based on how effectively it addresses the user_question.
-
-Evaluation Criteria:
-1. Correctness (60%): Is the information factually accurate?
-   - If correct_answer is provided and system_answer matches correct_answer, award 10.0
-   - If no correct_answer is provided, verify accuracy using internet search or your knowledge
-2. Helpfulness & Relevance (40%): Does it address the user's core need with appropriate detail?
-
-Scoring Guidelines:
-- 9.0-10.0: Correct and comprehensive (10.0 if matches correct_answer)
-- 7.0-8.9: Mostly correct with minor issues
-- 5.0-6.9: Partially addresses question or has accuracy concerns
-- 3.0-4.9: Significant correctness or relevance issues
-- 0.0-2.9: Incorrect or completely off-topic
-
-IMPORTANT NOTE: Conduct your own internet searches/knowledge investigation as needed to verify factual claims when correct_answer is not provided. Do not assume the system_answer is correct. You must independently verify all claims.
-
-**Uncertainty rule**: If you are not confident about the correct answer (obscure facts, precise numbers, specific dates, rare entities), assign 5.0 rather than a confident high or low score. Only assign scores below 3.0 or above 8.0 when you are certain.
-
-## Output Format:
-Respond with a JSON object with exactly these keys:
-- rating: number — float from 0.0 to 10.0 inclusive
-- reasoning: string — brief justification referencing correctness and relevance
-"""
-
-MAJORITY_VOTE_PROMPT = """You are an expert at evaluating answers. Given a question and answers, determine the final answer based on majority voting.
-
-Instructions:
-1. Analyze the question
-2. Identify underlying consensus across responses
-3. Synthesize a single, accurate answer based on majority consensus
-
-## Output Format:
-Respond with a JSON object with exactly these keys:
-- final_answer: string — best integrated answer
-- concise_answer: string — minimal wording direct answer only
-- reasoning: string — how consensus was determined and why this answer was chosen
-- confidence_level: string — short label for confidence in the synthesized answer
-"""
 
 SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis. Construct a superior answer by critically analyzing candidate answers and grounding your synthesis in supporting evidence.
 
@@ -626,6 +607,51 @@ Respond with a JSON object with exactly these keys:
 - confidence_level: string — one of: "high", "medium", "low", or "uncertain"
 """
 
+JUDGE_ANSWER_PROMPT_V2 = """You are an expert evaluator. Your task is to rate the system_answer on a scale from 0.0 to 10.0 based on how effectively it addresses the user_question.
+
+Evaluation Criteria:
+1. Correctness (60%): Is the information factually accurate?
+   - If correct_answer is provided and system_answer matches correct_answer, award 10.0
+   - If no correct_answer is provided, verify accuracy using internet search or your knowledge
+2. Helpfulness & Relevance (40%): Does it address the user's core need with appropriate detail?
+
+Scoring Guidelines:
+- 9.0-10.0: Correct and comprehensive (10.0 if matches correct_answer)
+- 7.0-8.9: Mostly correct with minor issues
+- 5.0-6.9: Partially addresses question or has accuracy concerns
+- 3.0-4.9: Significant correctness or relevance issues
+- 0.0-2.9: Incorrect or completely off-topic
+
+IMPORTANT NOTE: Conduct your own internet searches/knowledge investigation as needed to verify factual claims when correct_answer is not provided. Do not assume the system_answer is correct. You must independently verify all claims.
+
+**Uncertainty rule**: If you are not confident about the correct answer (obscure facts, precise numbers, specific dates, rare entities), assign 5.0 rather than a confident high or low score. Only assign scores below 3.0 or above 8.0 when you are certain.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- rating: number — float from 0.0 to 10.0 inclusive
+- reasoning: string — brief justification referencing correctness and relevance
+"""
+
+EXTRACT_PROMPT = """You are a meticulous research analyst. Build a comprehensive dossier of information from the provided text that could help answer the question.
+
+Rules:
+- Consider both direct and indirect relevant information. An information is considered relevant if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
+- Extracted information must be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items.
+
+Instructions:
+1. Question Deconstruction: Identify primary subject, key entities, and specific information sought.
+2. Candidate Identification: Identify and quote ALL passages that seem potentially related to the concepts in the question. Be liberal and inclusive in this initial pass; we will filter and refine in the next step.
+3. Relevance Evaluation: Assess each quote against criteria (directly answering, contextual, supporting evidence, etc.).
+4. Extraction: Extract ALL relevant information verbatim. Add context for clarity but preserve original meaning, make sure each extracted information is self-contained (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items) and can be used to answer the question.
+5. Final evaluation:
+    - Examine the extracted information to make sure each information is self-contained. If it is not, rewrite it to make it self-contained.
+    - Remove information that is not relevant to the question. The information considers relevant if it contains ANY information that could clue the answer to the question.
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- relevant_information: array of strings — each string is one self-contained fact or quote useful for the question (empty array if nothing relevant)
+"""
+
 VERIFY_ANSWER_PROMPT = """You are an expert verifier. Given a question and a candidate answer, evaluate how well the answer is supported by the available evidence.
 
 - If context is provided: use it as the primary source of evidence to verify the answer.
@@ -646,51 +672,11 @@ Respond with a JSON object with exactly these keys:
 - reasoning: string — brief justification
 """
 
-CONSENSUS_EVALUATION_PROMPT = """You are an expert evaluator. Given two candidate answers with their reasoning, evaluate the consensus between the two answers. Rate from 0.0 to 10.0 how well the two answers are consistent with each other.
-
-Criteria:
-- Answer Alignment (40%): Do the final answers reach the same or compatible conclusions?
-- Reasoning Consistency (35%): Are the logical steps, assumptions, and intermediate conclusions similar?
-- Information Agreement (25%): Do both answers rely on consistent facts and evidence?
-
-Scoring Guidelines:
-- 9.0-10.0: Nearly perfect consensus - answers and reasoning are essentially identical or fully compatible
-- 7.0-8.9: Strong consensus - minor differences in phrasing or emphasis, but core conclusions align
-- 5.0-6.9: Moderate consensus - answers agree on main points but differ in details or approach
-- 3.0-4.9: Weak consensus - some overlap but significant disagreements or contradictions
-- 0.0-2.9: No consensus - answers contradict each other or address different aspects entirely
-
-## Output Format:
-Respond with a JSON object with exactly these keys:
-- rating: number — float from 0.0 to 10.0 inclusive measuring consensus strength
-- reasoning: string — what aligned or conflicted between the candidates
-"""
 
 # =============================================================================
-
-# System Prompts -- Extractor
+# System Prompts -- Memory
 # =============================================================================
 
-
-EXTRACT_PROMPT = """You are a meticulous research analyst. Build a comprehensive dossier of information from the provided text that could help answer the question.
-
-Rules:
-- Consider both direct and indirect relevant information. An information is considered relevant if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
-- Extracted information must be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items.
-
-Instructions:
-1. Question Deconstruction: Identify primary subject, key entities, and specific information sought.
-2. Candidate Identification: Identify and quote ALL passages that seem potentially related to the concepts in the question. Be liberal and inclusive in this initial pass; we will filter and refine in the next step.
-3. Relevance Evaluation: Assess each quote against criteria (directly answering, contextual, supporting evidence, etc.).
-4. Extraction: Extract ALL relevant information verbatim. Add context for clarity but preserve original meaning, make sure each extracted information is self-contained (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items) and can be used to answer the question.
-5. Final evaluation: 
-    - Examine the extracted information to make sure each information is self-contained. If it is not, rewrite it to make it self-contained.
-    - Remove information that is not relevant to the question. The information considers relevant if it contains ANY information that could clue the answer to the question.
-
-## Output Format:
-Respond with a JSON object with exactly these keys:
-- relevant_information: array of strings — each string is one self-contained fact or quote useful for the question (empty array if nothing relevant)
-"""
 
 MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 
@@ -715,8 +701,8 @@ Respond with a JSON object with exactly these keys:
   - hop_depth: integer or null — hop level of this item (null if pre-consolidated/untagged)
 """
 
-# =============================================================================
 
+# =============================================================================
 # System Prompts -- Open IE
 # =============================================================================
 
@@ -724,7 +710,7 @@ Respond with a JSON object with exactly these keys:
 NER_PROMPT = """You are an expert Named Entity Recognition specialist. Extract all named entities from the text.
 
 You may be given an optional list of KNOWN ENTITIES, each with:
-- id: Wikidata QID 
+- id: Wikidata QID
 - name: official Wikidata label
 - description: brief description for disambiguation
 
@@ -791,7 +777,7 @@ You may issue at most a few subgraph fetches; prefer one well-formed call with a
 RELATION_EXTRACTION_PROMPT = """You are an expert Relation Extraction specialist. Extract all meaningful relationships between entities. Each relationship should be self-contained, i.e., understandable on its own without needing to refer back to the original text or entities.
 
 You may be given an optional list of KNOWN ENTITIES, each with:
-- id: Wikidata QID 
+- id: Wikidata QID
 - name: official Wikidata label
 - description: brief description for disambiguation
 
@@ -802,7 +788,7 @@ Wikidata linking rules (strict):
 
 Instructions:
 1. Identify entity pairs with direct relationships. Don't guess or invent answers for the question.
-2. Break down complex relationships into simpler relationships. 
+2. Break down complex relationships into simpler relationships.
 3. Only extract explicitly stated or strongly implied relationships.
 4. Use clear, concise relation types.
 5. Make sure extracted relationships are self-contained and not duplicated.
@@ -838,8 +824,73 @@ Respond with a JSON object with exactly these keys:
   - context: string or null — self-contained snippet if needed
 """
 
-# =============================================================================
+OPEN_IE_PROMPT = """You are an expert Open Information Extraction specialist. In one pass, extract all named entities AND all meaningful relationships between them from the text.
 
+You may be given an optional list of KNOWN ENTITIES, each with:
+- id: Wikidata QID
+- name: official Wikidata label
+- description: brief description for disambiguation
+
+Wikidata linking rules (strict):
+- If an extracted entity or relation subject/object clearly matches a KNOWN ENTITY (by name and/or description), set its id/subject_id/object_id to that QID and use the KNOWN ENTITY's official name.
+- If there is any ambiguity or you are not fully certain, leave ids as null.
+- NEVER guess or invent a QID if it is not provided.
+
+## Entity extraction
+1. If text is a question, focus ONLY on entities which are main clues to answer the question. Don't guess or invent answers for the question.
+2. Define precise boundaries (include modifiers like "Prime Minister Boris Johnson").
+3. Handle ambiguity using context (e.g., "Apple" as company vs. fruit).
+4. Extract unique entities only once (deduplicate by real-world entity; if id is present, also deduplicate by id).
+5. Extract ALL named entities, including those not appearing in any relation.
+
+Entity rules:
+- Only extract actual named entities, not common nouns or pronouns.
+- No overlapping entities; extract the most complete version.
+- For each entity, provide a brief description for clarity when helpful.
+
+## Relation extraction
+1. Identify entity pairs with direct relationships. Don't guess or invent answers for the question.
+2. Break down complex relationships into simpler relationships.
+3. Only extract explicitly stated or strongly implied relationships.
+4. Use clear, concise relation types.
+5. Make sure extracted relationships are self-contained and not duplicated.
+6. Entity naming consistency:
+   - Reuse the exact same subject/object string for the same real-world entity across all extracted relations.
+   - Do not use aliases, abbreviations, or pronouns in subject/object strings.
+   - Set subject_id/object_id to null if the subject/object is not in the KNOWN ENTITIES list.
+
+## Canonical Relation Direction
+Always extract relations in the ACTIVE form: prefer verb predicates or "has_X" noun phrases. Never use passive or inverse forms.
+- CORRECT: (Sigmund Freud, has_child, Anna Freud)
+- WRONG:   (Anna Freud, child_of, Sigmund Freud)
+- CORRECT: (USA, contains, New York)
+- WRONG:   (New York, is_located_in, USA)
+- CORRECT: (Tiberius, precedes, Caligula)
+- WRONG:   (Caligula, preceded_by, Tiberius)
+- CORRECT: (James Cameron, directed, Titanic)
+- WRONG:   (Titanic, directed_by, James Cameron)
+
+Rules — convert to active form when a predicate:
+1. ends in "_of" (child_of, part_of, capital_of) → invert: has_child, contains, has_capital
+2. starts with "is_" (is_located_in, is_a) → invert to active form
+3. ends in "_by" (preceded_by, directed_by, owned_by, succeeded_by) → invert: precedes, directed, owns, succeeds/has_successor
+
+## Output Format:
+Respond with a JSON object with exactly these keys:
+- entities: array of objects; each object has:
+  - id: string or null — Wikidata QID when certain from KNOWN ENTITIES; otherwise null (NEVER GUESS)
+  - name: string — canonical entity name
+  - description: string or null — short disambiguating phrase when helpful
+- relations: array of objects; each object has:
+  - subject: string
+  - subject_id: string or null — null unless certain from KNOWN ENTITIES (NEVER GUESS)
+  - relation: string
+  - object: string
+  - object_id: string or null — null unless certain from KNOWN ENTITIES (NEVER GUESS)
+  - context: string or null — self-contained snippet if needed
+"""
+
+# =============================================================================
 # System Prompts -- Pruner
 # =============================================================================
 
@@ -870,27 +921,25 @@ Respond with a JSON object with exactly these keys:
 
 
 # =============================================================================
-
 # Role Instances
 # =============================================================================
 
 
+# Active callers in Phase 1–3 subgraphs.
 SUBQUESTION_GENERATOR = Role("subquestion_generator", GENERATE_SUBQUESTION_PROMPT, SubquestionGenerationInput, SubquestionGenerationOutput)
 ANSWER_GENERATOR = Role("answer_generator", ANSWER_PROMPT, AnswerGenerationInput, AnswerGenerationOutput)
-QUERY_GENERATOR = Role("query_generator", GENERATE_QUERIES_PROMPT, QueryGeneratorInput, QueryGeneratorOutput)
+WEB_RESEARCHER = Role("web_researcher", WEB_RESEARCHER_PROMPT, WebResearcherInput, WebResearcherOutput)
 SELF_CORRECTOR = Role("self_corrector", SELF_CORRECT_PROMPT, SelfCorrectionInput, SelfCorrectionOutput)
-QUESTION_REPHRASER = Role("question_rephraser", REPHRASE_QUESTION_PROMPT, QuestionRephraserInput, QuestionRephraserOutput)
-REASONING_SYNTHESIZER = Role("reasoning_synthesizer", SYNTHESIZE_PROMPT, ReasoningSynthesizeInput, ReasoningSynthesizeOutput)
-EVALUATOR = Role("evaluator", JUDGE_ANSWER_PROMPT_V2, AnswerEvaluationInput, AnswerEvaluationOutput)
-MAJORITY_VOTER = Role("majority_voter", MAJORITY_VOTE_PROMPT, MajorityVoteInput, MajorityVoteOutput)
 FINAL_ANSWER_SYNTHESIZER = Role("final_answer_synthesizer", SYNTHESIZE_FINAL_ANSWER_PROMPT, FinalAnswerSynthesisInput, FinalAnswerSynthesisOutput)
-CONSENSUS_EVALUATOR = Role("consensus_evaluator", CONSENSUS_EVALUATION_PROMPT, ConsensusEvaluationInput, ConsensusEvaluationOutput)
 VERIFIER = Role("verifier", VERIFY_ANSWER_PROMPT, AnswerVerificationInput, AnswerVerificationOutput)
-EXTRACTOR = Role("extractor", EXTRACT_PROMPT, ExtractionInput, ExtractionOutput)
 MEMORY_CONSOLIDATOR = Role("memory_consolidation", MEMORY_CONSOLIDATION_PROMPT, MemoryConsolidationInput, MemoryConsolidationOutput)
 NER = Role("named_entity_recognition", NER_PROMPT, NERInput, NEROutput)
 RELATION_EXTRACTOR = Role("relation_extraction", RELATION_EXTRACTION_PROMPT, RelationExtractionInput, RelationExtractionOutput)
+OPEN_IE = Role("open_ie", OPEN_IE_PROMPT, OpenIEInput, OpenIEOutput)
 TRIPLE_PRUNER = Role("triple_pruner", TRIPLE_PRUNE_PROMPT, TriplePruneInput, TriplePruneOutput)
 
-
-# =============================================================================
+# Kept without a current caller — planned use cases listed in implementation_plan.md §3.6.
+QUESTION_REPHRASER = Role("question_rephraser", REPHRASE_QUESTION_PROMPT, QuestionRephraserInput, QuestionRephraserOutput)
+REASONING_SYNTHESIZER = Role("reasoning_synthesizer", SYNTHESIZE_PROMPT, ReasoningSynthesizeInput, ReasoningSynthesizeOutput)
+EVALUATOR = Role("evaluator", JUDGE_ANSWER_PROMPT_V2, AnswerEvaluationInput, AnswerEvaluationOutput)
+EXTRACTOR = Role("extractor", EXTRACT_PROMPT, ExtractionInput, ExtractionOutput)

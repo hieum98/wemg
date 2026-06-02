@@ -1,7 +1,7 @@
 """LangGraph-CoE Tools Package."""
 
 from .retrieval import corpus_search, init_retrieval_pipeline
-from .web import web_search, init_web_search
+from .web import web_search, init_web_search, reset_web_research_session
 from .wikidata import (
     link_entities,
     fetch_and_prune_subgraph,
@@ -18,6 +18,7 @@ __all__ = [
     # Web
     "web_search",
     "init_web_search",
+    "reset_web_research_session",
     # Wikidata / Knowledge Graph
     "link_entities",
     "fetch_and_prune_subgraph",

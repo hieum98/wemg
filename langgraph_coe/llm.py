@@ -26,8 +26,46 @@ def format_messages(role: Role, item: BaseModel) -> List[Any]:
         HumanMessage(content=user_prompt),
     ]
 
-def parse_fallback(role: Role, raw_text: str) -> Optional[BaseModel]:
+def _content_to_text(content: Any) -> str:
+    """Coerce a LangChain message ``content`` field to a plain string.
+
+    Qwen3 (and other reasoning-capable models) under SGLang's OpenAI-compatible
+    API return ``content`` as a list of typed blocks
+    (e.g. ``[{'type': 'thinking', 'thinking': '...'}, {'type': 'text', 'text': '...'}]``).
+    Pull out the user-facing text segments and drop ``thinking``/``reasoning``
+    blocks; fall back to ``str()`` for anything we don't recognise so we never
+    silently lose information.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (bytes, bytearray)):
+        return content.decode("utf-8", errors="replace")
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+                continue
+            if not isinstance(block, dict):
+                parts.append(str(block))
+                continue
+            btype = block.get("type")
+            if btype in ("thinking", "reasoning", "redacted_thinking"):
+                continue
+            for key in ("text", "content", "value"):
+                if key in block and isinstance(block[key], str):
+                    parts.append(block[key])
+                    break
+            else:
+                parts.append(str(block))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def parse_fallback(role: Role, raw_text: Any) -> Optional[BaseModel]:
     """Fallback parsing using regex extraction if structured output fails."""
+    text = _content_to_text(raw_text)
+
     keys = list(role.output_model.model_fields.keys())
     specs = [
         extraction_type_from_annotation(f.annotation)
@@ -35,16 +73,23 @@ def parse_fallback(role: Role, raw_text: str) -> Optional[BaseModel]:
     ]
     value_types = [s[0] for s in specs]
     field_optional = [s[1] for s in specs]
-    
-    parsed_dict = extract_info_from_text(
-        raw_text, keys, value_types, field_optional=field_optional
-    )
-    
+
     try:
-        return role.output_model(**parsed_dict)
-    except Exception as e:
-        logger.warning(f"Fallback parsing failed for {role.name}: {e}")
-        return None
+        parsed_dict = extract_info_from_text(
+            text, keys, value_types, field_optional=field_optional
+        )
+    except Exception:
+        # Print the raw text the parser choked on so the failure mode is
+        # observable (e.g. truncated thinking, no JSON emitted at all).
+        preview = text if len(text) < 4000 else f"{text[:2000]}\n…[truncated {len(text)-4000} chars]…\n{text[-2000:]}"
+        print(
+            f"[parse_fallback] role={role.name!r} could not extract fields {keys} "
+            f"from raw content (len={len(text)}):\n----- BEGIN RAW -----\n{preview}\n----- END RAW -----",
+            flush=True,
+        )
+        raise
+
+    return role.output_model(**parsed_dict)
 
 
 class RoleModelRegistry:
@@ -69,8 +114,14 @@ class RoleModelRegistry:
             
         if tier not in self._instances:
             cfg = self._tiers[tier]
-            
-            # ChatLiteLLM args
+
+            # Qwen3/SGLang exposes thinking-mode toggle via chat_template_kwargs.
+            # Forward it so configured tiers actually take effect.
+            model_kwargs: Dict[str, Any] = {"top_p": cfg.top_p}
+            model_kwargs["chat_template_kwargs"] = {
+                "enable_thinking": cfg.enable_thinking,
+            }
+
             self._instances[tier] = ChatLiteLLM(
                 model=cfg.model_name,
                 api_base=cfg.api_base,
@@ -79,7 +130,7 @@ class RoleModelRegistry:
                 max_tokens=cfg.max_tokens,
                 max_retries=cfg.max_retries,
                 timeout=cfg.timeout,
-                model_kwargs={"top_p": cfg.top_p}
+                model_kwargs=model_kwargs,
             )
         return self._instances[tier]
 

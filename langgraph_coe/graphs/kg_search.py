@@ -18,7 +18,7 @@ from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from ..llm import RoleModelRegistry
-from ..roles import KG_NER_AGENT_SYSTEM, KG_TRIPLE_AGENT_SYSTEM
+from ..roles import KG_TRIPLE_AGENT_SYSTEM, NEROutput
 from ..tools.wikidata import (
     create_fetch_and_prune_tool,
     enrich_entities,
@@ -53,6 +53,18 @@ def _build_ner_user_message(state: KGSearchState) -> str:
     if state.get("known_entities_summary"):
         parts.append(f"known_entities_from_memory:\n{state['known_entities_summary']}")
     return "\n\n".join(parts)
+
+
+def _extract_entity_names(parsed: NEROutput) -> List[str]:
+    names: List[str] = []
+    for item in parsed.entities:
+        if isinstance(item, str):
+            name = item.strip()
+        else:
+            name = str(getattr(item, "name", "")).strip()
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
 
 
 def _build_triple_user_message(state: KGSearchState) -> str:
@@ -136,28 +148,31 @@ def build_kg_search_graph(registry: RoleModelRegistry):
     fetch_tool = create_fetch_and_prune_tool(registry)
 
     async def ner_agent_node(state: KGSearchState) -> Dict[str, Any]:
-        reset_wikidata_session()
-        model = registry.get_model("kg_ner_agent")
-        agent = create_agent(
-            model,
-            tools=[link_entities],
-            system_prompt=KG_NER_AGENT_SYSTEM,
-            name="kg_ner",
-        )
         user = _build_ner_user_message(state)
         errs = list(state.get("errors") or [])
         try:
-            out = await agent.ainvoke(
-                {"messages": [HumanMessage(content=user)]},
-                config={"recursion_limit": 40},
+            model = registry.get_model("kg_ner_agent")
+            chain = model.with_structured_output(NEROutput)
+            parsed = await chain.ainvoke(
+                [HumanMessage(content=user)],
             )
         except Exception as exc:
-            logger.exception("KG NER agent failed")
-            errs.append(f"ner_agent: {exc}")
+            logger.exception("KG NER extraction failed")
+            errs.append(f"ner_extraction: {exc}")
             return {"linked_entities": [], "qids_for_triples": [], "errors": errs}
 
-        msgs = cast(List[BaseMessage], out.get("messages", []))
-        linked = _parse_link_entities_tool_payloads(msgs)
+        names = _extract_entity_names(parsed)
+        if not names:
+            return {"linked_entities": [], "qids_for_triples": [], "errors": errs}
+
+        try:
+            linked = await link_entities.ainvoke({"entity_names": names})
+        except Exception as exc:
+            logger.exception("Direct link_entities tool call failed")
+            errs.append(f"link_entities: {exc}")
+            return {"linked_entities": [], "qids_for_triples": [], "errors": errs}
+
+        linked = [r for r in linked if isinstance(r, dict) and r.get("qid")]
         qids = list(dict.fromkeys(r["qid"] for r in linked if r.get("qid")))
         return {"linked_entities": linked, "qids_for_triples": qids, "errors": errs}
 

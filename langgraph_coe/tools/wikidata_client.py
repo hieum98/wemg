@@ -213,6 +213,7 @@ class WikidataClient:
         lru_capacity: int = 5000,
         redis: Optional[Any] = None,
         redis_ttl_seconds: int = 86400,
+        cache: Optional[Any] = None,
         concurrency_limit: int = 10,
     ) -> None:
         self._backend: WikidataBackend = backend if backend is not None else HTTPWikidataBackend()
@@ -230,6 +231,7 @@ class WikidataClient:
 
         self._redis = redis
         self._redis_ttl = redis_ttl_seconds
+        self._cache = cache
         self._inflight: Dict[str, asyncio.Future] = {}
 
     # ==========================================================
@@ -339,6 +341,73 @@ class WikidataClient:
 
         triples = {s: [self._make_triple(sig, enrich) for sig in results[s]] for s in seeds}
         return triples[seeds[0]] if single else [triples[s] for s in seeds]
+
+    async def get_entity(self, qid: str) -> WikidataEntity:
+        key = f"wd:entity:{qid}"
+        cached = self._cache_get(key)
+        if isinstance(cached, dict):
+            try:
+                return WikidataEntity.model_validate(cached)
+            except Exception:
+                pass
+
+        await self._fetch_entities([qid])
+        entity = self._make_entity(qid)
+        self._cache_set(key, entity.model_dump())
+        return entity
+
+    async def search_entities(self, name: str, *, top_k: int = 1) -> List[WikidataEntity]:
+        key = f"wd:search:{name.lower()}:{top_k}"
+        cached = self._cache_get(key)
+        if isinstance(cached, list):
+            out: List[WikidataEntity] = []
+            for item in cached:
+                if isinstance(item, dict):
+                    try:
+                        out.append(WikidataEntity.model_validate(item))
+                    except Exception:
+                        continue
+            if out:
+                return out
+
+        linked = await self.link_entities(name, top_k=top_k)
+        entities = linked if isinstance(linked, list) else []
+        self._cache_set(key, [e.model_dump() for e in entities])
+        return entities
+
+    async def get_triples(self, qid: str) -> List[WikiTriple]:
+        key = f"wd:triples:{qid}"
+        cached = self._cache_get(key)
+        if isinstance(cached, list):
+            out: List[WikiTriple] = []
+            for item in cached:
+                if isinstance(item, dict):
+                    try:
+                        out.append(WikiTriple.model_validate(item))
+                    except Exception:
+                        continue
+            if out:
+                return out
+
+        triples = await self.get_k_hop_triples(qid, k=1, bidirectional=False, enrich=True)
+        out = triples if isinstance(triples, list) else []
+        self._cache_set(key, [t.model_dump(mode="json") for t in out])
+        return out
+
+    async def get_wikipedia_content(self, qid: str) -> str:
+        key = f"wd:enrich:{qid}"
+        cached = self._cache_get(key)
+        if isinstance(cached, dict):
+            content = cached.get("content")
+            if isinstance(content, str):
+                return content
+
+        enriched = await self.enrich_entities(qid, get_details=True)
+        content = ""
+        if enriched:
+            content = enriched[0].wikipedia_content or ""
+        self._cache_set(key, {"content": content})
+        return content
 
     # ==========================================================
     # Link / property-search per-input
@@ -724,6 +793,22 @@ class WikidataClient:
             self._redis.setex(key, self._redis_ttl, payload)
         except Exception:
             pass
+
+    def _cache_get(self, key: str) -> Any:
+        if self._cache is None:
+            return None
+        try:
+            return self._cache.get(key)
+        except Exception:
+            return None
+
+    def _cache_set(self, key: str, value: Any) -> None:
+        if self._cache is None:
+            return
+        try:
+            self._cache.set(key, value)
+        except Exception:
+            return
 
 
 __all__ = [
