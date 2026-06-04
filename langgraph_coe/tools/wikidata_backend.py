@@ -84,6 +84,12 @@ WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 _ENTITY_URI_PREFIX = "http://www.wikidata.org/entity/"
 _PROP_DIRECT_URI_PREFIX = "http://www.wikidata.org/prop/direct/"
 
+# QEndpoint and some local SPARQL engines require explicit PREFIX declarations for wd:.
+_SPARQL_PREFIXES = (
+    "PREFIX wd: <http://www.wikidata.org/entity/> "
+    "PREFIX wdt: <http://www.wikidata.org/prop/direct/> "
+)
+
 
 def _random_id(n: int = 10) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
@@ -243,6 +249,7 @@ class HTTPWikidataBackend:
             return {}
         values = " ".join(f"wd:{q}" for q in qids)
         query = (
+            f"{_SPARQL_PREFIXES}"
             "SELECT ?seed ?p ?o WHERE { "
             f"VALUES ?seed {{ {values} }} "
             "?seed ?p ?o . "
@@ -271,6 +278,7 @@ class HTTPWikidataBackend:
             return {}
         values = " ".join(f"wd:{q}" for q in qids)
         query = (
+            f"{_SPARQL_PREFIXES}"
             "SELECT ?seed ?p ?s WHERE { "
             f"VALUES ?seed {{ {values} }} "
             "?s ?p ?seed . "

@@ -58,6 +58,10 @@ memory:
   extractor_max_input_chars: 24000
 
 wikidata:
+  # Local QEndpoint on n0162:1234 — use SSH tunnel, then set e.g.:
+  #   ssh -fN -L 30162:n0162:1234 t2
+  #   sparql_endpoint: http://127.0.0.1:30162/api/endpoint/sparql
+  sparql_endpoint: null
   max_sparql_rps: 2.0
   max_wikipedia_rps: 10.0
   triple_cache_max_entries: 5000

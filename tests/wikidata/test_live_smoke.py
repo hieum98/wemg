@@ -1,34 +1,58 @@
-"""Live-API smoke tests against the real Wikidata/Wikipedia endpoints.
+"""Live-API smoke tests against Wikidata (local QEndpoint SPARQL when configured).
 
-Skipped by default; run with::
+Default SPARQL: ``LANGGRAPH_TEST_SPARQL_URL`` or tunneled
+``http://127.0.0.1:30162/api/endpoint/sparql``. Omit / unreachable → public
+``query.wikidata.org``.
 
+Run::
+
+    ssh -fN -L 30162:n0162:1234 t2
     pytest tests/wikidata/test_live_smoke.py -m requires_wikidata -v
 """
 
 from __future__ import annotations
 
+import os
+
+import httpx
 import pytest
+
+SPARQL_URL = os.environ.get(
+    "LANGGRAPH_TEST_SPARQL_URL",
+    "http://127.0.0.1:30162/api/endpoint/sparql",
+)
+
+
+def _sparql_alive(url: str) -> bool:
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                url,
+                params={"query": "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1"},
+                headers={"Accept": "application/sparql-results+json"},
+            )
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+_USE_LOCAL_SPARQL = _sparql_alive(SPARQL_URL)
 
 pytestmark = [pytest.mark.requires_wikidata, pytest.mark.integration]
 
 
 @pytest.fixture
 def live_client():
-    """Production WikidataClient configured for live use.
+    """WikidataClient: local QEndpoint SPARQL when reachable, else public endpoint."""
+    from langgraph_coe.tools.wikidata_client import WikidataClient
 
-    Skips if the production backend / dependencies are not in place.
-    """
-    pytest.importorskip("SPARQLWrapper")
-    try:
-        from langgraph_coe.tools.wikidata_client import WikidataClient
-        return WikidataClient()
-    except TypeError as e:
-        pytest.skip(
-            f"WikidataClient requires explicit backend; production factory not yet "
-            f"available ({e})"
+    if _USE_LOCAL_SPARQL:
+        return WikidataClient(
+            sparql_endpoint=SPARQL_URL,
+            max_sparql_rps=10.0,
+            max_wikipedia_rps=10.0,
         )
-    except Exception as e:
-        pytest.skip(f"Cannot construct WikidataClient for live use: {e}")
+    return WikidataClient()
 
 
 async def test_live_link_berlin_top_1_is_q64(live_client):

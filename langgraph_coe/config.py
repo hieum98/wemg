@@ -196,6 +196,10 @@ class RerankerConfig(BaseModel):
 
 class WikidataConfig(BaseModel):
     """Configuration for the Wikidata knowledge-graph tools."""
+    # Local QEndpoint (e.g. ``http://127.0.0.1:30162/api/endpoint/sparql`` via SSH tunnel).
+    # None → public ``https://query.wikidata.org/sparql``.
+    sparql_endpoint: Optional[str] = None
+
     # SPARQL / Wikipedia rate limits
     max_sparql_rps: float = 2.0
     max_wikipedia_rps: float = 10.0

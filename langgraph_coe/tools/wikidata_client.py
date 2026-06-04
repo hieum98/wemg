@@ -208,6 +208,7 @@ class WikidataClient:
         self,
         *,
         backend: Optional[WikidataBackend] = None,
+        sparql_endpoint: Optional[str] = None,
         max_sparql_rps: float = 2.0,
         max_wikipedia_rps: float = 10.0,
         lru_capacity: int = 5000,
@@ -216,7 +217,12 @@ class WikidataClient:
         cache: Optional[Any] = None,
         concurrency_limit: int = 10,
     ) -> None:
-        self._backend: WikidataBackend = backend if backend is not None else HTTPWikidataBackend()
+        if backend is not None:
+            self._backend = backend
+        elif sparql_endpoint is not None:
+            self._backend = HTTPWikidataBackend(sparql_endpoint=sparql_endpoint)
+        else:
+            self._backend = HTTPWikidataBackend()
         self._sparql_limiter = _AsyncRateLimiter(max_sparql_rps)
         self._wiki_limiter = _AsyncRateLimiter(max_wikipedia_rps)
         self._semaphore = asyncio.Semaphore(max(1, concurrency_limit))

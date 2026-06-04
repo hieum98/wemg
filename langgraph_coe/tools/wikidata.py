@@ -102,12 +102,18 @@ def init_wikidata(config: WikidataConfig, *, cache: Any = None) -> None:
     global _wikidata_client, _wikidata_config
     _wikidata_config = config
     _wikidata_client = WikidataClient(
+        sparql_endpoint=config.sparql_endpoint,
         max_sparql_rps=config.max_sparql_rps,
         max_wikipedia_rps=config.max_wikipedia_rps,
         lru_capacity=config.triple_cache_max_entries,
         cache=cache,
     )
-    logger.info("WikidataClient initialised (max_hops=%d)", config.max_hops)
+    endpoint = config.sparql_endpoint or "https://query.wikidata.org/sparql"
+    logger.info(
+        "WikidataClient initialised (max_hops=%d, sparql=%s)",
+        config.max_hops,
+        endpoint,
+    )
 
 
 def reset_wikidata_session() -> None:
