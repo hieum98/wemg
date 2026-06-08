@@ -39,8 +39,8 @@ retriever:
     url_cache_ttl: 3600    # seconds; null to disable, 0 for no expiry
   corpus:
     embedder:
-      model_name: "Qwen3-Embedding-4B"
-      url: "http://n0385:4000/v1"
+      model_name: "Qwen/Qwen3-Embedding-4B"
+      url: "http://n0301:30000/v1"
       api_key: null
       embedder_type: "openai"
     corpus_path: "Hieuman/wiki23-processed"
@@ -49,8 +49,9 @@ retriever:
 reranker:
   enabled: true
   model_name: "Qwen3-Reranker-4B"
-  url: "http://n0999:30002/v1"
+  url: "http://n0997:30000/v1"
   api_key: "EMPTY"
+  instruction: "Given a web search query, retrieve relevant passages that answer the query."
   top_k: 10
   concurrency: 32
   instruction: null

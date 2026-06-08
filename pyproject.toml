@@ -7,7 +7,7 @@ name = "wemg"
 version = "0.2.0"
 description = "WEMG - When Embedding Models Meet Graph RAG"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [
     {name = "Hieu Man", email = "hieum@uoregon.edu"}
@@ -41,6 +41,17 @@ dependencies = [
     "tqdm>=4.66.0",
     "numpy",
     "anytree>=2.13.0",
+    "langchain>=1.2.17",
+    "langchain-openai>=1.2.1",
+    "langchain-chroma>=1.1.0",
+    "langchain-litellm>=0.6.4",
+    "langchain-redis>=0.2.5",
+    "python-dotenv>=1.0.1",
+    "langgraph>=1.1.10",
+    "ipykernel>=7.2.0",
+    "langchain-community>=0.4.1",
+    "httpx>=0.28.1",
+    "pytest-asyncio>=1.3.0",
 ]
 
 [project.optional-dependencies]
@@ -48,17 +59,19 @@ dev = [
     "pytest>=8.4.2",
     "pytest-asyncio>=0.21.0",
     "python-dotenv>=1.0.0",
+    "fakeredis>=2.20.0",
+    "respx>=0.21.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["wemg*"]
+include = ["wemg*", "langgraph_coe*"]
 exclude = ["test*", "wemg_backup*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "langgraph_coe/tests"]
 asyncio_mode = "auto"
 # Always stream logging to the terminal during runs; INFO is the lowest standard level. (DEBUG is too verbose)
 log_cli = true
-log_cli_level = "INFO"
-log_level = "INFO"
+log_cli_level = "WARNING"
+log_level = "WARNING"
