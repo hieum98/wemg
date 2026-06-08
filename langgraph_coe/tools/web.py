@@ -26,7 +26,9 @@ class _WebSession:
         self.visited: set[str] = set()
 
 
-_cv_web_session: ContextVar[_WebSession | None] = ContextVar("web_research_session", default=None)
+_cv_web_session: ContextVar[_WebSession | None] = ContextVar(
+    "web_research_session", default=None
+)
 
 
 def _get_web_session() -> _WebSession:
@@ -105,7 +107,9 @@ async def web_search(query: str) -> List[Dict[str, str]]:
                 }
             )
     else:
-        res = await asyncio.to_thread(_web_search_instance.results, query, _web_config.top_k)
+        res = await asyncio.to_thread(
+            _web_search_instance.results, query, _web_config.top_k
+        )
         if isinstance(res, list):
             for item in res:
                 search_results.append(

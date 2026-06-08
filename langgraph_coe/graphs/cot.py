@@ -50,6 +50,7 @@ from ..roles import (
     SubquestionGenerationInput,
 )
 from ..tools.retrieval import call_sglang_reranker, corpus_search
+from ._memory_text import textualize_graph as _textualize_graph
 from .kg_search import build_kg_search_graph
 from .memory_update import build_memory_update_graph
 from .web_research import build_web_research_graph
@@ -106,7 +107,13 @@ class CoTState(TypedDict, total=False):
     subquestion_needs_kg: List[bool]
     retrieved_raw_context: Annotated[List[str], append_or_clear]
     retrieved_raw_triples: Annotated[List[Any], append_or_clear]
+    # ``rerank`` node output: the top-k *full passages* from the merged pool.
     reranked_context: List[str]
+    # ``extract_relevant`` node output: the EXTRACTOR's atomic, self-contained
+    # *facts* distilled from ``reranked_context``. Kept in a distinct key (rather
+    # than overwriting ``reranked_context``) so each node's output stays legible
+    # in traces; ``gen_subanswers`` grounds on this, falling back to passages.
+    extracted_facts: List[str]
     current_subanswers: List[str]
 
     # Append-only trajectory: each entry is one CoT iteration's decomposition.
@@ -119,6 +126,8 @@ class CoTState(TypedDict, total=False):
 
     # Output
     final_answer: str
+    concise_answer: str
+    reasoning: str
 
     # Per-Send scratch fields (set when fan-out injects into a worker)
     subquery: str
@@ -127,22 +136,6 @@ class CoTState(TypedDict, total=False):
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-def _textualize_graph(graph: Optional[nx.DiGraph]) -> str:
-    if graph is None or graph.number_of_edges() == 0:
-        return ""
-    lines: List[str] = []
-    for u, v, data in graph.edges(data=True):
-        rel = data.get("relation")
-        if isinstance(rel, (set, list, tuple)):
-            for r in rel:
-                lines.append(f"{u} — {r} — {v}")
-        elif rel:
-            lines.append(f"{u} — {rel} — {v}")
-        else:
-            lines.append(f"{u} — related_to — {v}")
-    return "\n".join(lines)
 
 
 def _join_memory_context(state: CoTState) -> str:
@@ -279,7 +272,9 @@ def build_cot_graph(
     # Adaptive retrieval (paper parity): web fan-out is gated off by default;
     # KG fan-out is gated per-subquestion by the generator's ``needs_kg`` tag.
     web_enabled = bool(getattr(getattr(cfg, "web_search", None), "enabled", False))
-    extractor_max_chars = int(getattr(cfg.memory, "extractor_max_input_chars", 24_000) or 24_000)
+    extractor_max_chars = int(
+        getattr(cfg.memory, "extractor_max_input_chars", 24_000) or 24_000
+    )
 
     # Compiled subgraphs. Lazy build at compile time keeps the per-question
     # cost down — same compiled instance is reused across all iterations.
@@ -342,7 +337,9 @@ def build_cot_graph(
         # One ``corpus_search`` per subquestion, in parallel — symmetric with
         # KG / web fan-out. ``corpus_search`` is a module-level reference so
         # tests can monkeypatch it.
-        subqs = [s.strip() for s in (state.get("subquestions") or []) if s and s.strip()]
+        subqs = [
+            s.strip() for s in (state.get("subquestions") or []) if s and s.strip()
+        ]
         if not subqs:
             return {}
 
@@ -402,7 +399,8 @@ def build_cot_graph(
             subq_lines = "\n".join(f"- {sq}" for sq in subqs)
             question_blob = (
                 f"{question_blob}\n\nCurrent subquestions:\n{subq_lines}"
-                if question_blob else f"Current subquestions:\n{subq_lines}"
+                if question_blob
+                else f"Current subquestions:\n{subq_lines}"
             )
 
         batches = _split_into_char_batches(contexts, extractor_max_chars)
@@ -431,15 +429,20 @@ def build_cot_graph(
                 seen.add(key)
                 facts.append(fact.strip())
 
-        # If the extractor produced nothing, keep the reranked passages so
-        # ``gen_subanswers`` still has evidence to ground on.
-        return {"reranked_context": facts or contexts}
+        # Write to ``extracted_facts`` (not ``reranked_context``) so the rerank
+        # passages stay visible in the trace. If the extractor produced nothing,
+        # fall back to the reranked passages so ``gen_subanswers`` still has
+        # evidence to ground on — no evidence is silently lost.
+        return {"extracted_facts": facts or contexts}
 
     async def gen_subanswers(state: CoTState) -> Dict[str, Any]:
         subqs = list(state.get("subquestions") or [])
         if not subqs:
             return {"current_subanswers": []}
-        ctx_joined = "\n".join(state.get("reranked_context") or [])
+        # Ground on the EXTRACTOR's atomic facts; fall back to the reranked
+        # passages if extraction yielded nothing.
+        evidence = state.get("extracted_facts") or state.get("reranked_context") or []
+        ctx_joined = "\n".join(evidence)
         inputs = [
             AnswerGenerationInput(question=sq, context=ctx_joined or "Not provided")
             for sq in subqs
@@ -449,7 +452,9 @@ def build_cot_graph(
             results = [results]
         answers: List[str] = []
         for r in results:
-            text = getattr(r, "answer", None) or getattr(r, "concise_answer", None) or ""
+            text = (
+                getattr(r, "answer", None) or getattr(r, "concise_answer", None) or ""
+            )
             if text:
                 answers.append(text)
         return {"current_subanswers": answers}
@@ -482,6 +487,7 @@ def build_cot_graph(
             "depth": int(state.get("depth", 0) or 0) + 1,
             "subquestions": [],
             "reranked_context": [],
+            "extracted_facts": [],
             "current_subanswers": [],
             "retrieved_raw_context": Clear(),
             "retrieved_raw_triples": Clear(),
@@ -503,8 +509,18 @@ def build_cot_graph(
             context=ctx,
         )
         out, _ = await execute_role_lc(registry, FINAL_ANSWER_SYNTHESIZER, inp)
-        final_text = getattr(out, "final_answer", None) or getattr(out, "concise_answer", None) or ""
-        return {"final_answer": str(final_text)}
+        final_text = (
+            getattr(out, "final_answer", None)
+            or getattr(out, "concise_answer", None)
+            or ""
+        )
+        concise = getattr(out, "concise_answer", None) or final_text
+        reasoning = getattr(out, "reasoning", None) or ""
+        return {
+            "final_answer": str(final_text),
+            "concise_answer": str(concise),
+            "reasoning": str(reasoning),
+        }
 
     # ── Routing ──────────────────────────────────────────────────────────────
 

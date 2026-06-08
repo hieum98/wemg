@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from langchain_core.runnables import Runnable
@@ -13,8 +14,18 @@ from langchain_litellm import ChatLiteLLM
 from .config import LLMConfig
 from .roles import Role
 from .parsing import extract_info_from_text, extraction_type_from_annotation
+from .thinking_budget import build_request_kwargs
 
 logger = logging.getLogger(__name__)
+
+# When a role is executed over a LIST of inputs, the items are independent so
+# they run concurrently up to this cap (a bounded ``asyncio.gather``). Previously
+# list items were awaited strictly one-at-a-time, which serialized e.g. answering
+# the N sub-questions in an MCTS/CoT expand into N sequential round-trips. Set
+# ``LANGGRAPH_ROLE_ITEM_CONCURRENCY=1`` to restore the old sequential behavior.
+_ROLE_ITEM_CONCURRENCY = max(
+    1, int(os.environ.get("LANGGRAPH_ROLE_ITEM_CONCURRENCY", "16"))
+)
 
 
 def format_messages(role: Role, item: BaseModel) -> List[Any]:
@@ -25,6 +36,7 @@ def format_messages(role: Role, item: BaseModel) -> List[Any]:
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
     ]
+
 
 def _content_to_text(content: Any) -> str:
     """Coerce a LangChain message ``content`` field to a plain string.
@@ -79,13 +91,20 @@ def parse_fallback(role: Role, raw_text: Any) -> Optional[BaseModel]:
             text, keys, value_types, field_optional=field_optional
         )
     except Exception:
-        # Print the raw text the parser choked on so the failure mode is
+        # Log the raw text the parser choked on so the failure mode is
         # observable (e.g. truncated thinking, no JSON emitted at all).
-        preview = text if len(text) < 4000 else f"{text[:2000]}\n…[truncated {len(text)-4000} chars]…\n{text[-2000:]}"
-        print(
-            f"[parse_fallback] role={role.name!r} could not extract fields {keys} "
-            f"from raw content (len={len(text)}):\n----- BEGIN RAW -----\n{preview}\n----- END RAW -----",
-            flush=True,
+        preview = (
+            text
+            if len(text) < 4000
+            else f"{text[:2000]}\n…[truncated {len(text) - 4000} chars]…\n{text[-2000:]}"
+        )
+        logger.error(
+            "[parse_fallback] role=%r could not extract fields %s from raw "
+            "content (len=%d):\n----- BEGIN RAW -----\n%s\n----- END RAW -----",
+            role.name,
+            keys,
+            len(text),
+            preview,
         )
         raise
 
@@ -94,9 +113,10 @@ def parse_fallback(role: Role, raw_text: Any) -> Optional[BaseModel]:
 
 class RoleModelRegistry:
     """Maps role names → ChatLiteLLM instances via tier indirection.
-    
+
     Lazily creates one ChatLiteLLM per unique tier config.
     """
+
     def __init__(self, llm_config: LLMConfig):
         self._tiers = llm_config.tiers
         self._role_tiers = llm_config.role_tiers
@@ -109,18 +129,47 @@ class RoleModelRegistry:
     def get_model_by_tier(self, tier: str) -> ChatLiteLLM:
         """Get or create the ChatLiteLLM for a specific tier."""
         if tier not in self._tiers:
-            logger.warning(f"Tier '{tier}' not found in config, falling back to 'heavy'.")
+            logger.warning(
+                f"Tier '{tier}' not found in config, falling back to 'heavy'."
+            )
             tier = "heavy"
-            
+
         if tier not in self._instances:
             cfg = self._tiers[tier]
 
             # Qwen3/SGLang exposes thinking-mode toggle via chat_template_kwargs.
             # Forward it so configured tiers actually take effect.
             model_kwargs: Dict[str, Any] = {"top_p": cfg.top_p}
+
+            # Optional sampling controls — only forward when set so an unset knob
+            # keeps SGLang's own default. The non-OpenAI knobs (top_k, min_p,
+            # repetition_penalty) ride through LiteLLM to SGLang's request body.
+            for _name, _value in (
+                ("top_k", cfg.top_k),
+                ("min_p", cfg.min_p),
+                ("presence_penalty", cfg.presence_penalty),
+                ("frequency_penalty", cfg.frequency_penalty),
+                ("repetition_penalty", cfg.repetition_penalty),
+                ("seed", cfg.seed),
+            ):
+                if _value is not None:
+                    model_kwargs[_name] = _value
+
             model_kwargs["chat_template_kwargs"] = {
                 "enable_thinking": cfg.enable_thinking,
             }
+
+            # Optional reasoning-token budget: SGLang has no native param, so we
+            # ship a custom logit processor that forces </think> once the budget
+            # is spent (server must run with --enable-custom-logit-processor).
+            # Only meaningful while thinking is on. build_request_kwargs returns
+            # None (and warns) for models whose think-token ids we don't know.
+            if cfg.enable_thinking and cfg.thinking_budget is not None:
+                budget_kwargs = build_request_kwargs(
+                    cfg.model_name, cfg.thinking_budget
+                )
+                if budget_kwargs:
+                    model_kwargs.update(budget_kwargs)
 
             self._instances[tier] = ChatLiteLLM(
                 model=cfg.model_name,
@@ -153,16 +202,16 @@ async def execute_role_lc(
     tier_override: Optional[str] = None,
 ) -> Tuple[Union[BaseModel, List[BaseModel], List[List[BaseModel]]], Dict]:
     """LangChain-native role execution.
-    
+
     Args:
         registry: RoleModelRegistry for tier-based model selection
         role: Role with system_prompt, input_model, output_model
         input_data: Single or list of Pydantic input models
         n: Number of completions per input
         tier_override: Force a specific tier (for retry escalation)
-        
+
     Returns:
-        Tuple of (results, log_data). 
+        Tuple of (results, log_data).
     """
     is_single = isinstance(input_data, BaseModel)
     items = [input_data] if is_single else input_data
@@ -172,20 +221,18 @@ async def execute_role_lc(
         model = registry.get_model_by_tier(tier_override)
     else:
         model = registry.get_model(role.name)
-    
+
     chain = model.with_structured_output(role.output_model, include_raw=True)
 
-    all_results = []
-    log_entries = []
-    
-    for item in items:
+    async def _run_item(item: BaseModel) -> List[BaseModel]:
+        """Execute one input item (n completions, gathered) → its parsed outputs."""
         messages = format_messages(role, item)  # system + user only
-        
-        # Parallel execution for N completions
+
+        # Parallel execution for N completions of this one item.
         tasks = [chain.ainvoke(messages) for _ in range(n)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        parsed = []
+
+        parsed: List[BaseModel] = []
         for r in results:
             if isinstance(r, dict):
                 # Langchain return format with include_raw=True
@@ -198,19 +245,48 @@ async def execute_role_lc(
             elif isinstance(r, role.output_model):
                 # Just in case some provider returns the object directly
                 parsed.append(r)
-                
+
         if not parsed:
-            # All N completions failed — raise so RetryPolicy catches it
+            # All N completions failed — raise so RetryPolicy catches it.
             errors = [r for r in results if isinstance(r, Exception)]
-            raise errors[0] if errors else RuntimeError(f"No valid output for {role.name}")
-            
+            raise (
+                errors[0]
+                if errors
+                else RuntimeError(f"No valid output for {role.name}")
+            )
+        return parsed
+
+    # Items in a list are independent, so run them concurrently (bounded). A
+    # single item (or single-input call) takes the trivial path. Order of
+    # ``items`` is preserved in the returned results.
+    if len(items) <= 1:
+        per_item: List[List[BaseModel]] = [await _run_item(items[0])] if items else []
+    else:
+        sem = asyncio.Semaphore(_ROLE_ITEM_CONCURRENCY)
+
+        async def _bounded(it: BaseModel) -> List[BaseModel]:
+            async with sem:
+                return await _run_item(it)
+
+        gathered = await asyncio.gather(
+            *[_bounded(it) for it in items], return_exceptions=True
+        )
+        # Surface the first failure (matches the old sequential raise-on-error),
+        # after all in-flight requests have settled (no orphaned tasks).
+        for g in gathered:
+            if isinstance(g, Exception):
+                raise g
+        per_item = list(gathered)
+
+    all_results = []
+    log_entries = []
+    for item, parsed in zip(items, per_item):
         if n == 1:
             all_results.append(parsed[0])
-            log_entries.append((str(item), str(parsed[0])))
         else:
             all_results.append(parsed)
-            log_entries.append((str(item), str(parsed[0])))
+        log_entries.append((str(item), str(parsed[0])))
 
     log_data = {role.name: log_entries}
-    
+
     return (all_results[0] if is_single else all_results), log_data

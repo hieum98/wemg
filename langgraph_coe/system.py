@@ -144,12 +144,15 @@ def _initial_cot_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any]
         "retrieved_raw_context": [],
         "retrieved_raw_triples": [],
         "reranked_context": [],
+        "extracted_facts": [],
         "current_subanswers": [],
         "iteration_history": [],
         "text_memory": [],
         "graph_memory": nx.DiGraph(),
         "entity_dict": {},
         "final_answer": "",
+        "concise_answer": "",
+        "reasoning": "",
     }
 
 
@@ -184,6 +187,8 @@ def _initial_mcts_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any
         "iterations_without_improvement": 0,
         "best_value": 0.0,
         "final_answer": "",
+        "concise_answer": "",
+        "reasoning": "",
     }
 
 
@@ -193,7 +198,9 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-async def answer(question: str, config: LangGraphCoeConfig | None = None) -> AnswerResult:
+async def answer(
+    question: str, config: LangGraphCoeConfig | None = None
+) -> AnswerResult:
     """Answer one ``question`` end-to-end via the configured strategy graph (§9)."""
     cfg = config or LangGraphCoeConfig.from_yaml()
 
@@ -223,7 +230,9 @@ async def answer(question: str, config: LangGraphCoeConfig | None = None) -> Ans
         recursion_limit = int(cfg.search.cot.recursion_limit)
 
     # 4. Invoke and adapt the final state into the public result envelope.
-    result = await graph.ainvoke(initial_state, config={"recursion_limit": recursion_limit})
+    result = await graph.ainvoke(
+        initial_state, config={"recursion_limit": recursion_limit}
+    )
     return AnswerResult.from_state({**(result or {}), "strategy": strategy})
 
 

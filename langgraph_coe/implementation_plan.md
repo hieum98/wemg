@@ -54,7 +54,7 @@ Tests land under `langgraph_coe/tests/` per phase as **target specs** (tests des
 
 Add to `langgraph_coe/roles.py`:
 
-- **`web_researcher`** (light tier). Input: `subquery + research_budget`. Output: list of `{title, url, snippet, full_text}`. System prompt covers research goal, iterative-query strategy, stopping criteria, output schema. Used as the agent prompt inside `WebResearchGraph`.
+- **`web_researcher`** (medium tier). Input: `subquery + research_budget`. Output: list of `{title, url, snippet, full_text}`. System prompt covers research goal, iterative-query strategy, stopping criteria, output schema. Used as the agent prompt inside `WebResearchGraph`.
 
 Register tier mapping in `config.py::LLMConfig.role_tiers`. Roles trimmed from the port are listed in §3.6.
 
@@ -75,6 +75,8 @@ Existing `langgraph_coe/graphs/kg_search.py`:
 **Move to:** `system.py`, called exactly once per question before strategy-graph invocation.
 
 ### 3.4 Redis caching
+
+**Operator guide:** [docs/setup_redis_cache.md](../docs/setup_redis_cache.md) — install/start Redis, enable `cache.enabled`, key namespaces, tests, troubleshooting.
 
 Wikidata is the most expensive retrieval surface (2 RPS, network-bound) and most of what it returns is stable across questions — promote the cache from "wrap `get_triples`" to a **first-class persistent layer** covering every stable lookup path.
 
@@ -172,7 +174,7 @@ graph TD
     end
 ```
 
-- **`web_research_agent`**: `create_react_agent(model=light_tier, tools=[web_search], prompt=web_researcher.system_prompt)`. Decisions are simple ("query enough? refine how?") — light tier suffices.
+- **`web_research_agent`**: `create_react_agent(model=medium_tier, tools=[web_search], prompt=web_researcher.system_prompt)`. The iterative query/refine decisions benefit from the medium tier (see `role_tiers.web_researcher`).
 - **`finalize`**: Parses `ToolMessage` entries with `.name == "web_search"` from the agent trace, dedupes by URL, returns top-N → `results`.
 
 **Three-layer loop prevention parity with `kg_search`:**

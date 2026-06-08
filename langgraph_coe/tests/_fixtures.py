@@ -1,27 +1,118 @@
-"""Helpers shared by langgraph_coe Phase 0+ test modules.
+"""Stubs and spies shared across the langgraph_coe test suite (mainly ``unit/``).
 
-These tests are **target specs** ([feedback_tests_as_target_spec]): they describe the
-goal the Phase 0 implementation must reach, not its current state. Some helpers
-reference symbols (e.g. ``WEB_RESEARCHER``, ``RedisDictCache``,
-``reset_web_research_session``) that intentionally do not exist yet — the
-helpers import them lazily inside fixtures/tests so collection still succeeds
-on a tree where Phase 0 is unimplemented.
+Provides the hermetic test doubles — fake chat models, fake ReAct agents,
+``ToolSpy``, structured-output spies, and the config-override logger — that let
+the unit tier run with no live LLM/SPARQL/Redis. Some helpers import optional
+symbols lazily inside the fixture body so module collection still succeeds even
+if a dependency is absent.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Type
-from unittest.mock import AsyncMock, MagicMock
+import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Type
+from unittest.mock import MagicMock
 
 import pydantic
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langchain_core.runnables import Runnable, RunnableLambda
+
+if TYPE_CHECKING:
+    from langgraph_coe.llm import RoleModelRegistry
 
 
 # Stable test URLs / strings reused across §3.5 tests.
 URL_A = "https://example.com/a"
 URL_B = "https://example.com/b"
 URL_C = "https://example.com/c"
+
+
+_LOG = logging.getLogger("langgraph_coe.tests")
+
+
+def log_config_override(param: str, default: Any, override: Any, *, reason: str) -> Any:
+    """Record (and return) a deliberate deviation from ``config.yaml``.
+
+    Project rule: tests run with the params declared in
+    ``langgraph_coe/config.yaml`` — they must not silently redefine hyper-
+    parameters. When a test genuinely needs a different value (an env-specific
+    endpoint, a smaller model's token budget, a tiny ``top_k`` to exercise a
+    cap, …) route it through this helper so the deviation is never silent: it
+    logs ``config.yaml=<default> -> test=<override>`` plus the reason at WARNING
+    level and to stdout (visible under ``pytest -s``).
+
+    When ``override`` equals ``default`` nothing is logged and the value is
+    returned unchanged, so wrapping a no-op is harmless.
+    """
+    if default == override:
+        return override
+    msg = (
+        f"[config-override] {param}: config.yaml={default!r} -> test={override!r} "
+        f"(reason: {reason})"
+    )
+    _LOG.warning(msg)
+    print(msg, flush=True)
+    return override
+
+
+def override_tier_endpoint(
+    cfg: Any,
+    tier_name: str,
+    *,
+    model_name: Optional[str] = None,
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    max_input_tokens: Optional[int] = None,
+    reason: str,
+) -> Any:
+    """Return a ``TierConfig`` copy of ``cfg.llm.tiers[tier_name]`` that keeps
+    every config.yaml generation knob (temperature, top_p, top_k, min_p,
+    penalties, seed, enable_thinking, …) and overrides *only* the endpoint /
+    token-budget fields a particular test deployment requires.
+
+    Every changed field is logged via :func:`log_config_override`. The
+    ``thinking_budget`` cap from config.yaml is clamped to stay strictly below an
+    overridden (smaller) ``max_tokens`` so the SGLang constraint still holds.
+    """
+    base = cfg.llm.tiers[tier_name]
+    updates: Dict[str, Any] = {}
+    if api_key is not None:
+        updates["api_key"] = api_key
+    if model_name is not None:
+        updates["model_name"] = log_config_override(
+            f"llm.tiers.{tier_name}.model_name",
+            base.model_name,
+            model_name,
+            reason=reason,
+        )
+    if api_base is not None:
+        updates["api_base"] = log_config_override(
+            f"llm.tiers.{tier_name}.api_base", base.api_base, api_base, reason=reason
+        )
+    if max_tokens is not None:
+        updates["max_tokens"] = log_config_override(
+            f"llm.tiers.{tier_name}.max_tokens",
+            base.max_tokens,
+            max_tokens,
+            reason=reason,
+        )
+    if max_input_tokens is not None:
+        updates["max_input_tokens"] = log_config_override(
+            f"llm.tiers.{tier_name}.max_input_tokens",
+            base.max_input_tokens,
+            max_input_tokens,
+            reason=reason,
+        )
+    eff_max = updates.get("max_tokens", base.max_tokens)
+    if base.thinking_budget is not None and base.thinking_budget >= eff_max:
+        updates["thinking_budget"] = log_config_override(
+            f"llm.tiers.{tier_name}.thinking_budget",
+            base.thinking_budget,
+            max(eff_max - 1024, 1),
+            reason=f"config cap must stay below overridden max_tokens={eff_max}",
+        )
+    return base.model_copy(update=updates)
 
 
 def make_structured_runnable(value: pydantic.BaseModel) -> Runnable:
@@ -58,8 +149,10 @@ class StructuredOutputSpy:
     ) -> Runnable:
         self.calls.append(output_cls)
         if include_raw:
+
             async def _wrapped(_inp: Any) -> Dict[str, Any]:
                 return {"parsed": self.return_value, "raw": AIMessage(content="")}
+
             return RunnableLambda(_wrapped)
         return make_structured_runnable(self.return_value)
 
@@ -72,16 +165,34 @@ def make_fake_react_agent(
     Mirrors the shape returned by ``langchain.agents.create_agent`` /
     ``langgraph.prebuilt.create_react_agent``: a final state dict with a
     ``messages`` key. The graph nodes filter that trace for ``ToolMessage``
-    entries (see ``kg_search._parse_link_entities_tool_payloads`` for the
+    entries (see ``kg_search._parse_triple_tool_payloads`` for the
     pattern Phase 0 tests verify).
+
+    Exposes both ``ainvoke`` and ``astream(stream_mode="values")``. The graph
+    nodes stream the agent so they can salvage partial messages when the
+    ``recursion_limit`` is hit; the fake emits the full state as a single
+    values-mode chunk (the shape production reads from ``last_state``).
     """
 
-    async def _coro(_inp: Any, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def _coro(
+        _inp: Any, config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         return {"messages": list(messages)}
 
+    async def _astream(
+        _inp: Any,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        stream_mode: Optional[str] = None,
+        **_kwargs: Any,
+    ):
+        yield {"messages": list(messages)}
+
     runnable = RunnableLambda(_coro)
-    # Expose .ainvoke directly so spies can assert on (input, config=...) call shape.
+    # Expose .ainvoke / .astream directly so spies can assert on the
+    # (input, config=...) call shape and graphs can stream values-mode chunks.
     runnable.ainvoke = _coro  # type: ignore[assignment]
+    runnable.astream = _astream  # type: ignore[assignment]
     return runnable
 
 

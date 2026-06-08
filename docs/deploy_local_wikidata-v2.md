@@ -163,3 +163,11 @@ if __name__ == "__main__":
 | Persistent volume | Mount `qendpoint_data` so downloads and indexes survive container restarts |
 | First boot | Expect a long download and index build; monitor disk space (200GB+) |
 | Firewall fallback | Use Method 2 on a login node, then copy `qendpoint_data/` to the compute node |
+
+---
+
+## Using with `langgraph_coe`
+
+Point `wikidata.sparql_endpoint` in `langgraph_coe/config.yaml` at your tunnel or node URL (for example `http://127.0.0.1:30162/api/endpoint/sparql`). Entity search and Wikipedia still use the public APIs; only k-hop SPARQL traversals hit QEndpoint.
+
+Agent wiring, hop budgets, pruning, and Redis `wd:*` cache: **[setup_wikidata_tools.md](setup_wikidata_tools.md)**.

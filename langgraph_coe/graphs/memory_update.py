@@ -223,7 +223,9 @@ def _merge_same_qid_nodes(graph: nx.DiGraph) -> None:
                 edge = dict(graph.edges[pred, dup])
                 rels = edge.get("relation", set()) or set()
                 if graph.has_edge(pred, canonical):
-                    existing = graph.edges[pred, canonical].setdefault("relation", set())
+                    existing = graph.edges[pred, canonical].setdefault(
+                        "relation", set()
+                    )
                     if not isinstance(existing, set):
                         existing = set(existing) if existing else set()
                         graph.edges[pred, canonical]["relation"] = existing
@@ -236,7 +238,9 @@ def _merge_same_qid_nodes(graph: nx.DiGraph) -> None:
                 edge = dict(graph.edges[dup, succ])
                 rels = edge.get("relation", set()) or set()
                 if graph.has_edge(canonical, succ):
-                    existing = graph.edges[canonical, succ].setdefault("relation", set())
+                    existing = graph.edges[canonical, succ].setdefault(
+                        "relation", set()
+                    )
                     if not isinstance(existing, set):
                         existing = set(existing) if existing else set()
                         graph.edges[canonical, succ]["relation"] = existing
@@ -277,10 +281,18 @@ def _coerce_raw_triple_to_relation(triple: Any) -> Optional[Relation]:
         return None
     try:
         return Relation(
-            subject=str(getattr(subject, "label", None) or getattr(subject, "name", None) or subject),
+            subject=str(
+                getattr(subject, "label", None)
+                or getattr(subject, "name", None)
+                or subject
+            ),
             subject_id=getattr(subject, "qid", None) or getattr(subject, "id", None),
             relation=str(getattr(relation_obj, "label", None) or relation_obj),
-            object=str(getattr(object_, "label", None) or getattr(object_, "name", None) or object_),
+            object=str(
+                getattr(object_, "label", None)
+                or getattr(object_, "name", None)
+                or object_
+            ),
             object_id=getattr(object_, "qid", None) or getattr(object_, "id", None),
             context=None,
         )
@@ -293,7 +305,9 @@ def _coerce_raw_triple_to_relation(triple: Any) -> Optional[Relation]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Optional[MemoryConfig] = None):
+def build_memory_update_graph(
+    registry: RoleModelRegistry, *, memory_cfg: Optional[MemoryConfig] = None
+):
     """Compile the MemoryUpdateGraph. *registry* supplies role-tier LLM clients."""
 
     cfg = memory_cfg or MemoryConfig()
@@ -307,7 +321,9 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
             return {"consolidated_memory": []}
 
         raw_blob = _format_raw_memory(combined)
-        inp = MemoryConsolidationInput(question=state.get("question", ""), memory=raw_blob)
+        inp = MemoryConsolidationInput(
+            question=state.get("question", ""), memory=raw_blob
+        )
         out, _ = await execute_role_lc(registry, MEMORY_CONSOLIDATOR, inp)
         return {"consolidated_memory": _consolidated_to_text(out)}
 
@@ -327,8 +343,9 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
         )
         out, _ = await execute_role_lc(registry, OPEN_IE, inp)
         relations = list(getattr(out, "relations", []) or [])
+        entities = list(getattr(out, "entities", []) or [])
         return {
-            "extracted_entities": list(getattr(out, "entities", []) or []),
+            "extracted_entities": entities,
             "extracted_relations": relations,
         }
 
@@ -337,7 +354,9 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
         entities = list(state.get("extracted_entities") or [])
         relations = list(state.get("extracted_relations") or [])
 
-        candidate_names = _collect_unlinked_entity_names(entities, relations, entity_dict)
+        candidate_names = _collect_unlinked_entity_names(
+            entities, relations, entity_dict
+        )
         linked_map: Dict[str, str] = {}
         if candidate_names:
             results = await link_entities.ainvoke({"entity_names": candidate_names})
@@ -367,7 +386,9 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
                 relations.append(coerced)
 
         linked_map = dict(state.get("linked_entities") or {})
-        entity_dict = dict(state.get("updated_entity_dict") or state.get("entity_dict") or {})
+        entity_dict = dict(
+            state.get("updated_entity_dict") or state.get("entity_dict") or {}
+        )
 
         # Enrich relations with newly linked QIDs.
         for rel in relations:
@@ -383,7 +404,8 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
         # Filter to **newly proposed** relations only — pruner is expensive and
         # should never re-examine edges already in the graph (§4.2).
         relations = [
-            rel for rel in relations
+            rel
+            for rel in relations
             if rel.relation and not _relation_already_in_graph(source_graph, rel)
         ]
 
@@ -399,14 +421,11 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
             ]
             kept_relations: List[Relation] = []
             inputs = [
-                TriplePruneInput(question=question, triples=chunk)
-                for chunk in chunks
+                TriplePruneInput(question=question, triples=chunk) for chunk in chunks
             ]
 
             if inputs:
-                outputs, _ = await execute_role_lc(
-                    registry, TRIPLE_PRUNER, inputs
-                )
+                outputs, _ = await execute_role_lc(registry, TRIPLE_PRUNER, inputs)
                 if not isinstance(outputs, list):
                     outputs = [outputs]
                 for batch, out in zip(chunk_relations, outputs):
@@ -415,7 +434,9 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
                             f"triple_pruner returned no keep_indices for batch of {len(batch)} relations"
                         )
                     keep = {idx for idx in out.keep_indices if 0 <= idx < len(batch)}
-                    kept_relations.extend(batch[i] for i in range(len(batch)) if i in keep)
+                    kept_relations.extend(
+                        batch[i] for i in range(len(batch)) if i in keep
+                    )
             else:
                 kept_relations = list(relations)
 
@@ -450,7 +471,9 @@ def build_memory_update_graph(registry: RoleModelRegistry, *, memory_cfg: Option
             return {"updated_text_memory": []}
 
         raw_blob = _format_lines(consolidated)
-        inp = MemoryConsolidationInput(question=state.get("question", ""), memory=raw_blob)
+        inp = MemoryConsolidationInput(
+            question=state.get("question", ""), memory=raw_blob
+        )
         out, _ = await execute_role_lc(registry, MEMORY_CONSOLIDATOR, inp)
         return {"updated_text_memory": _consolidated_to_text(out)}
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import pytest
 
@@ -22,10 +22,28 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 
+def pytest_configure(config) -> None:
+    """Register the custom markers these suites use.
+
+    Mirrors the root ``tests/conftest.py`` so the markers are also known when the
+    suite is run on its own (``pytest langgraph_coe/tests``) — that sibling
+    conftest is not loaded in that case, which otherwise raises
+    ``PytestUnknownMarkWarning``.
+    """
+    markers = [
+        ("requires_wikidata", "needs live Wikidata/Wikipedia APIs"),
+        ("integration", "real external services"),
+        ("slow_integration", "long-running real-system flows"),
+    ]
+    for name, desc in markers:
+        config.addinivalue_line("markers", f"{name}: {desc}")
+
+
 @pytest.fixture
 def config():
     """Loaded LangGraphCoeConfig (defaults + config.yaml merge)."""
     from langgraph_coe.config import LangGraphCoeConfig
+
     return LangGraphCoeConfig.from_yaml()
 
 
@@ -52,12 +70,14 @@ def mini_backend():
     """Pre-populated ``FakeWikidataBackend`` (Berlin/Germany/Paris/France/...)."""
     from tests.wikidata._fixtures import build_mini_graph
     from tests.wikidata.fake_backend import FakeWikidataBackend
+
     return build_mini_graph(FakeWikidataBackend())
 
 
 @pytest.fixture
 def empty_backend():
     from tests.wikidata.fake_backend import FakeWikidataBackend
+
     return FakeWikidataBackend()
 
 
@@ -70,6 +90,7 @@ def _reset_sessions():
     still works pre-implementation.
     """
     from langgraph_coe.tools.wikidata import reset_wikidata_session
+
     reset_wikidata_session()
     try:
         from langgraph_coe.tools.web import reset_web_research_session

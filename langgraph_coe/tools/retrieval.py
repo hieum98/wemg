@@ -9,6 +9,7 @@ The optional reranker speaks SGLang's Cohere-compatible ``/v1/rerank`` API.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -24,10 +25,23 @@ from langchain_openai import OpenAIEmbeddings
 
 from ..config import EmbedderConfig, RerankerConfig, RetrieverConfig, CorpusConfig
 
+logger = logging.getLogger(__name__)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # SGLang reranker HTTP client
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_rerank_results(data: Any) -> List[Dict[str, Any]]:
+    """Normalize SGLang /v1/rerank JSON (top-level list or Cohere-style dict)."""
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        results = data.get("results")
+        if isinstance(results, list):
+            return [row for row in results if isinstance(row, dict)]
+    return []
 
 
 def _coerce_score(row: Dict[str, Any]) -> float:
@@ -53,11 +67,13 @@ async def call_sglang_reranker(
     if not cfg.url:
         raise RuntimeError("reranker URL is not configured; cannot rerank")
 
-    payload = {
+    payload: Dict[str, Any] = {
         "model": cfg.model_name,
         "query": query,
         "documents": list(texts),
     }
+    if cfg.instruction:
+        payload["instruct"] = cfg.instruction
     headers = {"Authorization": f"Bearer {cfg.api_key or 'EMPTY'}"}
     endpoint = f"{cfg.url.rstrip('/')}/rerank"
 
@@ -66,10 +82,12 @@ async def call_sglang_reranker(
 
     if resp.status_code >= 400:
         body_preview = resp.text[:2000]
-        print(
-            f"[reranker] HTTP {resp.status_code} from {endpoint}\n"
-            f"----- BEGIN BODY -----\n{body_preview}\n----- END BODY -----",
-            flush=True,
+        logger.error(
+            "[reranker] HTTP %d from %s\n"
+            "----- BEGIN BODY -----\n%s\n----- END BODY -----",
+            resp.status_code,
+            endpoint,
+            body_preview,
         )
         resp.raise_for_status()
 
@@ -77,19 +95,17 @@ async def call_sglang_reranker(
         data = resp.json()
     except ValueError:
         body_preview = resp.text[:2000]
-        print(
-            f"[reranker] non-JSON response from {endpoint}:\n"
-            f"----- BEGIN BODY -----\n{body_preview}\n----- END BODY -----",
-            flush=True,
+        logger.error(
+            "[reranker] non-JSON response from %s:\n"
+            "----- BEGIN BODY -----\n%s\n----- END BODY -----",
+            endpoint,
+            body_preview,
         )
         raise
 
-    results = data.get("results") if isinstance(data, dict) else None
+    results = _parse_rerank_results(data)
     if not results:
-        print(
-            f"[reranker] no 'results' in response from {endpoint}: {data!r}",
-            flush=True,
-        )
+        logger.error("[reranker] no 'results' in response from %s: %r", endpoint, data)
         raise RuntimeError(
             f"SGLang reranker returned no results for {len(texts)} candidates"
         )
@@ -97,7 +113,7 @@ async def call_sglang_reranker(
     ranked: List[Tuple[int, float]] = []
     for row in results:
         if not isinstance(row, dict):
-            print(f"[reranker] unexpected row shape: {row!r}", flush=True)
+            logger.error("[reranker] unexpected row shape: %r", row)
             raise TypeError(f"rerank row is not a dict: {type(row).__name__}")
         idx = int(row["index"])
         score = _coerce_score(row)
@@ -183,7 +199,9 @@ class _LazyTextDocstore(Docstore):
             text = self._texts[i]
         except (ValueError, TypeError, IndexError, KeyError):
             return f"ID {search} not found."
-        return Document(page_content="" if text is None else str(text), metadata={"row": i})
+        return Document(
+            page_content="" if text is None else str(text), metadata={"row": i}
+        )
 
 
 class _IdentityStrMapping(Mapping):
@@ -213,12 +231,14 @@ def index_name_for(index_path: str) -> str:
     return os.path.basename(index_path).replace(".faiss", "") + ".pkl"
 
 
-def _load_raw_faiss_corpus(index_path: str, embeddings: Any, corpus_cfg: CorpusConfig) -> FAISS:
+def _load_raw_faiss_corpus(
+    index_path: str, embeddings: Any, corpus_cfg: CorpusConfig
+) -> FAISS:
     """Wrap a bare HF-datasets FAISS index in a LangChain store via a side corpus."""
     import faiss  # local import: only needed for the raw-index layout
     import datasets
 
-    dataset_ref = corpus_cfg.corpus_dataset
+    dataset_ref = corpus_cfg.resolved_corpus_source()
     if not dataset_ref:
         raise FileNotFoundError(
             f"No docstore sidecar {index_name_for(index_path)!r} next to {index_path!r}, "
@@ -232,10 +252,13 @@ def _load_raw_faiss_corpus(index_path: str, embeddings: Any, corpus_cfg: CorpusC
         ds = datasets.load_dataset(dataset_ref, split=corpus_cfg.corpus_split)
 
     if not os.path.exists(index_path):
-        print(f"Index not found at {index_path!r}, building index...")
+        logger.info("Index not found at %r, building index...", index_path)
         texts = ds[corpus_cfg.text_column]
         vector_store = FAISS.from_texts(texts, embeddings=embeddings)
-        vector_store.save_local(folder_path=os.path.dirname(index_path), index_name=os.path.basename(index_path).replace(".faiss", ""))
+        vector_store.save_local(
+            folder_path=os.path.dirname(index_path),
+            index_name=os.path.basename(index_path).replace(".faiss", ""),
+        )
         return vector_store
 
     index = faiss.read_index(index_path)
@@ -251,7 +274,11 @@ def _load_raw_faiss_corpus(index_path: str, embeddings: Any, corpus_cfg: CorpusC
     text_col = corpus_cfg.text_column
     if text_col not in ds.column_names:
         fallback = next(
-            (c for c in ("contents", "text", "passage", "content") if c in ds.column_names),
+            (
+                c
+                for c in ("contents", "text", "passage", "content")
+                if c in ds.column_names
+            ),
             None,
         )
         if fallback is None:
@@ -281,7 +308,7 @@ def get_corpus_retriever(retriever_cfg: RetrieverConfig):
     * **LangChain bundle** — ``<name>.faiss`` + ``<name>.pkl`` docstore sidecar;
       loaded via :meth:`FAISS.load_local`.
     * **Raw HF-datasets index** — a bare ``<name>.faiss`` from ``build_index.py``,
-      whose passage text lives in a separate HF dataset (``corpus.corpus_dataset``).
+      whose passage text lives in a separate HF dataset (``corpus.corpus_path``).
     """
     corpus = retriever_cfg.corpus
     emb_cfg = corpus.embedder
@@ -290,9 +317,7 @@ def get_corpus_retriever(retriever_cfg: RetrieverConfig):
 
     index_path = corpus.index_path
     if not os.path.exists(index_path):
-        raise FileNotFoundError(
-            f"FAISS index not found at {index_path!r}"
-        )
+        raise FileNotFoundError(f"FAISS index not found at {index_path!r}")
 
     folder = os.path.dirname(index_path) or "."
     index_name = os.path.basename(index_path).replace(".faiss", "")

@@ -14,14 +14,23 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+    Union,
+)
 
 import pydantic
 
 from .wikidata_backend import (
-    EntityRecord,
     HTTPWikidataBackend,
-    PropertyRecord,
     WikidataBackend,
     WikidataRateLimitError,
 )
@@ -227,18 +236,30 @@ class WikidataClient:
         self._wiki_limiter = _AsyncRateLimiter(max_wikipedia_rps)
         self._semaphore = asyncio.Semaphore(max(1, concurrency_limit))
 
-        self._entities: _LRU = _LRU(lru_capacity)          # qid -> EntityRecord
-        self._properties: _LRU = _LRU(lru_capacity)        # pid -> PropertyRecord
-        self._outgoing: _LRU = _LRU(lru_capacity)          # qid -> list[(pid, obj)]
-        self._incoming: _LRU = _LRU(lru_capacity)          # qid -> list[(pid, subj)]
-        self._wiki: _LRU = _LRU(lru_capacity)              # title -> str | None
-        self._entity_search: _LRU = _LRU(lru_capacity)     # (text, top_k) -> list[qid]
-        self._property_search: _LRU = _LRU(lru_capacity)   # (text, top_k) -> list[pid]
+        self._entities: _LRU = _LRU(lru_capacity)  # qid -> EntityRecord
+        self._properties: _LRU = _LRU(lru_capacity)  # pid -> PropertyRecord
+        self._outgoing: _LRU = _LRU(lru_capacity)  # qid -> list[(pid, obj)]
+        self._incoming: _LRU = _LRU(lru_capacity)  # qid -> list[(pid, subj)]
+        self._wiki: _LRU = _LRU(lru_capacity)  # title -> str | None
+        self._entity_search: _LRU = _LRU(lru_capacity)  # (text, top_k) -> list[qid]
+        self._property_search: _LRU = _LRU(lru_capacity)  # (text, top_k) -> list[pid]
 
         self._redis = redis
         self._redis_ttl = redis_ttl_seconds
         self._cache = cache
         self._inflight: Dict[str, asyncio.Future] = {}
+
+    async def aclose(self) -> None:
+        """Release the backend's network resources (idempotent, best-effort).
+
+        Delegates to the backend's ``aclose`` when it exposes one (the default
+        ``HTTPWikidataBackend`` holds an ``httpx.AsyncClient``). Must be awaited
+        inside the event loop the client made its requests on, so the underlying
+        connection pool is torn down before that loop closes.
+        """
+        backend_close = getattr(self._backend, "aclose", None)
+        if backend_close is not None:
+            await backend_close()
 
     # ==========================================================
     # Public API
@@ -255,7 +276,9 @@ class WikidataClient:
         if not name_list:
             return []
 
-        per_name = await asyncio.gather(*[self._link_one(n, top_k=top_k) for n in name_list])
+        per_name = await asyncio.gather(
+            *[self._link_one(n, top_k=top_k) for n in name_list]
+        )
         all_qids = list(dict.fromkeys(q for cs in per_name for q in cs))
         if all_qids:
             await self._fetch_entities(all_qids)
@@ -301,7 +324,9 @@ class WikidataClient:
         if not q_list:
             return []
 
-        per_q = await asyncio.gather(*[self._search_one_property(q, top_k=top_k) for q in q_list])
+        per_q = await asyncio.gather(
+            *[self._search_one_property(q, top_k=top_k) for q in q_list]
+        )
         all_pids = list(dict.fromkeys(p for ps in per_q for p in ps))
         if all_pids:
             await self._fetch_properties(all_pids)
@@ -345,7 +370,9 @@ class WikidataClient:
         if enrich:
             await self._enrich_triple_endpoints(seeds, results)
 
-        triples = {s: [self._make_triple(sig, enrich) for sig in results[s]] for s in seeds}
+        triples = {
+            s: [self._make_triple(sig, enrich) for sig in results[s]] for s in seeds
+        }
         return triples[seeds[0]] if single else [triples[s] for s in seeds]
 
     async def get_entity(self, qid: str) -> WikidataEntity:
@@ -362,19 +389,13 @@ class WikidataClient:
         self._cache_set(key, entity.model_dump())
         return entity
 
-    async def search_entities(self, name: str, *, top_k: int = 1) -> List[WikidataEntity]:
+    async def search_entities(
+        self, name: str, *, top_k: int = 1
+    ) -> List[WikidataEntity]:
         key = f"wd:search:{name.lower()}:{top_k}"
-        cached = self._cache_get(key)
-        if isinstance(cached, list):
-            out: List[WikidataEntity] = []
-            for item in cached:
-                if isinstance(item, dict):
-                    try:
-                        out.append(WikidataEntity.model_validate(item))
-                    except Exception:
-                        continue
-            if out:
-                return out
+        cached = self._decode_cached_models(self._cache_get(key), WikidataEntity)
+        if cached:
+            return cached
 
         linked = await self.link_entities(name, top_k=top_k)
         entities = linked if isinstance(linked, list) else []
@@ -383,19 +404,13 @@ class WikidataClient:
 
     async def get_triples(self, qid: str) -> List[WikiTriple]:
         key = f"wd:triples:{qid}"
-        cached = self._cache_get(key)
-        if isinstance(cached, list):
-            out: List[WikiTriple] = []
-            for item in cached:
-                if isinstance(item, dict):
-                    try:
-                        out.append(WikiTriple.model_validate(item))
-                    except Exception:
-                        continue
-            if out:
-                return out
+        cached = self._decode_cached_models(self._cache_get(key), WikiTriple)
+        if cached:
+            return cached
 
-        triples = await self.get_k_hop_triples(qid, k=1, bidirectional=False, enrich=True)
+        triples = await self.get_k_hop_triples(
+            qid, k=1, bidirectional=False, enrich=True
+        )
         out = triples if isinstance(triples, list) else []
         self._cache_set(key, [t.model_dump(mode="json") for t in out])
         return out
@@ -497,7 +512,7 @@ class WikidataClient:
         for s in seeds:
             seen = set(results[s])
             for src in frontier[s]:
-                for (rel, obj) in outgoing.get(src, []):
+                for rel, obj in outgoing.get(src, []):
                     sig = (src, rel, obj)
                     if sig in seen:
                         continue
@@ -507,7 +522,7 @@ class WikidataClient:
                         visited[s].add(obj)
                         new_frontier[s].add(obj)
                 if bidirectional:
-                    for (rel, subj) in incoming.get(src, []):
+                    for rel, subj in incoming.get(src, []):
                         sig = (subj, rel, src)
                         if sig in seen:
                             continue
@@ -526,7 +541,7 @@ class WikidataClient:
         qids: Set[str] = set()
         pids: Set[str] = set()
         for s in seeds:
-            for (subj, rel, obj) in results[s]:
+            for subj, rel, obj in results[s]:
                 if _is_valid_qid(subj):
                     qids.add(subj)
                 if _is_valid_qid(obj):
@@ -541,11 +556,13 @@ class WikidataClient:
     def _make_triple(self, sig: Tuple[str, str, str], enrich: bool) -> WikiTriple:
         subj, rel, obj = sig
         subj_ent = (
-            self._make_entity(subj) if enrich and _is_valid_qid(subj)
+            self._make_entity(subj)
+            if enrich and _is_valid_qid(subj)
             else WikidataEntity(qid=subj)
         )
         rel_prop = (
-            self._make_property(rel) if enrich and _is_valid_pid(rel)
+            self._make_property(rel)
+            if enrich and _is_valid_pid(rel)
             else WikidataProperty(pid=rel)
         )
         if _is_valid_qid(obj):
@@ -636,7 +653,9 @@ class WikidataClient:
                 on_miss=lambda p: {"pid": p},
             )
 
-    async def _fetch_outgoing(self, qids: List[str]) -> Dict[str, List[Tuple[str, str]]]:
+    async def _fetch_outgoing(
+        self, qids: List[str]
+    ) -> Dict[str, List[Tuple[str, str]]]:
         return await self._fetch_cached(
             qids,
             lru=self._outgoing,
@@ -648,7 +667,9 @@ class WikidataClient:
             redis_normalize=lambda lst: [tuple(e) for e in lst],
         )
 
-    async def _fetch_incoming(self, qids: List[str]) -> Dict[str, List[Tuple[str, str]]]:
+    async def _fetch_incoming(
+        self, qids: List[str]
+    ) -> Dict[str, List[Tuple[str, str]]]:
         return await self._fetch_cached(
             qids,
             lru=self._incoming,
@@ -695,7 +716,9 @@ class WikidataClient:
                 except WikidataRateLimitError as e:
                     if attempt >= MAX_RETRIES - 1:
                         raise
-                    retry_after = e.retry_after if e.retry_after is not None else (2 ** attempt)
+                    retry_after = (
+                        e.retry_after if e.retry_after is not None else (2**attempt)
+                    )
             await asyncio.sleep(retry_after)
         raise RuntimeError("unreachable")  # for type checkers
 
@@ -799,6 +822,27 @@ class WikidataClient:
             self._redis.setex(key, self._redis_ttl, payload)
         except Exception:
             pass
+
+    @staticmethod
+    def _decode_cached_models(
+        cached: Any, model_cls: Type[pydantic.BaseModel]
+    ) -> List[Any]:
+        """Validate a cached list of dicts back into ``model_cls`` instances.
+
+        Returns the successfully-decoded models (skipping malformed entries), or
+        an empty list when ``cached`` is not a list — callers treat empty as a
+        cache miss and recompute.
+        """
+        if not isinstance(cached, list):
+            return []
+        out: List[Any] = []
+        for item in cached:
+            if isinstance(item, dict):
+                try:
+                    out.append(model_cls.model_validate(item))
+                except Exception:
+                    continue
+        return out
 
     def _cache_get(self, key: str) -> Any:
         if self._cache is None:

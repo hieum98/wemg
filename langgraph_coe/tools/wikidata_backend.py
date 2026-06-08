@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import random
 import string
+import os
 from typing import Any, Optional, Protocol, TypedDict, runtime_checkable
 
 import httpx
@@ -66,10 +67,18 @@ class WikidataBackend(Protocol):
     async def search_entities_text(self, query: str, *, limit: int) -> list[str]: ...
     async def get_entity_details(self, qids: list[str]) -> dict[str, EntityRecord]: ...
     async def search_properties_text(self, query: str, *, limit: int) -> list[str]: ...
-    async def get_property_details(self, pids: list[str]) -> dict[str, PropertyRecord]: ...
-    async def fetch_outgoing(self, qids: list[str]) -> dict[str, list[tuple[str, str]]]: ...
-    async def fetch_incoming(self, qids: list[str]) -> dict[str, list[tuple[str, str]]]: ...
-    async def get_wikipedia_contents(self, titles: list[str]) -> dict[str, Optional[str]]: ...
+    async def get_property_details(
+        self, pids: list[str]
+    ) -> dict[str, PropertyRecord]: ...
+    async def fetch_outgoing(
+        self, qids: list[str]
+    ) -> dict[str, list[tuple[str, str]]]: ...
+    async def fetch_incoming(
+        self, qids: list[str]
+    ) -> dict[str, list[tuple[str, str]]]: ...
+    async def get_wikipedia_contents(
+        self, titles: list[str]
+    ) -> dict[str, Optional[str]]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -95,13 +104,22 @@ def _random_id(n: int = 10) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
-DEFAULT_USER_AGENT = (
-    f"WEMG/0.2.0 (langgraph_coe; bot/{_random_id()}) python-httpx"
-)
+def default_user_agent() -> str:
+    """Wikimedia-compliant UA (https://w.wiki/4wJS): project id + contact, not ``bot/``."""
+    override = os.environ.get("WIKIDATA_USER_AGENT") or os.environ.get(
+        "WEMG_USER_AGENT"
+    )
+    if override:
+        return override.strip()
+    contact = os.environ.get("WIKIDATA_CONTACT", "contact/hieum@uoregon.edu").strip()
+    return f"WEMG/0.2.0.{_random_id()} (langgraph_coe; {contact}) python-httpx"
+
+
+DEFAULT_USER_AGENT = default_user_agent()
 
 
 def _strip_prefix(value: str, prefix: str) -> str:
-    return value[len(prefix):] if value.startswith(prefix) else value
+    return value[len(prefix) :] if value.startswith(prefix) else value
 
 
 def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
@@ -163,15 +181,19 @@ class HTTPWikidataBackend:
     # ---------------- entity search ----------------
 
     async def search_entities_text(self, query: str, *, limit: int) -> list[str]:
-        data = await self._wikidata_api_call({
-            "action": "wbsearchentities",
-            "search": query,
-            "language": "en",
-            "type": "item",
-            "format": "json",
-            "limit": max(1, min(limit, 50)),
-        })
-        return [r["id"] for r in data.get("search", []) if isinstance(r, dict) and "id" in r]
+        data = await self._wikidata_api_call(
+            {
+                "action": "wbsearchentities",
+                "search": query,
+                "language": "en",
+                "type": "item",
+                "format": "json",
+                "limit": max(1, min(limit, 50)),
+            }
+        )
+        return [
+            r["id"] for r in data.get("search", []) if isinstance(r, dict) and "id" in r
+        ]
 
     async def get_entity_details(self, qids: list[str]) -> dict[str, EntityRecord]:
         if not qids:
@@ -179,15 +201,17 @@ class HTTPWikidataBackend:
         result: dict[str, EntityRecord] = {}
         # wbgetentities supports up to 50 ids per request
         for i in range(0, len(qids), 50):
-            chunk = qids[i: i + 50]
-            data = await self._wikidata_api_call({
-                "action": "wbgetentities",
-                "ids": "|".join(chunk),
-                "props": "labels|descriptions|aliases|sitelinks/urls",
-                "languages": "en",
-                "sitefilter": "enwiki",
-                "format": "json",
-            })
+            chunk = qids[i : i + 50]
+            data = await self._wikidata_api_call(
+                {
+                    "action": "wbgetentities",
+                    "ids": "|".join(chunk),
+                    "props": "labels|descriptions|aliases|sitelinks/urls",
+                    "languages": "en",
+                    "sitefilter": "enwiki",
+                    "format": "json",
+                }
+            )
             entities = data.get("entities") or {}
             for qid, ent in entities.items():
                 if "missing" in ent:
@@ -195,7 +219,11 @@ class HTTPWikidataBackend:
                 label = (ent.get("labels", {}).get("en") or {}).get("value")
                 desc = (ent.get("descriptions", {}).get("en") or {}).get("value")
                 aliases_raw = ent.get("aliases", {}).get("en") or []
-                aliases = [a["value"] for a in aliases_raw if isinstance(a, dict) and "value" in a]
+                aliases = [
+                    a["value"]
+                    for a in aliases_raw
+                    if isinstance(a, dict) and "value" in a
+                ]
                 sitelink = ent.get("sitelinks", {}).get("enwiki") or {}
                 result[qid] = {
                     "qid": qid,
@@ -210,29 +238,35 @@ class HTTPWikidataBackend:
     # ---------------- property search ----------------
 
     async def search_properties_text(self, query: str, *, limit: int) -> list[str]:
-        data = await self._wikidata_api_call({
-            "action": "wbsearchentities",
-            "search": query,
-            "language": "en",
-            "type": "property",
-            "format": "json",
-            "limit": max(1, min(limit, 50)),
-        })
-        return [r["id"] for r in data.get("search", []) if isinstance(r, dict) and "id" in r]
+        data = await self._wikidata_api_call(
+            {
+                "action": "wbsearchentities",
+                "search": query,
+                "language": "en",
+                "type": "property",
+                "format": "json",
+                "limit": max(1, min(limit, 50)),
+            }
+        )
+        return [
+            r["id"] for r in data.get("search", []) if isinstance(r, dict) and "id" in r
+        ]
 
     async def get_property_details(self, pids: list[str]) -> dict[str, PropertyRecord]:
         if not pids:
             return {}
         result: dict[str, PropertyRecord] = {}
         for i in range(0, len(pids), 50):
-            chunk = pids[i: i + 50]
-            data = await self._wikidata_api_call({
-                "action": "wbgetentities",
-                "ids": "|".join(chunk),
-                "props": "labels|descriptions",
-                "languages": "en",
-                "format": "json",
-            })
+            chunk = pids[i : i + 50]
+            data = await self._wikidata_api_call(
+                {
+                    "action": "wbgetentities",
+                    "ids": "|".join(chunk),
+                    "props": "labels|descriptions",
+                    "languages": "en",
+                    "format": "json",
+                }
+            )
             entities = data.get("entities") or {}
             for pid, ent in entities.items():
                 if "missing" in ent:
@@ -304,28 +338,41 @@ class HTTPWikidataBackend:
 
     # ---------------- Wikipedia ----------------
 
-    async def get_wikipedia_contents(self, titles: list[str]) -> dict[str, Optional[str]]:
+    async def get_wikipedia_contents(
+        self, titles: list[str]
+    ) -> dict[str, Optional[str]]:
         if not titles:
             return {}
         result: dict[str, Optional[str]] = {t: None for t in titles}
         # Wikipedia API supports up to 50 titles per call
         for i in range(0, len(titles), 20):
-            chunk = titles[i: i + 20]
-            resp = await self._client.get(self._wikipedia_api, params={
-                "action": "query",
-                "prop": "extracts",
-                "exintro": 1,
-                "explaintext": 1,
-                "titles": "|".join(chunk),
-                "format": "json",
-                "redirects": 1,
-            })
+            chunk = titles[i : i + 20]
+            resp = await self._client.get(
+                self._wikipedia_api,
+                params={
+                    "action": "query",
+                    "prop": "extracts",
+                    "exintro": 1,
+                    "explaintext": 1,
+                    "titles": "|".join(chunk),
+                    "format": "json",
+                    "redirects": 1,
+                },
+            )
             self._raise_on_rate_limit(resp)
             resp.raise_for_status()
             data = resp.json()
             query = data.get("query") or {}
-            normalized = {n["from"]: n["to"] for n in query.get("normalized", []) if "from" in n and "to" in n}
-            redirects = {r["from"]: r["to"] for r in query.get("redirects", []) if "from" in r and "to" in r}
+            normalized = {
+                n["from"]: n["to"]
+                for n in query.get("normalized", [])
+                if "from" in n and "to" in n
+            }
+            redirects = {
+                r["from"]: r["to"]
+                for r in query.get("redirects", [])
+                if "from" in r and "to" in r
+            }
             pages = query.get("pages") or {}
             # Map MediaWiki's canonical title back to each originally-requested title
             extract_by_title: dict[str, Optional[str]] = {}

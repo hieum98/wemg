@@ -2,7 +2,17 @@ import json
 import logging
 import re
 import types
-from typing import Annotated, Any, Dict, List, Literal, Optional, Union, get_args, get_origin
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Union,
+    get_args,
+    get_origin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +97,9 @@ def extract_info_from_text(
             f"Got {len(keys)} keys and {len(field_optional)} flags."
         )
 
-    optional_by_key = field_optional if field_optional is not None else [False] * len(keys)
+    optional_by_key = (
+        field_optional if field_optional is not None else [False] * len(keys)
+    )
 
     extracted_info: Dict[str, Any] = {}
 
@@ -105,7 +117,9 @@ def extract_info_from_text(
                         raise ValueError(f"JSON missing required field: {key}")
             return extracted_info
     except (json.JSONDecodeError, ValueError):
-                logger.warning("Direct JSON parse failed; falling back to embedded JSON and regex extraction.")
+        logger.warning(
+            "Direct JSON parse failed; falling back to embedded JSON and regex extraction."
+        )
 
     # Strategy 2: find JSON objects within text
     json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
@@ -122,7 +136,9 @@ def extract_info_from_text(
     # Strategy 3: per-field regex extraction
     for key, vtype, opt in zip(keys, value_type, optional_by_key):
         if key not in extracted_info:
-            extracted_info[key] = _extract_field_with_regex(text, key, vtype, optional=opt)
+            extracted_info[key] = _extract_field_with_regex(
+                text, key, vtype, optional=opt
+            )
 
     return extracted_info
 

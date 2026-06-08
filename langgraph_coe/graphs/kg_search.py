@@ -1,7 +1,9 @@
-"""KG_search subgraph: NER/link agent → triple-search agent → entity enrichment.
+"""KG_search subgraph: NER + entity linking → triple-search agent → enrichment.
 
-Uses LangChain ``langchain.agents.create_agent`` (tool-calling loop built on LangGraph)
-for the first two steps; see LangChain Agents documentation.
+The NER step is a one-shot ``model.with_structured_output(NEROutput)`` call
+followed by a direct ``link_entities`` tool call (no agent loop). Only the
+triple-search step is a tool-calling agent (``langchain.agents.create_agent``,
+built on LangGraph); see LangChain Agents documentation.
 
 Flow: ``START`` → ``ner_agent`` → ``triple_search_agent`` → ``enrich`` → ``END``.
 """
@@ -9,21 +11,25 @@ Flow: ``START`` → ``ner_agent`` → ``triple_search_agent`` → ``enrich`` →
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence, cast
+from typing import Any, Dict, List, Sequence, cast
 
 from langchain.agents import create_agent
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from ._reasoning_middleware import strip_reasoning_middleware
 from ..llm import RoleModelRegistry
 from ..roles import KG_TRIPLE_AGENT_SYSTEM, NEROutput
 from ..tools.wikidata import (
     create_fetch_and_prune_tool,
     enrich_entities,
     link_entities,
-    reset_wikidata_session,
+    # Imported only so tests can patch it on this module and assert the NER
+    # node never calls it (session reset lives in system.py, not here).
+    reset_wikidata_session,  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
@@ -76,44 +82,6 @@ def _build_triple_user_message(state: KGSearchState) -> str:
             f"seed_qids:\n{', '.join(qids)}",
         ]
     )
-
-
-def _parse_link_entities_tool_payloads(messages: Sequence[BaseMessage]) -> List[Dict[str, str]]:
-    """Gather link_entities tool outputs (dicts with name, qid, description)."""
-    merged: List[Dict[str, str]] = []
-    for m in messages:
-        if not isinstance(m, ToolMessage):
-            continue
-        tname = getattr(m, "name", None)
-        if tname is not None and tname != "link_entities":
-            continue
-        content = m.content
-        rows: List[Any]
-        if isinstance(content, list):
-            rows = content
-        elif isinstance(content, str):
-            rows = [content]
-        else:
-            continue
-        for item in rows:
-            if isinstance(item, dict) and item.get("qid"):
-                merged.append(
-                    {
-                        "name": str(item.get("name", "")),
-                        "qid": str(item["qid"]),
-                        "description": str(item.get("description", "")),
-                    }
-                )
-    # Dedupe by qid, keep order
-    seen: set[str] = set()
-    out: List[Dict[str, str]] = []
-    for row in merged:
-        qid = row["qid"]
-        if qid in seen:
-            continue
-        seen.add(qid)
-        out.append(row)
-    return out
 
 
 def _parse_triple_tool_payloads(messages: Sequence[BaseMessage]) -> List[str]:
@@ -182,6 +150,7 @@ def build_kg_search_graph(registry: RoleModelRegistry):
             model,
             tools=[fetch_tool],
             system_prompt=KG_TRIPLE_AGENT_SYSTEM,
+            middleware=[strip_reasoning_middleware],
             name="kg_triple",
         )
         user = _build_triple_user_message(state)
@@ -202,17 +171,40 @@ def build_kg_search_graph(registry: RoleModelRegistry):
 
         user_full = f"{user}\n\n**combined_query_for_tool** (use as the `query` argument):\n{query_blob.strip()}"
 
+        recursion_limit = 35
+        # Stream with ``stream_mode="values"`` so we retain the last full state
+        # emitted before the agent loop terminates. Unlike ``ainvoke`` (which is
+        # all-or-nothing and discards everything on error), this lets us salvage
+        # the tool results gathered so far if the recursion limit is reached.
+        last_state: Dict[str, Any] = {}
         try:
-            out = await agent.ainvoke(
+            async for chunk in agent.astream(
                 {"messages": [HumanMessage(content=user_full)]},
-                config={"recursion_limit": 35},
+                config={"recursion_limit": recursion_limit},
+                stream_mode="values",
+            ):
+                last_state = chunk
+        except GraphRecursionError:
+            # Graceful degradation: the agent didn't converge within the step
+            # budget. Keep the partial messages and feed them downstream rather
+            # than crashing. Warn (not exception) since this is recoverable.
+            partial = cast(List[BaseMessage], last_state.get("messages", []))
+            logger.warning(
+                "KG triple-search agent hit recursion_limit=%d; using %d "
+                "partial messages gathered before the limit",
+                recursion_limit,
+                len(partial),
+            )
+            errs.append(
+                f"triple_search_agent: recursion_limit={recursion_limit} reached "
+                "(partial triples used)"
             )
         except Exception as exc:
             logger.exception("KG triple-search agent failed")
             errs.append(f"triple_search_agent: {exc}")
             return {"triples": [], "errors": errs}
 
-        msgs = cast(List[BaseMessage], out.get("messages", []))
+        msgs = cast(List[BaseMessage], last_state.get("messages", []))
         triples = _parse_triple_tool_payloads(msgs)
         return {"triples": triples, "errors": errs}
 

@@ -43,6 +43,42 @@ class Role:
     output_model: Type[pydantic.BaseModel]
 
 
+class _KeyedFieldsInput(pydantic.BaseModel):
+    """Base for inputs whose prompt body is one ``key:\\n value`` block per field.
+
+    Renders every field in declaration order, blank-line separated — the default
+    shape several role prompts expect. Subclasses needing a custom layout (e.g.
+    context-first ordering for prefix-cache reuse) simply override ``__str__``.
+    """
+
+    def __str__(self) -> str:
+        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+
+
+class _EntityLinkingInput(pydantic.BaseModel):
+    """Base for OpenIE-style inputs: free ``text`` plus optional ``known_entities``.
+
+    Renders the known-entity reference block (when present) above the text — the
+    shape the NER / relation-extraction / open-IE prompts are tuned for. Each
+    subclass declares its own ``text`` field so it can document what to extract.
+    """
+
+    known_entities: Optional[List["WikidataEntity"]] = pydantic.Field(
+        None,
+        description="Optional reference list of known entities with Wikidata QIDs. Use only when certain; never guess IDs.",
+    )
+
+    def __str__(self) -> str:
+        if not self.known_entities:
+            return f"Text:\n{self.text}"
+        known = "\n".join(
+            f"- {e.qid}:{e.label}, {e.description}"
+            for e in self.known_entities
+            if e.qid and e.label
+        )
+        return f"Known entities:\n{known}\n---\nText:\n{self.text}"
+
+
 # =============================================================================
 # Generator I/O Models
 # =============================================================================
@@ -50,8 +86,13 @@ class Role:
 
 class SubquestionGenerationInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
-    context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
-    intermediate_answer: Optional[str] = pydantic.Field(None, description="Result of the previous reasoning hop to anchor the next subquestion.")
+    context: Optional[str] = pydantic.Field(
+        "Not provided", description="The context for the question."
+    )
+    intermediate_answer: Optional[str] = pydantic.Field(
+        None,
+        description="Result of the previous reasoning hop to anchor the next subquestion.",
+    )
 
     def __str__(self):
         parts = [f"question:\n{self.question}", f"context:\n{self.context}"]
@@ -61,8 +102,13 @@ class SubquestionGenerationInput(pydantic.BaseModel):
 
 
 class SubquestionGenerationOutput(pydantic.BaseModel):
-    is_answerable: bool = pydantic.Field(..., description="If the main question can be answered with context.")
-    subquestions: Optional[List[str]] = pydantic.Field(None, description="Generated subquestions which are atomic, self-contained and diverse.")
+    is_answerable: bool = pydantic.Field(
+        ..., description="If the main question can be answered with context."
+    )
+    subquestions: Optional[List[str]] = pydantic.Field(
+        None,
+        description="Generated subquestions which are atomic, self-contained and diverse.",
+    )
     needs_kg: Optional[List[bool]] = pydantic.Field(
         None,
         description=(
@@ -77,7 +123,9 @@ class SubquestionGenerationOutput(pydantic.BaseModel):
 
 class AnswerGenerationInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
-    context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
+    context: Optional[str] = pydantic.Field(
+        "Not provided", description="The context for the question."
+    )
 
     def __str__(self):
         # Context-first ordering: in every batched call site (CoT ``gen_subanswers``,
@@ -90,23 +138,31 @@ class AnswerGenerationInput(pydantic.BaseModel):
 
 class AnswerGenerationOutput(pydantic.BaseModel):
     answer: str = pydantic.Field(..., description="The final answer.")
-    concise_answer: str = pydantic.Field(..., description="A concise version of the answer, only include the answer for the question.")
-    reasoning: str = pydantic.Field(..., description="The reasoning process behind the final answer.")
+    concise_answer: str = pydantic.Field(
+        ...,
+        description="A concise version of the answer, only include the answer for the question.",
+    )
+    reasoning: str = pydantic.Field(
+        ..., description="The reasoning process behind the final answer."
+    )
     confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
-class WebResearcherInput(pydantic.BaseModel):
-    subquery: str = pydantic.Field(..., description="Sub-question to investigate on the web.")
-    research_budget: int = pydantic.Field(..., description="Maximum number of web queries to issue.")
-
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+class WebResearcherInput(_KeyedFieldsInput):
+    subquery: str = pydantic.Field(
+        ..., description="Sub-question to investigate on the web."
+    )
+    research_budget: int = pydantic.Field(
+        ..., description="Maximum number of web queries to issue."
+    )
 
 
 class WebResearchResult(pydantic.BaseModel):
     title: str = pydantic.Field(..., description="Result page title.")
     url: str = pydantic.Field(..., description="Canonical result URL.")
-    snippet: str = pydantic.Field(..., description="Short search snippet from the provider.")
+    snippet: str = pydantic.Field(
+        ..., description="Short search snippet from the provider."
+    )
     full_text: str = pydantic.Field("", description="Optional crawled body text.")
 
 
@@ -117,27 +173,28 @@ class WebResearcherOutput(pydantic.BaseModel):
     )
 
 
-class SelfCorrectionInput(pydantic.BaseModel):
+class SelfCorrectionInput(_KeyedFieldsInput):
     question: str = pydantic.Field(..., description="The question to be answered.")
-    proposed_answer: str = pydantic.Field(..., description="The proposed answer to verify.")
-    context: Optional[str] = pydantic.Field("Not provided", description="The context for the question.")
-
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+    proposed_answer: str = pydantic.Field(
+        ..., description="The proposed answer to verify."
+    )
+    context: Optional[str] = pydantic.Field(
+        "Not provided", description="The context for the question."
+    )
 
 
 class SelfCorrectionOutput(pydantic.BaseModel):
-    status: str = pydantic.Field(..., description="Status of the answer should be one of correct, partial, incorrect or unsupported")
+    status: str = pydantic.Field(
+        ...,
+        description="Status of the answer should be one of correct, partial, incorrect or unsupported",
+    )
     refined_answer: str = pydantic.Field(..., description="The refined answer.")
     confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
-class QuestionRephraserInput(pydantic.BaseModel):
+class QuestionRephraserInput(_KeyedFieldsInput):
     context: Optional[str] = pydantic.Field(None, description="Context for rephrasing.")
     original_question: str = pydantic.Field(..., description="The original question.")
-
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
 
 
 class QuestionRephraserOutput(pydantic.BaseModel):
@@ -153,7 +210,9 @@ class ReasoningSynthesizeInput(pydantic.BaseModel):
 
 
 class ReasoningSynthesizeOutput(pydantic.BaseModel):
-    is_answerable: bool = pydantic.Field(..., description="If question can be answered with context.")
+    is_answerable: bool = pydantic.Field(
+        ..., description="If question can be answered with context."
+    )
     step_conclusion: str = pydantic.Field(..., description="Synthesized conclusion.")
     confidence_level: str = pydantic.Field(..., description="Confidence level")
 
@@ -163,17 +222,20 @@ class ReasoningSynthesizeOutput(pydantic.BaseModel):
 # =============================================================================
 
 
-class AnswerEvaluationInput(pydantic.BaseModel):
-    user_question: str = pydantic.Field(..., description="The user's original question.")
+class AnswerEvaluationInput(_KeyedFieldsInput):
+    user_question: str = pydantic.Field(
+        ..., description="The user's original question."
+    )
     system_answer: str = pydantic.Field(..., description="The system's answer.")
-    correct_answer: Optional[str] = pydantic.Field("Not available", description="The known correct answer.")
-
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
+    correct_answer: Optional[str] = pydantic.Field(
+        "Not available", description="The known correct answer."
+    )
 
 
 class AnswerEvaluationOutput(pydantic.BaseModel):
-    rating: float = pydantic.Field(..., ge=0.0, le=10.0, description="Rating from 0.0 to 10.0.")
+    rating: float = pydantic.Field(
+        ..., ge=0.0, le=10.0, description="Rating from 0.0 to 10.0."
+    )
     reasoning: str = pydantic.Field(..., description="Reasoning behind the rating.")
 
 
@@ -182,16 +244,16 @@ class AnswerEvaluationOutput(pydantic.BaseModel):
 # =============================================================================
 
 
-class ExtractionInput(pydantic.BaseModel):
+class ExtractionInput(_KeyedFieldsInput):
     question: str = pydantic.Field(..., description="The user's question.")
     raw_data: str = pydantic.Field(..., description="Raw text to analyze.")
 
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
-
 
 class ExtractionOutput(pydantic.BaseModel):
-    relevant_information: List[str] = pydantic.Field(..., description="Self-contained information that is (directly or indirectly) relevant to the question.")
+    relevant_information: List[str] = pydantic.Field(
+        ...,
+        description="Self-contained information that is (directly or indirectly) relevant to the question.",
+    )
 
 
 # =============================================================================
@@ -202,17 +264,29 @@ class ExtractionOutput(pydantic.BaseModel):
 class FinalAnswerSynthesisInput(pydantic.BaseModel):
     question: str = pydantic.Field(..., description="The question to be answered.")
     candidate_answers: List[str] = pydantic.Field(..., description="Candidate answers.")
-    candidate_scores: Optional[List[float]] = pydantic.Field(None, description="Quality scores in [-1, 1] for each candidate (higher = better).")
-    context: str = pydantic.Field("", description="Optional supporting evidence (e.g. structured knowledge graph triples).")
+    candidate_scores: Optional[List[float]] = pydantic.Field(
+        None,
+        description="Quality scores in [-1, 1] for each candidate (higher = better).",
+    )
+    context: str = pydantic.Field(
+        "",
+        description="Optional supporting evidence (e.g. structured knowledge graph triples).",
+    )
 
     def __str__(self):
-        if self.candidate_scores and len(self.candidate_scores) == len(self.candidate_answers):
+        if self.candidate_scores and len(self.candidate_scores) == len(
+            self.candidate_answers
+        ):
             candidates_str = "\n\n".join(
-                f"{i+1}. [quality_score={s:.2f}]\n {c}"
-                for i, (c, s) in enumerate(zip(self.candidate_answers, self.candidate_scores))
+                f"{i + 1}. [quality_score={s:.2f}]\n {c}"
+                for i, (c, s) in enumerate(
+                    zip(self.candidate_answers, self.candidate_scores)
+                )
             )
         else:
-            candidates_str = "\n\n".join(f"{i+1}.\n {c}" for i, c in enumerate(self.candidate_answers))
+            candidates_str = "\n\n".join(
+                f"{i + 1}.\n {c}" for i, c in enumerate(self.candidate_answers)
+            )
         parts = [f"question:\n{self.question}", f"candidate_answers:\n{candidates_str}"]
         if self.context:
             parts.append(f"supporting_evidence:\n{self.context}")
@@ -222,7 +296,9 @@ class FinalAnswerSynthesisInput(pydantic.BaseModel):
 class FinalAnswerSynthesisOutput(pydantic.BaseModel):
     final_answer: str = pydantic.Field(..., description="Synthesized final answer.")
     concise_answer: str = pydantic.Field(..., description="Concise version.")
-    reasoning: str = pydantic.Field(..., description="Integrated reasoning behind the final answer.")
+    reasoning: str = pydantic.Field(
+        ..., description="Integrated reasoning behind the final answer."
+    )
     confidence_level: str = pydantic.Field(..., description="Confidence level")
 
 
@@ -253,19 +329,23 @@ class SourceType(Enum):
 class MemoryItem(pydantic.BaseModel):
     content: str = pydantic.Field(..., description="Self-contained information piece.")
     provenance: str = pydantic.Field(..., pattern=r"^(System Prediction|Retrieval)$")
-    hop_depth: Optional[int] = pydantic.Field(None, description="Reasoning hop at which this item was retrieved. Null means pre-consolidated (always retain).")
+    hop_depth: Optional[int] = pydantic.Field(
+        None,
+        description="Reasoning hop at which this item was retrieved. Null means pre-consolidated (always retain).",
+    )
 
 
-class MemoryConsolidationInput(pydantic.BaseModel):
-    question: str = pydantic.Field(..., description="Question the memory should help answer.")
+class MemoryConsolidationInput(_KeyedFieldsInput):
+    question: str = pydantic.Field(
+        ..., description="Question the memory should help answer."
+    )
     memory: str = pydantic.Field(..., description="Raw memory as list of tagged items.")
-
-    def __str__(self):
-        return "\n\n".join(f"{k}:\n{v}" for k, v in self.model_dump().items())
 
 
 class MemoryConsolidationOutput(pydantic.BaseModel):
-    consolidated_memory: List[MemoryItem] = pydantic.Field(..., description="Refined memory items.")
+    consolidated_memory: List[MemoryItem] = pydantic.Field(
+        ..., description="Refined memory items."
+    )
 
 
 class Entity(pydantic.BaseModel):
@@ -274,7 +354,9 @@ class Entity(pydantic.BaseModel):
         description="Wikidata QID for the entity (e.g., 'Q42'). Must be null if unknown or uncertain.",
     )
     name: str = pydantic.Field(..., description="Entity name.")
-    description: Optional[str] = pydantic.Field(None, description="Brief description of the entity.")
+    description: Optional[str] = pydantic.Field(
+        None, description="Brief description of the entity."
+    )
 
     def __hash__(self):
         return hash(self.id if self.id else self.name)
@@ -290,24 +372,14 @@ class Entity(pydantic.BaseModel):
         return f"{self.name} - {self.description}" if self.description else self.name
 
 
-class NERInput(pydantic.BaseModel):
+class NERInput(_EntityLinkingInput):
     text: str = pydantic.Field(..., description="Text to extract entities from.")
-    known_entities: Optional[List[WikidataEntity]] = pydantic.Field(
-        None,
-        description="Optional reference list of known entities with Wikidata QIDs. Use only when certain; never guess IDs.",
-    )
-
-    def __str__(self):
-        if self.known_entities:
-            known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
-            known_entities_str = "\n".join(known_entities_str)
-            return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
-        else:
-            return f"Text:\n{self.text}"
 
 
 class NEROutput(pydantic.BaseModel):
-    entities: List[Entity] = pydantic.Field(..., description="Extracted named entities.")
+    entities: List[Entity] = pydantic.Field(
+        ..., description="Extracted named entities."
+    )
 
 
 class Relation(pydantic.BaseModel):
@@ -322,64 +394,62 @@ class Relation(pydantic.BaseModel):
         None,
         description="Wikidata QID of the object (e.g., 'Q42'). Must be null if unknown or uncertain.",
     )
-    context: Optional[str] = pydantic.Field(None, description="The context in which the relationship is stated. It should be self-contained and not rely on the original text or entities.")
+    context: Optional[str] = pydantic.Field(
+        None,
+        description="The context in which the relationship is stated. It should be self-contained and not rely on the original text or entities.",
+    )
 
     def __hash__(self):
-        return hash((self.subject, self.relation, self.object, self.subject_id, self.object_id))
+        return hash(
+            (self.subject, self.relation, self.object, self.subject_id, self.object_id)
+        )
 
     def __eq__(self, other):
         if not isinstance(other, Relation):
             return False
-        same_subject = self.subject_id==other.subject_id if self.subject_id and other.subject_id else self.subject == other.subject
-        same_object = self.object_id==other.object_id if self.object_id and other.object_id else self.object == other.object
+        same_subject = (
+            self.subject_id == other.subject_id
+            if self.subject_id and other.subject_id
+            else self.subject == other.subject
+        )
+        same_object = (
+            self.object_id == other.object_id
+            if self.object_id and other.object_id
+            else self.object == other.object
+        )
 
-        return (same_subject and same_object
-                and self.relation == other.relation)
+        return same_subject and same_object and self.relation == other.relation
 
     def __str__(self):
-        text = f"Subject: {self.subject}\nRelation: {self.relation}\nObject: {self.object}"
+        text = (
+            f"Subject: {self.subject}\nRelation: {self.relation}\nObject: {self.object}"
+        )
         return text + (f"\nContext: {self.context}" if self.context else "")
 
 
-class RelationExtractionInput(pydantic.BaseModel):
+class RelationExtractionInput(_EntityLinkingInput):
     text: str = pydantic.Field(..., description="Text to extract relationships from.")
-    known_entities: Optional[List[WikidataEntity]] = pydantic.Field(
-        None,
-        description="Optional reference list of known entities with Wikidata QIDs. Use only when certain; never guess IDs.",
-    )
-
-    def __str__(self):
-        if self.known_entities:
-            known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
-            known_entities_str = "\n".join(known_entities_str)
-            return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
-        else:
-            return f"Text:\n{self.text}"
 
 
 class RelationExtractionOutput(pydantic.BaseModel):
-    relations: List[Relation] = pydantic.Field(..., description="Extracted relationships.")
-
-
-class OpenIEInput(pydantic.BaseModel):
-    text: str = pydantic.Field(..., description="Text to extract entities and relations from.")
-    known_entities: Optional[List[WikidataEntity]] = pydantic.Field(
-        None,
-        description="Optional reference list of known entities with Wikidata QIDs. Use only when certain; never guess IDs.",
+    relations: List[Relation] = pydantic.Field(
+        ..., description="Extracted relationships."
     )
 
-    def __str__(self):
-        if self.known_entities:
-            known_entities_str = [f"- {e.qid}:{e.label}, {e.description}" for e in self.known_entities if e.qid and e.label]
-            known_entities_str = "\n".join(known_entities_str)
-            return f"Known entities:\n{known_entities_str}\n---\nText:\n{self.text}"
-        else:
-            return f"Text:\n{self.text}"
+
+class OpenIEInput(_EntityLinkingInput):
+    text: str = pydantic.Field(
+        ..., description="Text to extract entities and relations from."
+    )
 
 
 class OpenIEOutput(pydantic.BaseModel):
-    entities: List[Entity] = pydantic.Field(..., description="Extracted named entities.")
-    relations: List[Relation] = pydantic.Field(..., description="Extracted relationships.")
+    entities: List[Entity] = pydantic.Field(
+        ..., description="Extracted named entities."
+    )
+    relations: List[Relation] = pydantic.Field(
+        ..., description="Extracted relationships."
+    )
 
 
 # =============================================================================
@@ -397,7 +467,9 @@ class TriplePruneInput(pydantic.BaseModel):
 
 
 class TriplePruneOutput(pydantic.BaseModel):
-    keep_indices: List[int] = pydantic.Field(..., description="0-based indices of triples to keep.")
+    keep_indices: List[int] = pydantic.Field(
+        ..., description="0-based indices of triples to keep."
+    )
 
 
 # =============================================================================
@@ -926,20 +998,62 @@ Respond with a JSON object with exactly these keys:
 
 
 # Active callers in Phase 1–3 subgraphs.
-SUBQUESTION_GENERATOR = Role("subquestion_generator", GENERATE_SUBQUESTION_PROMPT, SubquestionGenerationInput, SubquestionGenerationOutput)
-ANSWER_GENERATOR = Role("answer_generator", ANSWER_PROMPT, AnswerGenerationInput, AnswerGenerationOutput)
-WEB_RESEARCHER = Role("web_researcher", WEB_RESEARCHER_PROMPT, WebResearcherInput, WebResearcherOutput)
-SELF_CORRECTOR = Role("self_corrector", SELF_CORRECT_PROMPT, SelfCorrectionInput, SelfCorrectionOutput)
-FINAL_ANSWER_SYNTHESIZER = Role("final_answer_synthesizer", SYNTHESIZE_FINAL_ANSWER_PROMPT, FinalAnswerSynthesisInput, FinalAnswerSynthesisOutput)
-VERIFIER = Role("verifier", VERIFY_ANSWER_PROMPT, AnswerVerificationInput, AnswerVerificationOutput)
-MEMORY_CONSOLIDATOR = Role("memory_consolidation", MEMORY_CONSOLIDATION_PROMPT, MemoryConsolidationInput, MemoryConsolidationOutput)
+SUBQUESTION_GENERATOR = Role(
+    "subquestion_generator",
+    GENERATE_SUBQUESTION_PROMPT,
+    SubquestionGenerationInput,
+    SubquestionGenerationOutput,
+)
+ANSWER_GENERATOR = Role(
+    "answer_generator", ANSWER_PROMPT, AnswerGenerationInput, AnswerGenerationOutput
+)
+WEB_RESEARCHER = Role(
+    "web_researcher", WEB_RESEARCHER_PROMPT, WebResearcherInput, WebResearcherOutput
+)
+SELF_CORRECTOR = Role(
+    "self_corrector", SELF_CORRECT_PROMPT, SelfCorrectionInput, SelfCorrectionOutput
+)
+FINAL_ANSWER_SYNTHESIZER = Role(
+    "final_answer_synthesizer",
+    SYNTHESIZE_FINAL_ANSWER_PROMPT,
+    FinalAnswerSynthesisInput,
+    FinalAnswerSynthesisOutput,
+)
+VERIFIER = Role(
+    "verifier", VERIFY_ANSWER_PROMPT, AnswerVerificationInput, AnswerVerificationOutput
+)
+MEMORY_CONSOLIDATOR = Role(
+    "memory_consolidation",
+    MEMORY_CONSOLIDATION_PROMPT,
+    MemoryConsolidationInput,
+    MemoryConsolidationOutput,
+)
 NER = Role("named_entity_recognition", NER_PROMPT, NERInput, NEROutput)
-RELATION_EXTRACTOR = Role("relation_extraction", RELATION_EXTRACTION_PROMPT, RelationExtractionInput, RelationExtractionOutput)
+RELATION_EXTRACTOR = Role(
+    "relation_extraction",
+    RELATION_EXTRACTION_PROMPT,
+    RelationExtractionInput,
+    RelationExtractionOutput,
+)
 OPEN_IE = Role("open_ie", OPEN_IE_PROMPT, OpenIEInput, OpenIEOutput)
-TRIPLE_PRUNER = Role("triple_pruner", TRIPLE_PRUNE_PROMPT, TriplePruneInput, TriplePruneOutput)
+TRIPLE_PRUNER = Role(
+    "triple_pruner", TRIPLE_PRUNE_PROMPT, TriplePruneInput, TriplePruneOutput
+)
 
 # Kept without a current caller — planned use cases listed in implementation_plan.md §3.6.
-QUESTION_REPHRASER = Role("question_rephraser", REPHRASE_QUESTION_PROMPT, QuestionRephraserInput, QuestionRephraserOutput)
-REASONING_SYNTHESIZER = Role("reasoning_synthesizer", SYNTHESIZE_PROMPT, ReasoningSynthesizeInput, ReasoningSynthesizeOutput)
-EVALUATOR = Role("evaluator", JUDGE_ANSWER_PROMPT_V2, AnswerEvaluationInput, AnswerEvaluationOutput)
+QUESTION_REPHRASER = Role(
+    "question_rephraser",
+    REPHRASE_QUESTION_PROMPT,
+    QuestionRephraserInput,
+    QuestionRephraserOutput,
+)
+REASONING_SYNTHESIZER = Role(
+    "reasoning_synthesizer",
+    SYNTHESIZE_PROMPT,
+    ReasoningSynthesizeInput,
+    ReasoningSynthesizeOutput,
+)
+EVALUATOR = Role(
+    "evaluator", JUDGE_ANSWER_PROMPT_V2, AnswerEvaluationInput, AnswerEvaluationOutput
+)
 EXTRACTOR = Role("extractor", EXTRACT_PROMPT, ExtractionInput, ExtractionOutput)

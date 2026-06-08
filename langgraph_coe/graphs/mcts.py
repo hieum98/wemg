@@ -49,6 +49,7 @@ from ..roles import (
     SelfCorrectionInput,
     SubquestionGenerationInput,
 )
+from ._memory_text import textualize_graph as _textualize_graph
 from .cot import Clear, append_or_clear, build_cot_graph
 from .memory_update import build_memory_update_graph
 
@@ -135,6 +136,8 @@ class MCTSState(TypedDict, total=False):
 
     # Output
     final_answer: str
+    concise_answer: str
+    reasoning: str
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -171,20 +174,20 @@ def _make_node(
     }
 
 
-def _textualize_graph(graph: Optional[nx.DiGraph]) -> str:
-    if graph is None or graph.number_of_edges() == 0:
-        return ""
-    lines: List[str] = []
-    for u, v, data in graph.edges(data=True):
-        rel = data.get("relation")
-        if isinstance(rel, (set, list, tuple)):
-            for r in rel:
-                lines.append(f"{u} — {r} — {v}")
-        elif rel:
-            lines.append(f"{u} — {rel} — {v}")
-        else:
-            lines.append(f"{u} — related_to — {v}")
-    return "\n".join(lines)
+def _make_root_node(root_id: str, question: str) -> MCTSTreeNode:
+    """Build the USER_QUESTION root. Unlike :func:`_make_node`, the root keeps a
+    caller-supplied ``node_id`` and a fixed prior of 1.0 (it is never a UCB
+    candidate, so its prior is unused — see ``NODE_TYPE_PRIOR``)."""
+    return {
+        "node_id": root_id,
+        "parent_id": None,
+        "children_ids": [],
+        "node_type": MCTSNodeType.USER_QUESTION,
+        "content": {"question": question},
+        "visits": 0,
+        "value": 0.0,
+        "prior": 1.0,
+    }
 
 
 def _format_text_memory(text_memory: Optional[List[str]]) -> str:
@@ -254,7 +257,9 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             SUBQUESTION_GENERATOR,
             SubquestionGenerationInput(question=question, context=ctx),
         )
-        subqs = [s for s in (getattr(out, "subquestions", None) or []) if s and s.strip()]
+        subqs = [
+            s for s in (getattr(out, "subquestions", None) or []) if s and s.strip()
+        ]
         if not subqs:
             return []
         inputs = [AnswerGenerationInput(question=sq, context=ctx) for sq in subqs]
@@ -272,8 +277,12 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             )
         return nodes
 
-    async def _gen_final(question: str, parent_id: str, ctx: str, state: MCTSState) -> List[MCTSTreeNode]:
-        candidates = list(state.get("text_memory") or []) or ["No prior reasoning available."]
+    async def _gen_final(
+        question: str, parent_id: str, ctx: str, state: MCTSState
+    ) -> List[MCTSTreeNode]:
+        candidates = list(state.get("text_memory") or []) or [
+            "No prior reasoning available."
+        ]
         out, _ = await execute_role_lc(
             registry,
             FINAL_ANSWER_SYNTHESIZER,
@@ -288,7 +297,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             _make_node(
                 MCTSNodeType.FINAL_ANSWER,
                 parent_id,
-                {"final_answer": final_text, "concise_answer": concise, "reasoning": reasoning},
+                {
+                    "final_answer": final_text,
+                    "concise_answer": concise,
+                    "reasoning": reasoning,
+                },
             )
         ]
 
@@ -320,16 +333,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         tree_update: Dict[str, MCTSTreeNode] = {}
 
         if root_id not in tree:
-            root = {
-                "node_id": root_id,
-                "parent_id": None,
-                "children_ids": [],
-                "node_type": MCTSNodeType.USER_QUESTION,
-                "content": {"question": state.get("question", "")},
-                "visits": 0,
-                "value": 0.0,
-                "prior": 1.0,
-            }
+            root = _make_root_node(root_id, state.get("question", ""))
             tree[root_id] = root
             tree_update[root_id] = root
 
@@ -347,7 +351,12 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                 child = tree[cid]
                 visits = child.get("visits", 0)
                 q = (child.get("value", 0.0) / visits) if visits > 0 else 0.0
-                u = explore * child.get("prior", 1.0) * math.sqrt(parent_visits + 1.0) / (1.0 + visits)
+                u = (
+                    explore
+                    * child.get("prior", 1.0)
+                    * math.sqrt(parent_visits + 1.0)
+                    / (1.0 + visits)
+                )
                 score = q + u
                 if score > best_score:
                     best_score, best_id = score, cid
@@ -440,7 +449,9 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             concat_q = "\n".join(f"Sub Q{i + 1}: {q}" for i, q in enumerate(subqs))
             concat_a = "\n".join(f"Sub A{i + 1}: {a}" for i, a in enumerate(subas))
             node = _make_node(
-                MCTSNodeType.SUB_QA, None, {"sub_question": concat_q, "sub_answer": concat_a}
+                MCTSNodeType.SUB_QA,
+                None,
+                {"sub_question": concat_q, "sub_answer": concat_a},
             )
             chain_ids.append(node["node_id"])
             updates[node["node_id"]] = node
@@ -451,7 +462,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             fnode = _make_node(
                 MCTSNodeType.FINAL_ANSWER,
                 None,
-                {"final_answer": final_answer, "concise_answer": final_answer, "reasoning": ""},
+                {
+                    "final_answer": final_answer,
+                    "concise_answer": final_answer,
+                    "reasoning": "",
+                },
             )
             chain_ids.append(fnode["node_id"])
             updates[fnode["node_id"]] = fnode
@@ -483,7 +498,10 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         path = state.get("current_path") or []
         sr = dict(state.get("simulation_result") or {})
         if not path:
-            return {"reward": 0.0, "simulation_result": {**sr, "verifier_critiques": []}}
+            return {
+                "reward": 0.0,
+                "simulation_result": {**sr, "verifier_critiques": []},
+            }
 
         term = tree[path[-1]]
         content = term.get("content", {})
@@ -507,7 +525,9 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                     registry,
                     VERIFIER,
                     AnswerVerificationInput(
-                        question=question, candidate_answer=candidate, context="Not provided"
+                        question=question,
+                        candidate_answer=candidate,
+                        context="Not provided",
                     ),
                 ),
                 execute_role_lc(
@@ -536,7 +556,10 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             logger.warning("Verifier reward computation failed; reward=0.0: %s", e)
             reward, critiques = 0.0, []
 
-        return {"reward": reward, "simulation_result": {**sr, "verifier_critiques": critiques}}
+        return {
+            "reward": reward,
+            "simulation_result": {**sr, "verifier_critiques": critiques},
+        }
 
     async def backprop(state: MCTSState) -> Dict[str, Any]:
         tree = state.get("tree") or {}
@@ -620,7 +643,9 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
         candidate_scores: Optional[List[float]] = scores
         if not candidates:
-            candidates = list(state.get("text_memory") or []) or ["No answer available."]
+            candidates = list(state.get("text_memory") or []) or [
+                "No answer available."
+            ]
             candidate_scores = None
 
         out, _ = await execute_role_lc(
@@ -633,8 +658,16 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                 context=_join_memory_context(state),
             ),
         )
-        final_text = getattr(out, "final_answer", "") or getattr(out, "concise_answer", "") or ""
-        return {"final_answer": str(final_text)}
+        final_text = (
+            getattr(out, "final_answer", "") or getattr(out, "concise_answer", "") or ""
+        )
+        concise = getattr(out, "concise_answer", "") or final_text
+        reasoning = getattr(out, "reasoning", "") or ""
+        return {
+            "final_answer": str(final_text),
+            "concise_answer": str(concise),
+            "reasoning": str(reasoning),
+        }
 
     # ── Routing ────────────────────────────────────────────────────────────────
 
@@ -669,7 +702,9 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
     builder.add_edge("simulate", "evaluate")
     builder.add_edge("evaluate", "backprop")
     builder.add_edge("backprop", "mem_update")
-    builder.add_conditional_edges("mem_update", route_after_iteration, ["select", "synthesize"])
+    builder.add_conditional_edges(
+        "mem_update", route_after_iteration, ["select", "synthesize"]
+    )
     builder.add_edge("synthesize", END)
 
     return builder.compile()

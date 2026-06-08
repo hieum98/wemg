@@ -20,7 +20,6 @@ Thread/async safety:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Set
@@ -31,10 +30,7 @@ from langchain_core.tools import tool
 from .wikidata_client import (
     WikidataClient,
     WikidataEntity,
-    WikidataProperty,
     WikiTriple,
-    DEFAULT_PROPERTIES,
-    PROPERTY_LABELS,
 )
 from ..config import WikidataConfig
 
@@ -131,6 +127,7 @@ def reset_wikidata_session() -> None:
 # Stage A pruning: fast reranker-based score filter
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 async def _stage_a_prune(
     question: str,
     triples: List[WikiTriple],
@@ -138,6 +135,7 @@ async def _stage_a_prune(
     reranker_model: Optional[str],
     top_k: int = 64,
     delta: float = 0.05,
+    instruction: Optional[str] = None,
 ) -> List[WikiTriple]:
     """Score each triple against the query via the reranker API and keep the top tier."""
     if not triples or not reranker_url:
@@ -147,8 +145,13 @@ async def _stage_a_prune(
     payload = {
         "model": reranker_model or "reranker",
         "query": question,
-        "texts": texts,
+        "documents": texts,
     }
+    # Task instruction tells Qwen3-Reranker what "relevant" means; symmetric with
+    # the context reranks in tools/retrieval.py. Omit when unset so the server
+    # falls back to its default behavior.
+    if instruction:
+        payload["instruct"] = instruction
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -157,7 +160,13 @@ async def _stage_a_prune(
                 timeout=30.0,
             )
             resp.raise_for_status()
-            results = resp.json().get("results", [])
+            body = resp.json()
+            if isinstance(body, list):
+                results = body
+            elif isinstance(body, dict):
+                results = body.get("results", [])
+            else:
+                results = []
 
         if not results:
             return triples
@@ -165,9 +174,7 @@ async def _stage_a_prune(
         scored = sorted(results, key=lambda r: r.get("score", 0), reverse=True)
         top_score = scored[0].get("score", 0)
         kept_indices = [
-            r["index"]
-            for r in scored
-            if r.get("score", 0) >= (top_score - delta)
+            r["index"] for r in scored if r.get("score", 0) >= (top_score - delta)
         ][:top_k]
         return [triples[i] for i in kept_indices]
 
@@ -179,6 +186,7 @@ async def _stage_a_prune(
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage B pruning: LLM TRIPLE_PRUNER role
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 async def _stage_b_prune(
     question: str,
@@ -216,6 +224,7 @@ async def _stage_b_prune(
 # ──────────────────────────────────────────────────────────────────────────────
 # Tool 1 – link_entities
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 @tool
 async def link_entities(entity_names: List[str]) -> List[Dict[str, str]]:
@@ -322,10 +331,15 @@ async def _fetch_and_prune_subgraph_core(
 
     reranker_url = getattr(_wikidata_config, "reranker_url", None)
     reranker_model = getattr(_wikidata_config, "reranker_model", None)
+    reranker_instruction = getattr(_wikidata_config, "reranker_instruction", None)
     triples = await _stage_a_prune(
-        query, triples, reranker_url, reranker_model,
+        query,
+        triples,
+        reranker_url,
+        reranker_model,
         top_k=_wikidata_config.pruning_top_k,
         delta=_wikidata_config.pruning_delta,
+        instruction=reranker_instruction,
     )
 
     if registry is not None:
@@ -362,6 +376,7 @@ def create_fetch_and_prune_tool(registry: Any):
 # Tool 3 – enrich_entities
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 @tool
 async def enrich_entities(qids: List[str]) -> List[WikidataEntity]:
     """Fetch full entity details (label, description, aliases, Wikipedia) for *qids*.
@@ -376,9 +391,7 @@ async def enrich_entities(qids: List[str]) -> List[WikidataEntity]:
         return []
 
     try:
-        enriched = await _wikidata_client.enrich_entities(
-            valid_qids, get_details=True
-        )
+        enriched = await _wikidata_client.enrich_entities(valid_qids, get_details=True)
     except Exception as exc:
         logger.error("Entity enrichment failed for %s: %s", qids, exc)
         return []

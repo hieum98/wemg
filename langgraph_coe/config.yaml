@@ -8,28 +8,83 @@ llm:
   # here instead of in config.py. Unspecified fields fall back to TierConfig
   # defaults (api_base http://n0142:4000/v1, max_input_tokens 65536, top_p 0.95,
   # max_retries 3, timeout 300).
+  #
+  # Generation/sampling knobs (per tier; OMIT a knob to use the server default):
+  #   temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty,
+  #   repetition_penalty, seed, max_tokens, enable_thinking, thinking_budget.
+  # top_k / min_p / repetition_penalty are non-OpenAI knobs forwarded to SGLang.
+  # See docs/setup_generation_params.md. Example (all knobs on one tier):
+  #   light:
+  #     top_p: 0.95
+  #     top_k: 20
+  #     min_p: 0.0
+  #     presence_penalty: 1.5
+  #     frequency_penalty: 0.0
+  #     repetition_penalty: 1.0
+  #     seed: 8888
   tiers:
     heavy:
-      model_name: Qwen3-Next-80B-A3B-Thinking-FP8
-      temperature: 0.7
-      max_tokens: 8192
+      model_name: openai/Qwen/Qwen3.5-4B
+      api_base: http://n0152:30000/v1
+      temperature: 1.0
+      max_tokens: 65536
       enable_thinking: true
+      thinking_budget: 16384
+      top_p: 0.95
+      top_k: 20
+      min_p: 0.0
+      presence_penalty: 1.5
+      frequency_penalty: 0.0
+      repetition_penalty: 1.0
+      seed: 8888
     medium:
-      model_name: Qwen3-Next-80B-A3B-Thinking-FP8
-      temperature: 0.4
-      max_tokens: 4096
-      enable_thinking: false
+      model_name: openai/Qwen/Qwen3.5-4B
+      api_base: http://n0152:30000/v1
+      temperature: 1.0
+      max_tokens: 65536
+      enable_thinking: true
+      thinking_budget: 8192
+      top_p: 0.95
+      top_k: 20
+      min_p: 0.0
+      presence_penalty: 1.5
+      frequency_penalty: 0.0
+      repetition_penalty: 1.0
+      seed: 8888
     light:
-      model_name: Qwen3-32B-FP8
-      temperature: 0.2
-      max_tokens: 2048
-      enable_thinking: false
+      model_name: openai/Qwen/Qwen3.5-4B
+      api_base: http://n0152:30000/v1
+      temperature: 1.0
+      max_tokens: 65536
+      enable_thinking: true
+      thinking_budget: 4096
+      top_p: 0.95
+      top_k: 20
+      min_p: 0.0
+      presence_penalty: 1.5
+      frequency_penalty: 0.0
+      repetition_penalty: 1.0
+      seed: 8888
+      # Cap reasoning tokens when thinking is on (server needs
+      # --enable-custom-logit-processor). Must be < max_tokens.
+      # Setup: docs/setup_thinking_budget.md. Example:
+      #   enable_thinking: true
+      #   thinking_budget: 512
     # Bounded-output classification roles (§3b): tiny fixed-shape outputs, no thinking.
     classify:
-      model_name: Qwen3-32B-FP8
-      temperature: 0.0
-      max_tokens: 1024
-      enable_thinking: false
+      model_name: openai/Qwen/Qwen3.5-4B
+      api_base: http://n0152:30000/v1
+      temperature: 0.1
+      max_tokens: 65536
+      enable_thinking: true
+      thinking_budget: 4096 
+      top_p: 0.95
+      top_k: 20
+      min_p: 0.0
+      presence_penalty: 1.5
+      frequency_penalty: 0.0
+      repetition_penalty: 1.0
+      seed: 8888
   # Role → tier routing. Remap a role to a different tier here; unknown roles
   # fall back to "heavy".
   role_tiers:
@@ -38,7 +93,7 @@ llm:
     final_answer_synthesizer: heavy
     subquestion_generator: heavy
     reasoning_synthesizer: heavy
-    memory_consolidation: medium
+    memory_consolidation: heavy
     relation_extraction: medium
     open_ie: medium
     verifier: medium
@@ -46,29 +101,34 @@ llm:
     triple_pruner: classify
     named_entity_recognition: classify
     question_rephraser: classify
-    web_researcher: light
-    extractor: light
+    web_researcher: medium
+    extractor: medium
     kg_ner_agent: light
     kg_triple_search_agent: medium
 
 # Working-memory limits (MemoryUpdateGraph + CoT extractor batching).
 memory:
-  max_textual_memory_tokens: 16384
+  max_textual_memory_tokens: 65536
   prune_batch_size: 16
   extractor_max_input_chars: 24000
 
+# Wikidata tools: langgraph_coe/tools/wikidata*.py — docs/setup_wikidata_tools.md
 wikidata:
   # Local QEndpoint on n0162:1234 — use SSH tunnel, then set e.g.:
   #   ssh -fN -L 30162:n0162:1234 t2
   #   sparql_endpoint: http://127.0.0.1:30162/api/endpoint/sparql
-  sparql_endpoint: null
-  max_sparql_rps: 2.0
+  sparql_endpoint: http://n0162:1234/api/endpoint/sparql
+  max_sparql_rps: 10.0
   max_wikipedia_rps: 10.0
   triple_cache_max_entries: 5000
-  max_hops: 3
+  max_hops: 1
   # Leave null so integration tests exercise Wikidata-only paths (Stage A rerank skipped).
-  reranker_url: null
-  reranker_model: null
+  reranker_url: http://n0997:30000/v1
+  reranker_model: Qwen3-Reranker-4B
+  # Task instruction (Qwen3-Reranker ``instruct`` field) for Stage-A triple
+  # pruning. Without it the reranker saturates (~0.998 flat scores) on short,
+  # near-identical triple strings. Symmetric with reranker.instruction below.
+  reranker_instruction: "Given a question, retrieve the knowledge-graph triples whose relation and object are needed to answer it."
   pruning_top_k: 64
   pruning_delta: 0.05
 
@@ -77,43 +137,38 @@ web_search:
   enabled: false  # paper parity: KG + corpus only. Set true to re-enable the web fan-out.
   api_key: null
   top_k: 3
-  crawl_full_text: false
+  crawl_full_text: true
   max_crawl_requests_per_second: 2.0
   max_queries_per_agent: 2
 
-# Corpus tool (``init_retrieval_pipeline`` / ``corpus_search``): local FAISS + embedder HTTP API.
-# Two index layouts (auto-detected by presence of a ``.pkl`` sidecar):
-#   1. LangChain bundle — ``<name>.faiss`` + ``<name>.pkl``
-#   2. Raw HF-datasets index — bare ``<name>.faiss``; passage text from ``corpus_dataset``
-# Override path with LANGGRAPH_CORPUS_INDEX_PATH (or SAR_CORPUS_INDEX_PATH).
 retriever:
   corpus:
     index_path: /home/hieum/uonlp/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss
     search_k: 10
-    # Raw-index layout only; override with LANGGRAPH_CORPUS_DATASET / SAR_CORPUS_DATASET.
-    corpus_dataset: null
+    corpus_path: Hieuman/wiki23-processed
     corpus_split: train
     text_column: contents
     embedder:
-      model_name: Qwen3-Embedding-4B
-      url: http://n0385:4000/v1
+      model_name: Qwen/Qwen3-Embedding-4B
+      url: http://n0152:30001/v1
       api_key: null
 
 reranker:
-  enabled: false
+  enabled: true
   model_name: Qwen3-Reranker-4B
-  url: http://n0999:30002/v1
-  api_key: null
+  url: http://n0997:30000/v1
+  api_key: EMPTY
   top_k: 5
+  instruction: "Given a web search query, retrieve relevant passages that answer the query."
 
 # Search strategy (system.py picks MCTSGraph vs CoTGraph via `strategy`).
 search:
   strategy: mcts            # "mcts" | "cot"
   cot:
-    max_depth: 5            # CoT decomposition loop iterations before forced synthesis
-    recursion_limit: 75     # LangGraph superstep budget per CoT run
+    max_depth: 10           # CoT decomposition loop iterations before forced synthesis
+    recursion_limit: 150     # LangGraph superstep budget per CoT run
   mcts:
-    num_iterations: 15      # hard cap on MCTS iterations
+    num_iterations: 20      # hard cap on MCTS iterations
     min_iterations: 3       # floor before any early-termination condition may fire
     exploration_weight: 2.0
     max_tree_depth: 10
@@ -122,8 +177,9 @@ search:
     high_confidence_threshold: 0.9
     convergence_patience: 5
     semantic_sufficiency_count: 3
-    recursion_limit: 150    # LangGraph superstep budget per MCTS run
+    recursion_limit: 300    # LangGraph superstep budget per MCTS run
 
+# Redis cache for LLM (db 0), Wikidata + web_search (db 1). Setup: docs/setup_redis_cache.md
 cache:
   enabled: false
   redis:

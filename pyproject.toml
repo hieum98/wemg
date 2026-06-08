@@ -74,5 +74,5 @@ testpaths = ["tests", "langgraph_coe/tests"]
 asyncio_mode = "auto"
 # Always stream logging to the terminal during runs; INFO is the lowest standard level. (DEBUG is too verbose)
 log_cli = true
-log_cli_level = "INFO"
-log_level = "INFO"
+log_cli_level = "WARNING"
+log_level = "WARNING"
