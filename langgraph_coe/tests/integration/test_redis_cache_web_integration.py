@@ -5,7 +5,7 @@ Mirrors ``test_redis_cache_web.py`` but uses a real ``redis.Redis`` client from
 
 Run (from repo root). Full setup: ``docs/setup_redis_cache.md``::
 
-    conda activate wemg
+    conda activate coe
     redis-server --daemonize yes   # if not already listening on cache.redis.host:port
     uv run pytest langgraph_coe/tests/phase0/test_redis_cache_web_integration.py -v -s
 
@@ -84,7 +84,7 @@ requires_redis = pytest.mark.skipif(
     not _redis_alive(),
     reason=(
         f"Redis unreachable at {_redis_host()}:{_redis_port()} db={_redis_db()}. "
-        "Start with: conda activate wemg && redis-server --daemonize yes"
+        "Start with: conda activate coe && redis-server --daemonize yes"
     ),
 )
 

@@ -1,6 +1,6 @@
 """CoTGraph (Phase 2).
 
-Replaces the legacy ``wemg/reasoning/cot.py`` while-loop with explicit LangGraph
+Replaces the legacy ``coe/reasoning/cot.py`` while-loop with explicit LangGraph
 nodes and native fan-out. See `implementation_plan.md` §7 for the full design.
 
 Flow::

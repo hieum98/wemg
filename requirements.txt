@@ -16,4 +16,4 @@ typer-slim==0.20.1
 uvloop==0.22.1
 watchfiles==1.1.1
 websockets==15.0.1
-wemg==0.1.0
+coe==0.1.0

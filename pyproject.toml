@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wemg"
+name = "coe"
 version = "0.2.0"
-description = "WEMG - When Embedding Models Meet Graph RAG"
+description = "COE - Co-Evolving Memory and Graph for RAG reasoning"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
@@ -65,8 +65,8 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["wemg*", "langgraph_coe*"]
-exclude = ["test*", "wemg_backup*"]
+include = ["coe*", "langgraph_coe*"]
+exclude = ["test*", "coe_backup*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "langgraph_coe/tests"]

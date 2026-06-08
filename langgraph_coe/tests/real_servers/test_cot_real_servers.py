@@ -24,7 +24,7 @@ Because the corpus index is ~99 GB it must be loaded on a compute node with
 enough RAM — run from a node that can reach every endpoint, e.g.::
 
     # files are shared across nodes; n0162 hosts QEndpoint and has the RAM
-    ssh n0162 'cd /gpfs/projects/uonlp/hieum/wemg && \
+    ssh n0162 'cd /gpfs/projects/uonlp/hieum/coe && \
         uv run pytest langgraph_coe/tests/phase2/test_cot_real_servers.py -v -s'
 
 The whole module skips cleanly when any endpoint or the corpus is unreachable.

@@ -38,7 +38,7 @@ enough RAM that can also reach every endpoint (the fixture is module-scoped so
 the index loads **once** for all three tests). Run e.g.::
 
     # files are shared across nodes; n0162 hosts QEndpoint and has the RAM
-    ssh n0162 'cd /gpfs/projects/uonlp/hieum/wemg && \
+    ssh n0162 'cd /gpfs/projects/uonlp/hieum/coe && \
         uv run pytest langgraph_coe/tests/phase3/test_mcts_real_servers.py -v -s'
 
 The whole module skips cleanly when any endpoint or the corpus is unreachable.

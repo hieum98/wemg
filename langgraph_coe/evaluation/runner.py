@@ -1,6 +1,6 @@
 """Dataset evaluation runner for the ``langgraph_coe`` system.
 
-Produces the **same output** as ``wemg.evaluation.runner.DatasetEvaluator``:
+Produces the **same output** as ``coe.evaluation.runner.DatasetEvaluator``:
 
   - ``evaluation_log.jsonl`` — one JSON row per question with the identical keys
     (``question``, ``correct_answer``, ``predicted_answer``, ``full_answer``,
@@ -12,7 +12,7 @@ Produces the **same output** as ``wemg.evaluation.runner.DatasetEvaluator``:
     ``working_memory_textual.json``, ``working_memory_graph.pkl``.
 
 Resume / ``score_only`` semantics match the legacy runner. The difference is the
-generation backend: instead of a persistent ``WEMGSystem``, this driver wires the
+generation backend: instead of a persistent ``COESystem``, this driver wires the
 ``langgraph_coe`` runtime **once** (so the 99 GB FAISS index loads a single time),
 builds the configured CoT/MCTS graph once, and invokes it per question inside one
 event loop — then adapts each final graph state through
@@ -222,7 +222,7 @@ class DatasetEvaluator:
                 )
                 result.metadata["_raw_state"] = final or {}
                 return result
-            except Exception as e:  # noqa: BLE001 — captured as an error row (wemg parity)
+            except Exception as e:  # noqa: BLE001 — captured as an error row (coe parity)
                 logger.error("Error answering question %r: %s", question[:60], e)
                 return AnswerResult(
                     question=question,
@@ -655,7 +655,7 @@ class DatasetEvaluator:
 
         summary_file = output_dir / "summary.txt"
         with open(summary_file, "w") as f:
-            f.write("WEMG Evaluation Results (Short and Long Answer Versions)\n")
+            f.write("COE Evaluation Results (Short and Long Answer Versions)\n")
             f.write("=" * 50 + "\n\n")
             f.write("SHORT ANSWER METRICS:\n")
             f.write("-" * 30 + "\n")

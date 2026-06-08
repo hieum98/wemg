@@ -1,6 +1,6 @@
 """MemoryUpdateGraph (Phase 1).
 
-Port of legacy ``WorkingMemory.synchronize_memory`` (``wemg/reasoning/working_memory.py``)
+Port of legacy ``WorkingMemory.synchronize_memory`` (``coe/reasoning/working_memory.py``)
 into an explicit ``StateGraph`` with a single OpenIE extraction pass, batched
 ``triple_pruner`` (size 16) on **newly proposed edges only**, and an optional
 post-merge consolidation pass that folds newly-textualised graph triples back into

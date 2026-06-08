@@ -1,10 +1,10 @@
 """Evaluation metrics: Sub-EM, Acc (LLM-based), aggregates.
 
 The pure scoring functions (``compute_sub_em``, ``compute_aggregate_metrics*``)
-are byte-for-byte the same logic as ``wemg.evaluation.metrics`` so the numbers
+are byte-for-byte the same logic as ``coe.evaluation.metrics`` so the numbers
 and the ``metrics.json`` shape are identical. Only the Acc judge differs: it runs
 the ``langgraph_coe`` ``EVALUATOR`` role through a :class:`RoleModelRegistry`
-instead of a ``wemg`` ``LLMClient``. The rating→score mapping (``rating / 10.0``)
+instead of a ``coe`` ``LLMClient``. The rating→score mapping (``rating / 10.0``)
 is unchanged.
 """
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sub-EM (identical to wemg.evaluation.metrics.compute_sub_em)
+# Sub-EM (identical to coe.evaluation.metrics.compute_sub_em)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -67,7 +67,7 @@ async def compute_acc(
             n=1,
         )
         return float(out.rating) / 10.0
-    except Exception as e:  # noqa: BLE001 — neutral score on judge failure (wemg parity)
+    except Exception as e:  # noqa: BLE001 — neutral score on judge failure (coe parity)
         logger.error("Acc computation failed: %s", e)
         return 0.0
 
@@ -99,7 +99,7 @@ async def compute_acc_batch(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Aggregates (identical to wemg.evaluation.metrics)
+# Aggregates (identical to coe.evaluation.metrics)
 # ──────────────────────────────────────────────────────────────────────────────
 
 

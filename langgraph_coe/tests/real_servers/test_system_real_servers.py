@@ -31,7 +31,7 @@ cleanly at teardown.
 
 Run on a node with the RAM + endpoint reach (files are shared across nodes)::
 
-    ssh n0162 'cd /gpfs/projects/uonlp/hieum/wemg && \
+    ssh n0162 'cd /gpfs/projects/uonlp/hieum/coe && \
         uv run pytest langgraph_coe/tests/phase4/test_system_real_servers.py -v -s'
 
 The whole module skips cleanly when any endpoint or the corpus is unreachable.

@@ -1,13 +1,13 @@
 # langgraph_coe Evaluation
 
 Benchmark the **langgraph_coe** system (LangGraph CoT/MCTS) and emit results in the
-**exact same format** as the legacy `wemg.evaluation` so the two are directly
+**exact same format** as the legacy `coe.evaluation` so the two are directly
 comparable.
 
 ## Run
 
 ```bash
-conda activate wemg   # or use `uv run`
+conda activate coe   # or use `uv run`
 python -m langgraph_coe.evaluation.evaluate \
     dataset_name_or_path=bamboogle \
     output_path=./results/lgc_bamboogle \
@@ -44,10 +44,10 @@ Written under `output_path/`:
 ## How it differs from legacy internally
 
 - **Backend**: drives the compiled CoT/MCTS LangGraph (`langgraph_coe.system`)
-  instead of `WEMGSystem`. The runtime (FAISS index + Wikidata client) is wired
+  instead of `COESystem`. The runtime (FAISS index + Wikidata client) is wired
   **once** and the graph is invoked per question inside a single event loop —
   the index is never reloaded per question.
-- **Sub-EM / aggregates**: byte-for-byte the same logic as `wemg.evaluation.metrics`.
+- **Sub-EM / aggregates**: byte-for-byte the same logic as `coe.evaluation.metrics`.
 - **Acc judge**: the `langgraph_coe` `EVALUATOR` role (same `rating/10` mapping).
 - **`pass_at_k`**: the public `AnswerResult` envelope does not expose per-step
   pass signals, so this column is `null` (the key is kept for schema parity).

@@ -168,7 +168,7 @@ Do not raise `max_sparql_rps` on the public Wikidata SPARQL URL without a privat
 ```bash
 export WIKIDATA_CONTACT="contact/you@example.edu"   # default: contact/hieum@uoregon.edu
 # or full string:
-export WIKIDATA_USER_AGENT="WEMG/0.2.0 (langgraph_coe; contact/you@example.edu) python-httpx"
+export WIKIDATA_USER_AGENT="COE/0.2.0 (langgraph_coe; contact/you@example.edu) python-httpx"
 ```
 
 ---
@@ -384,7 +384,7 @@ Outgoing/incoming edges use `redis_normalize=lambda lst: [tuple(e) for e in lst]
 
 ## Legacy code
 
-Do not extend `wemg/retrieval/wikidata.py` (sync legacy stack). New behavior belongs in `langgraph_coe/tools/`.
+Do not extend `coe/retrieval/wikidata.py` (sync legacy stack). New behavior belongs in `langgraph_coe/tools/`.
 
 ---
 

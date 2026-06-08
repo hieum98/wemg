@@ -191,7 +191,7 @@ def _assert_reranker_discriminates(
             f"{example.case_id}: reranker returned identical scores for every document "
             f"({scores[0]:.8f}). The endpoint at {_rerank_url()!r} is reachable but not "
             "discriminating — check that Qwen3-Reranker is loaded and the SGLang chat "
-            "template (see wemg/utils/sglang-qwen3-reranker.jinja) is applied.\n"
+            "template (see coe/utils/sglang-qwen3-reranker.jinja) is applied.\n"
             f"Query: {example.query!r}\n"
             f"Ranking:\n{_format_ranking(ranked, documents)}"
         )

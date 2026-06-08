@@ -140,12 +140,12 @@ class CacheConfig(BaseModel):
 
 
 class MCTSConfig(BaseModel):
-    """Knobs for the MCTSGraph (Phase 3). Ports legacy ``wemg/reasoning/mcts.py``."""
+    """Knobs for the MCTSGraph (Phase 3). Ports legacy ``coe/reasoning/mcts.py``."""
 
     num_iterations: int = 15
     exploration_weight: float = 2.0
     max_tree_depth: int = 10
-    # Per-rollout CoTGraph depth. Lower than wemg's 5 because each rollout step
+    # Per-rollout CoTGraph depth. Lower than coe's 5 because each rollout step
     # now runs a full CoT iteration (retrieval + rerank + extractor + memory).
     max_simulation_depth: int = 3
     # Floor on iterations before any early-termination condition (high-confidence,
@@ -153,7 +153,7 @@ class MCTSConfig(BaseModel):
     # always wins as the hard cap. Honored by ``route_after_iteration``.
     min_iterations: int = 3
     # Minimum tree depth (root = 0) before expand emits a FINAL_ANSWER child from
-    # ``_gen_final``. Matches wemg ``should_explore = depth < 2`` — skip synthesis
+    # ``_gen_final``. Matches coe ``should_explore = depth < 2`` — skip synthesis
     # while memory is still shallow (legacy skipped retrieval there; we skip the
     # whole final-answer expansion call).
     final_answer_min_depth: int = 2
@@ -214,10 +214,10 @@ class CorpusConfig(BaseModel):
     embedder: EmbedderConfig = Field(default_factory=EmbedderConfig)
     # LangChain bundle (<name>.faiss + <name>.pkl) or raw HF-datasets index.
     index_path: str = (
-        "/home/hieum/uonlp/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss"
+        "/home/hieum/uonlp/coe/retriever_corpora/Qwen3-4B-Emb-index.faiss"
     )
     search_k: int = 10  # FAISS fetch depth before optional rerank / caller top_k cap
-    # HF hub id or local ``load_from_disk`` path (same field name as legacy ``wemg``).
+    # HF hub id or local ``load_from_disk`` path (same field name as legacy ``coe``).
     corpus_path: Optional[str] = "Hieuman/wiki23-processed"
     # Alias used in raw-index FAISS layout; kept in sync with ``corpus_path`` when one is set.
     corpus_dataset: Optional[str] = None

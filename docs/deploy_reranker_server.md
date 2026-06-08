@@ -19,7 +19,7 @@ candidates by relevance.
   `Qwen3-Reranker-4B`).
 - A conda env with SGLang installed (reference: env `sglang`, SGLang `0.5.9`).
 - The chat template shipped in this repo:
-  `wemg/utils/sglang-qwen3-reranker.jinja`.
+  `coe/utils/sglang-qwen3-reranker.jinja`.
 
 The template frames each (query, document) pair for `yes`/`no` scoring:
 
@@ -45,7 +45,7 @@ conda activate sglang
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-Reranker-4B \
   --served-model-name Qwen3-Reranker-4B \
-  --chat-template /gpfs/projects/uonlp/hieum/wemg/wemg/utils/sglang-qwen3-reranker.jinja \
+  --chat-template /gpfs/projects/uonlp/hieum/coe/coe/utils/sglang-qwen3-reranker.jinja \
   --trust-remote-code \
   --disable-radix-cache \
   --host 0.0.0.0 \
@@ -90,7 +90,7 @@ script — it posts curated query/document contrasts and checks that the relevan
 passage ranks #1 with separable scores:
 
 ```bash
-conda activate wemg
+conda activate coe
 
 python langgraph_coe/scripts/probe_reranker_server.py \
   --url http://n0997:30000/v1 \

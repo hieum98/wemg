@@ -1,0 +1,1837 @@
+"""Consolidated Wikidata module for entity/property retrieval, SPARQL queries,
+k-hop triple traversal, and path finding."""
+
+import asyncio
+import html
+import json
+import logging
+import os
+import random
+import re
+import threading
+import time
+from collections import defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
+from urllib.error import HTTPError
+from urllib.parse import unquote
+
+from datasets import disable_progress_bars
+import pydantic
+import requests
+from SPARQLWrapper import SPARQLWrapper, JSON, POST
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
+WIKIPEDIA_API_BATCH_SIZE = 50
+WIKIPEDIA_API_TIMEOUT_SECONDS = 20
+
+# Rate limit for Wikipedia page fetches (same default as web crawl to avoid destination rate limits).
+DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND = 10
+_wiki_rate_lock = threading.Lock()
+_wiki_last_request_time: List[float] = [0.0]
+WIKIPEDIA_DUMP_DATASET = "Hieuman/wiki23-processed"
+disable_progress_bars()
+
+def _wikipedia_rate_limit(max_requests_per_second: float) -> None:
+    """Wait if needed so the next Wikipedia request does not exceed the given rate."""
+    with _wiki_rate_lock:
+        now = time.monotonic()
+        min_interval = 1.0 / max(0.1, min(10.0, max_requests_per_second))
+        elapsed = now - _wiki_last_request_time[0]
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        _wiki_last_request_time[0] = time.monotonic()
+
+
+# Rate limit for Wikidata SPARQL queries. Wikidata enforces ~2 RPS per client.
+DEFAULT_MAX_SPARQL_REQUESTS_PER_SECOND = 2.0
+_sparql_rate_lock = threading.Lock()
+_sparql_last_request_time: List[float] = [0.0]
+
+def _sparql_rate_limit(max_requests_per_second: float) -> None:
+    """Wait if needed so the next SPARQL request does not exceed the given rate."""
+    with _sparql_rate_lock:
+        now = time.monotonic()
+        min_interval = 1.0 / max(0.1, min(20.0, max_requests_per_second))
+        elapsed = now - _sparql_last_request_time[0]
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        _sparql_last_request_time[0] = time.monotonic()
+
+
+def _sparql_retry_sleep_seconds(exc: BaseException, attempt: int) -> float:
+    """Backoff before retrying WDQS.
+
+    During WDQS instability Wikimedia returns HTTP 429 with rules such as
+    \"Aggressively rate-limiting to 1 req / min\" (per-IP or per-fingerprint).
+    Retrying after only a few seconds keeps you over quota; honor Retry-After
+    or wait at least ~one minute when that policy is indicated.
+    """
+    jitter = random.uniform(0, 2)
+    generic = RETRY_BASE_DELAY * (2 ** attempt) + jitter
+
+    if isinstance(exc, HTTPError) and exc.code == 429:
+        hdrs = exc.headers
+        if hdrs:
+            ra = hdrs.get("Retry-After")
+            if ra is not None:
+                try:
+                    return float(ra) + random.uniform(0, 1)
+                except ValueError:
+                    pass
+        hint = (getattr(exc, "reason", None) or str(exc) or "").lower()
+        if "1 req" in hint and "min" in hint:
+            return 60.0 + jitter
+        return max(generic, 30.0 + jitter)
+
+    retry_after = getattr(exc, "headers", None)
+    if retry_after is not None:
+        ra = retry_after.get("Retry-After") if hasattr(retry_after, "get") else None
+        if ra is not None:
+            try:
+                return float(ra) + random.uniform(0, 1)
+            except (TypeError, ValueError):
+                pass
+
+    return generic
+
+
+# ---------------------------------------------------------------------------
+# Data Models
+# ---------------------------------------------------------------------------
+
+
+class WikidataEntity(pydantic.BaseModel):
+    qid: str
+    label: Optional[str] = None
+    description: Optional[str] = None
+    aliases: List[str] = pydantic.Field(default_factory=list)
+    url: Optional[str] = None
+    wikipedia_url: Optional[str] = None
+    wikipedia_content: Optional[str] = None
+
+    def __hash__(self):
+        return hash(self.qid)
+
+    def __eq__(self, other):
+        if not isinstance(other, WikidataEntity):
+            return False
+        return self.qid == other.qid
+
+    def __str__(self):
+        parts = [self.label or self.qid]
+        if self.description:
+            parts.append(f"({self.description})")
+        return " ".join(parts)
+
+    def to_context(self, include_wiki_page: bool = False) -> str:
+        parts = [f"{self.label or self.qid}"]
+        if self.description:
+            parts.append(f"Description: {self.description}")
+        if self.aliases:
+            parts.append(f"Also known as: {', '.join(self.aliases)}")
+        if include_wiki_page and self.wikipedia_content:
+            parts.append(f"Wikipedia: {self.wikipedia_content[:500]}")
+        return "\n".join(parts)
+
+
+def _surface_form_matches_text(text: str, surface: str) -> bool:
+    """Return True if *surface* (label or alias) is plausibly mentioned in *text*."""
+    s = surface.strip()
+    if len(s) < 2:
+        return False
+    if " " in s:
+        return s.lower() in text.lower()
+    # Single-token forms: word-boundary match so short strings do not match inside longer words.
+    pat = r"(?<!\w)" + re.escape(s) + r"(?!\w)"
+    return re.search(pat, text, re.IGNORECASE) is not None
+
+
+def entity_surface_mentioned_in_text(entity: WikidataEntity, text: str) -> bool:
+    """True if *entity*'s label or any alias matches *text* (case-insensitive)."""
+    text = text.lower()
+    if not text or not str(text).strip():
+        return False
+    surfaces: List[str] = []
+    if entity.label:
+        surfaces.append(entity.label.lower())
+    surfaces.extend(a.lower() for a in (entity.aliases or []) if a)
+    return any(_surface_form_matches_text(text, surf) for surf in surfaces)
+
+
+def filter_entities_relevant_to_text(
+    entities: Optional[List[WikidataEntity]],
+    text: Optional[str],
+) -> Optional[List[WikidataEntity]]:
+    """Restrict *entities* to those whose label or alias appears in *text*.
+
+    Used to bound ``known_entities`` in NER / relation-extraction prompts without
+    truncating descriptions. Returns ``None`` if there is nothing to pass.
+    """
+    if not entities:
+        return None
+    if not text or not str(text).strip():
+        return None
+    out = [e for e in entities if isinstance(e, WikidataEntity) and entity_surface_mentioned_in_text(e, text)]
+    return out or None
+
+
+class WikidataProperty(pydantic.BaseModel):
+    pid: str
+    label: Optional[str] = None
+    description: Optional[str] = None
+
+    def __hash__(self):
+        return hash(self.pid)
+
+    def __eq__(self, other):
+        if not isinstance(other, WikidataProperty):
+            return False
+        return self.pid == other.pid
+
+    def __str__(self):
+        if self.label and self.label.strip():
+            return self.label
+        if self.description and self.description.strip():
+            return self.description
+        return self.pid
+
+
+class WikiTriple(pydantic.BaseModel):
+    subject: Any
+    relation: Any
+    object: Any
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _reconstruct_nested(cls, data: Any) -> Any:
+        """Reconstruct WikidataEntity/WikidataProperty from dicts (e.g. after Redis deserialization)."""
+        if not isinstance(data, dict):
+            return data
+        subj = data.get("subject")
+        rel = data.get("relation")
+        obj = data.get("object")
+        if isinstance(subj, dict):
+            data["subject"] = WikidataEntity.model_validate(subj)
+        if isinstance(rel, dict):
+            data["relation"] = WikidataProperty.model_validate(rel)
+        if isinstance(obj, dict):
+            try:
+                data["object"] = WikidataEntity.model_validate(obj)
+            except Exception:
+                logger.warning("Could not reconstruct WikiTriple object as WikidataEntity; preserving literal payload.")
+        return data
+
+    def __hash__(self):
+        s = self.subject.qid if hasattr(self.subject, "qid") else str(self.subject)
+        r = self.relation.pid if hasattr(self.relation, "pid") else str(self.relation)
+        o = self.object.qid if hasattr(self.object, "qid") else str(self.object)
+        return hash((s, r, o))
+
+    def __eq__(self, other):
+        if not isinstance(other, WikiTriple):
+            return False
+        return hash(self) == hash(other)
+
+    def __str__(self):
+        return f"Subject: {self.subject} - Relation: {self.relation} - Object: {self.object}"
+
+
+class WikidataPathBetweenEntities(pydantic.BaseModel):
+    source: WikidataEntity
+    target: WikidataEntity
+    path: List[WikiTriple] = pydantic.Field(default_factory=list)
+    path_length: int = 0
+
+    def __str__(self):
+        if not self.path:
+            return f"No path found between {self.source} and {self.target}."
+        triples_str = "\n---\n".join(
+            f"{i + 1}.\n{t}" for i, t in enumerate(self.path)
+        )
+        return f"Path from {self.source} to {self.target}:\n{triples_str}"
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+WIKIDATA_SPARQL_ENDPOINT = "http://n0162:1234/api/endpoint/sparql"
+# Wikibase REST item search (v1). wikibase-rest-api-client's search_item still targets removed v0 / wrong rewrite.
+WIKIDATA_REST_SEARCH_ITEMS_URL = "https://www.wikidata.org/w/rest.php/wikibase/v1/search/items"
+REST_SEARCH_TIMEOUT_S = 60
+random_str = lambda n: "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=5)) # for user agent uniqueness to help with Wikidata rate limits (this is just a best effort and does not guarantee avoiding rate limits, but can help a bit by making it less likely to be identified as a single client across multiple runs)
+USER_AGENT = f"COE/0.2.0.{os.uname().nodename}.{random_str(10)}"
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2
+LIMIT_PER_QUERY = 100
+MAX_ENTITIES_PER_HOP = 500
+SPARQL_TIMEOUT_S = 120
+# Cap total SPARQL rows for batched k-hop queries (scales with number of seeds).
+MAX_BATCH_SPARQL_ROWS = 10000
+BATCH_SIZE = 25
+
+DEFAULT_PROPERTIES = [
+    "P31", "P279", "P27", "P361", "P527", "P495", "P17", "P585", "P106",
+    "P569", "P570", "P577", "P50", "P571", "P641", "P625", "P19", "P69",
+    "P108", "P136", "P39", "P161", "P20", "P101", "P179", "P175", "P7937",
+    "P57", "P607", "P509", "P800", "P449", "P580", "P582", "P276", "P112",
+    "P740", "P159", "P452", "P102", "P1142", "P1387", "P1576", "P140",
+    "P178", "P287", "P25", "P22", "P40", "P185", "P802", "P1416", "P26",
+    "P3373", "P451", "P1038", "P184", "P166", "P512", "P463", "P127",
+    "P749", "P355", "P488", "P169", "P131", "P706", "P150", "P36", "P30",
+    "P6", "P35", "P1313", "P54", "P1344", "P1532", "P170", "P86", "P162",
+    "P58", "P144", "P921", "P407", "P264", "P1411", "P1082", "P2044",
+    "P2046",
+]
+
+PROPERTY_LABELS: Dict[str, Dict[str, str]] = {
+    "P6": {"label": "head of government", "description": "head of the executive power of this governmental body"},
+    "P17": {"label": "country", "description": "sovereign state that this item is in"},
+    "P19": {"label": "place of birth", "description": "most specific known birth location of a person"},
+    "P20": {"label": "place of death", "description": "most specific known death location of a person"},
+    "P22": {"label": "father", "description": "male parent of the subject"},
+    "P25": {"label": "mother", "description": "female parent of the subject"},
+    "P26": {"label": "spouse", "description": "the subject has the object as their spouse"},
+    "P27": {"label": "country of citizenship", "description": "the object is a country that recognizes the subject as its citizen"},
+    "P30": {"label": "continent", "description": "continent of which the subject is a part"},
+    "P31": {"label": "instance of", "description": "that class of which this subject is a particular example and member"},
+    "P35": {"label": "head of state", "description": "official with the highest formal authority in a country/state"},
+    "P36": {"label": "capital", "description": "seat of government of a country, province, state or other administrative territorial entity"},
+    "P39": {"label": "position held", "description": "subject currently or formerly holds the object position or public office"},
+    "P40": {"label": "child", "description": "subject has object as child"},
+    "P50": {"label": "author", "description": "main creator(s) of a written work"},
+    "P54": {"label": "member of sports team", "description": "sports teams or clubs that the subject represents"},
+    "P57": {"label": "director", "description": "director(s) of film, TV-series, stageplay, video game or similar"},
+    "P58": {"label": "screenwriter", "description": "person(s) who wrote the script for subject item"},
+    "P69": {"label": "educated at", "description": "educational institution attended by subject"},
+    "P86": {"label": "composer", "description": "person(s) who wrote the music"},
+    "P101": {"label": "field of work", "description": "specialization of a person or organization"},
+    "P102": {"label": "member of political party", "description": "the political party of which a person is or has been a member"},
+    "P106": {"label": "occupation", "description": "occupation of a person"},
+    "P108": {"label": "employer", "description": "person or organization for which the subject works or worked"},
+    "P112": {"label": "founded by", "description": "founder or co-founder of this organization, religion, place or entity"},
+    "P127": {"label": "owned by", "description": "owner of the subject"},
+    "P131": {"label": "located in the administrative territorial entity", "description": "the item is located on the territory of the following administrative entity"},
+    "P136": {"label": "genre", "description": "creative work's genre or an artist's field of work"},
+    "P140": {"label": "religion or worldview", "description": "religion of a person, organization or religious building"},
+    "P144": {"label": "based on", "description": "the work(s) used as the basis for subject item"},
+    "P150": {"label": "contains the administrative territorial entity", "description": "direct subdivisions of an administrative territorial entity"},
+    "P159": {"label": "headquarters location", "description": "city or town where an organization's headquarters is situated"},
+    "P161": {"label": "cast member", "description": "actor in the subject production"},
+    "P162": {"label": "producer", "description": "person(s) who produced the film, musical work, theatrical production, etc."},
+    "P166": {"label": "award received", "description": "award or recognition received by a person, organization or creative work"},
+    "P169": {"label": "chief executive officer", "description": "highest-ranking corporate officer appointed as the CEO"},
+    "P170": {"label": "creator", "description": "maker of this creative work or other object"},
+    "P175": {"label": "performer", "description": "actor, musician, band or other performer associated with this work"},
+    "P178": {"label": "developer", "description": "organization or person that developed the item"},
+    "P179": {"label": "part of the series", "description": "series which contains the subject"},
+    "P184": {"label": "doctoral advisor", "description": "person who supervised the doctorate or PhD thesis"},
+    "P185": {"label": "doctoral student", "description": "doctoral student(s) of a professor"},
+    "P264": {"label": "record label", "description": "brand and trademark for marketing of music recordings"},
+    "P276": {"label": "location", "description": "location of the object, structure or event"},
+    "P279": {"label": "subclass of", "description": "this subject is a subclass of that class"},
+    "P287": {"label": "designed by", "description": "person or organization which designed the object"},
+    "P355": {"label": "has subsidiary", "description": "child organization/unit of an organization/unit"},
+    "P361": {"label": "part of", "description": "object of which the subject is a part"},
+    "P407": {"label": "language of work or name", "description": "language associated with this creative work or a name"},
+    "P449": {"label": "original broadcaster", "description": "network(s) that originally broadcast a radio or television program"},
+    "P451": {"label": "unmarried partner", "description": "someone with whom the person is in a relationship without being married"},
+    "P452": {"label": "industry", "description": "specific industry of company or organization"},
+    "P463": {"label": "member of", "description": "organization, club or musical group to which the subject belongs"},
+    "P488": {"label": "chairperson", "description": "presiding member of an organization, group or body"},
+    "P495": {"label": "country of origin", "description": "country of origin of this item"},
+    "P509": {"label": "cause of death", "description": "underlying or immediate cause of death"},
+    "P512": {"label": "academic degree", "description": "academic degree that the person holds"},
+    "P527": {"label": "has part(s)", "description": "part of this subject; inverse of 'part of' (P361)"},
+    "P569": {"label": "date of birth", "description": "date on which the subject was born"},
+    "P570": {"label": "date of death", "description": "date on which the subject died"},
+    "P571": {"label": "inception", "description": "time when an entity begins to exist"},
+    "P577": {"label": "publication date", "description": "date or point in time when a work was first published or released"},
+    "P580": {"label": "start time", "description": "time an entity begins to exist or a statement starts being valid"},
+    "P582": {"label": "end time", "description": "moment when an entity ceases to exist or a statement stops being valid"},
+    "P585": {"label": "point in time", "description": "date something took place, existed or a statement was true"},
+    "P607": {"label": "participated in conflict", "description": "battles, wars or other military engagements in which the subject participated"},
+    "P625": {"label": "coordinate location", "description": "geocoordinates of the subject"},
+    "P641": {"label": "sport", "description": "sport that the subject participates in or is associated with"},
+    "P706": {"label": "located in/on physical feature", "description": "located on the specified geophysical feature"},
+    "P740": {"label": "location of formation", "description": "location where a group or organization was formed"},
+    "P749": {"label": "parent organization", "description": "parent organization or unit of an organization"},
+    "P800": {"label": "notable work", "description": "notable scientific, artistic or literary work of the subject"},
+    "P802": {"label": "student", "description": "notable student(s) of the subject individual"},
+    "P921": {"label": "main subject", "description": "primary topic of a work or act of communication"},
+    "P1038": {"label": "relative", "description": "family member (qualify with kinship to subject P1039)"},
+    "P1082": {"label": "population", "description": "number of people inhabiting the place"},
+    "P1142": {"label": "political ideology", "description": "political ideology of an organization or person"},
+    "P1313": {"label": "office held by head of government", "description": "political office fulfilled by the head of government"},
+    "P1344": {"label": "participant in", "description": "event in which a person or organization was a participant"},
+    "P1387": {"label": "political alignment", "description": "political position within the left-right political spectrum"},
+    "P1411": {"label": "nominated for", "description": "award nomination received by a person, organization or creative work"},
+    "P1416": {"label": "affiliation", "description": "organization that a person is affiliated with"},
+    "P1532": {"label": "country for sport", "description": "country a person or team represents when playing a sport"},
+    "P1576": {"label": "lifestyle", "description": "typical way of life of an individual, group, or culture"},
+    "P2044": {"label": "elevation above sea level", "description": "height of the item above a fixed reference point"},
+    "P2046": {"label": "area", "description": "area of an entity"},
+    "P3373": {"label": "sibling", "description": "the subject and the object have at least one common parent"},
+    "P7937": {"label": "form of creative work", "description": "structure of a creative work"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_qid(qid: str) -> Optional[str]:
+    if not qid or not isinstance(qid, str):
+        return None
+    normalized = qid.strip().upper()
+    if re.fullmatch(r"Q\d+", normalized):
+        return normalized
+    return None
+
+
+def _normalize_pid(pid: str) -> Optional[str]:
+    if not pid or not isinstance(pid, str):
+        return None
+    normalized = pid.strip().upper()
+    if re.fullmatch(r"P\d+", normalized):
+        return normalized
+    return None
+
+
+def _extract_id_from_uri(uri: str) -> Optional[str]:
+    if not isinstance(uri, str) or not uri:
+        return None
+    if "/entity/" in uri:
+        candidate = uri.rsplit("/", 1)[-1]
+    else:
+        candidate = uri
+    candidate = candidate.strip()
+    if re.fullmatch(r"[QP]\d+", candidate, flags=re.IGNORECASE):
+        return candidate.upper()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WikidataClient
+# ---------------------------------------------------------------------------
+
+
+class WikidataClient:
+    """Unified Wikidata access client combining SPARQL queries, entity/property
+    retrieval, k-hop triples, and path finding."""
+
+    def __init__(
+        self,
+        properties: Optional[List[str]] = None,
+        property_labels: Optional[Dict[str, Dict[str, str]]] = None,
+        max_wikipedia_requests_per_second: Optional[float] = None,
+        max_sparql_requests_per_second: Optional[float] = None,
+        triple_cache_max_entries: int = 5000,
+        redis_client=None,
+    ):
+        self.properties = properties or list(DEFAULT_PROPERTIES)
+        self.property_labels = dict(property_labels or PROPERTY_LABELS)
+        self._max_wikipedia_rps = (
+            max_wikipedia_requests_per_second
+            if max_wikipedia_requests_per_second is not None
+            else DEFAULT_MAX_WIKIPEDIA_REQUESTS_PER_SECOND
+        )
+        self._max_sparql_rps = (
+            max_sparql_requests_per_second
+            if max_sparql_requests_per_second is not None
+            else DEFAULT_MAX_SPARQL_REQUESTS_PER_SECOND
+        )
+        self._triple_cache_max_entries = max(1, int(triple_cache_max_entries))
+        self._redis = redis_client
+        self._redis_prefix = "coe:triples"
+        self._redis_ttl = 86400  # 24h
+        self._semaphore = threading.Semaphore(10)
+        self._cache_lock = threading.Lock()
+        # Raw 1-hop triples per QID (pre-enrichment); shared across k-hop and find_path.
+        self._outgoing_triples_cache: "OrderedDict[str, List[WikiTriple]]" = OrderedDict()
+        self._bidirectional_triples_cache: "OrderedDict[str, List[WikiTriple]]" = OrderedDict()
+        self._wikipedia_dump_dataset, self._wikidump_url_index = self._load_wikipedia_dump_dataset()
+        # Cache canonical_url -> content to avoid re-scanning for the same URLs across MCTS iterations.
+        self._wikidump_content_cache: Dict[str, Optional[str]] = {}
+
+    def _lru_get(
+        self,
+        cache: "OrderedDict[str, List[WikiTriple]]",
+        key: str,
+    ) -> Optional[List[WikiTriple]]:
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+            return value
+        if self._redis:
+            try:
+                raw = self._redis.get(f"{self._redis_prefix}:{key}")
+                if raw:
+                    triples = [WikiTriple.model_validate(t) for t in json.loads(raw)]
+                    self._lru_set(cache, key, triples)
+                    return triples
+            except Exception as e:
+                logger.warning("Redis cache read failed for %s; falling back to in-memory cache: %s", key, e)
+        return None
+
+    def _lru_set(
+        self,
+        cache: "OrderedDict[str, List[WikiTriple]]",
+        key: str,
+        value: List[WikiTriple],
+    ) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self._triple_cache_max_entries:
+            cache.popitem(last=False)
+        if self._redis:
+            try:
+                raw = json.dumps([t.model_dump() for t in value])
+                self._redis.setex(f"{self._redis_prefix}:{key}", self._redis_ttl, raw)
+            except Exception as e:
+                logger.warning("Redis cache write failed for %s; keeping in-memory cache only: %s", key, e)
+
+    def clear_triple_caches(self) -> None:
+        """Clear in-process Wikidata triple caches."""
+        with self._cache_lock:
+            self._outgoing_triples_cache.clear()
+            self._bidirectional_triples_cache.clear()
+
+    # ------------------------------------------------------------------
+    # SPARQL execution
+    # ------------------------------------------------------------------
+
+    def _sparql_query(self, sparql: str) -> List[Dict]:
+        with self._semaphore:
+            # SPARQLWrapper defaults to GET; WDQS matches draft.ipynb/W3C examples better via URL-encoded POST.
+            # Pass agent= to avoid stacking User-Agent with the library default on urllib.Request.
+            client = SPARQLWrapper(
+                WIKIDATA_SPARQL_ENDPOINT,
+                returnFormat=JSON,
+                agent=USER_AGENT,
+            )
+            client.setMethod(POST)
+            client.setTimeout(SPARQL_TIMEOUT_S)
+            client.setQuery(sparql)
+            for attempt in range(MAX_RETRIES):
+                _sparql_rate_limit(self._max_sparql_rps)
+                try:
+                    results = client.query().convert()
+                    return results.get("results", {}).get("bindings", [])
+                except Exception as e:
+                    if attempt == MAX_RETRIES - 1:
+                        logger.error(f"SPARQL query failed after {MAX_RETRIES} attempts: {e}")
+                        return []
+                    sleep_s = _sparql_retry_sleep_seconds(e, attempt)
+                    if isinstance(e, HTTPError) and e.code == 429:
+                        logger.warning(
+                            "WDQS returned 429; sleeping %.1fs then retry %d/%d (%s)",
+                            sleep_s,
+                            attempt + 2,
+                            MAX_RETRIES,
+                            getattr(e, "reason", None) or e,
+                        )
+                    else:
+                        logger.debug("SPARQL query attempt failed: %s; retry in %.1fs", e, sleep_s)
+                    time.sleep(sleep_s)
+        return []
+
+    # ------------------------------------------------------------------
+    # Property helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_property_text(
+        pid: str,
+        label: Optional[str],
+        description: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Normalize Wikidata property label/description.
+
+        - Strip whitespace.
+        - Treat PID-like labels (e.g. "P36") as missing.
+        - If label is missing but description is present, reuse description
+          as a human-facing label.
+        """
+        label = label.strip() if isinstance(label, str) else None
+        description = description.strip() if isinstance(description, str) else None
+
+        if label and re.fullmatch(r"P\d+", label.upper()):
+            label = None
+
+        if not label and description:
+            label = description
+
+        return (label or None), (description or None)
+
+    def _get_property_label(self, pid: str) -> Tuple[Optional[str], Optional[str]]:
+        info = self.property_labels.get(pid, {})
+        label, desc = self._normalize_property_text(
+            pid,
+            info.get("label"),
+            info.get("description"),
+        )
+        return label, desc
+
+    def _is_entity_enriched(self, entity: WikidataEntity) -> bool:
+        if not entity or not entity.label:
+            return False
+        label = entity.label.strip()
+        if not label or (label.startswith("Q") and label[1:].isdigit()):
+            return False
+        return bool(entity.description and entity.description.strip())
+
+    def _is_property_enriched(self, prop: WikidataProperty) -> bool:
+        if not prop or not prop.label:
+            return False
+        label = prop.label.strip()
+        return bool(label and not (label.startswith("P") and label[1:].isdigit()))
+
+    def _fetch_wikipedia_contents_concurrent(
+        self,
+        entities: List[WikidataEntity],
+        *,
+        max_workers: Optional[int] = None,
+    ) -> None:
+        """Fetch Wikipedia page contents concurrently for entities.
+
+        Uses the global `_wikipedia_rate_limit` gate to respect the configured
+        max RPS while allowing network I/O to overlap across requests.
+        """
+        if not entities:
+            return
+
+        # Only fetch missing content, and de-duplicate by URL/title.
+        by_url: Dict[str, List[WikidataEntity]] = {}
+        for e in entities:
+            if not e or not e.wikipedia_url or e.wikipedia_content:
+                continue
+            by_url.setdefault(e.wikipedia_url, []).append(e)
+
+        if not by_url:
+            return
+        # Prefer URL-matched content from the local/wiki dump before web requests.
+        dump_matches = self._lookup_wikipedia_dump_contents(set(by_url.keys()))
+        for url, content in dump_matches.items():
+            if not content:
+                continue
+            for e in by_url.get(url, []):
+                e.wikipedia_content = content
+            by_url.pop(url, None)
+        if not by_url:
+            return
+
+        # Pick a conservative default concurrency that still overlaps latency.
+        if max_workers is None:
+            max_workers = min(16, max(4, int(self._max_wikipedia_rps or 1)))
+
+        session_local = threading.local()
+
+        canonical_to_raw: Dict[str, List[str]] = defaultdict(list)
+        title_to_canonical: Dict[str, str] = {}
+        for raw_url in by_url:
+            canonical_url = self._canonicalize_wikipedia_url(raw_url)
+            if not canonical_url:
+                continue
+            title = self._extract_wikipedia_title(canonical_url)
+            if not title:
+                continue
+            canonical_to_raw[canonical_url].append(raw_url)
+            title_to_canonical[title] = canonical_url
+
+        if not title_to_canonical:
+            return
+
+        def _get_session() -> requests.Session:
+            session = getattr(session_local, "session", None)
+            if session is None:
+                session = requests.Session()
+                session.headers.update(
+                    {
+                        "User-Agent": (
+                            "coe/1.0 (batched Wikipedia content fetch; "
+                            "https://en.wikipedia.org/)"
+                        ),
+                    }
+                )
+                setattr(session_local, "session", session)
+            return session
+
+        def _fetch_batch(titles: List[str]) -> Dict[str, Optional[str]]:
+            try:
+                _wikipedia_rate_limit(self._max_wikipedia_rps)
+                response = _get_session().get(
+                    WIKIPEDIA_API_URL,
+                    params={
+                        "action": "query",
+                        "prop": "revisions",
+                        "titles": "|".join(titles),
+                        "redirects": 1,
+                        "rvprop": "content",
+                        "rvslots": "main",
+                        "format": "json",
+                        "formatversion": 2,
+                    },
+                    timeout=WIKIPEDIA_API_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                return self._parse_wikipedia_revisions_response(
+                    requested_titles=titles,
+                    payload=response.json(),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch Wikipedia content batch for %s: %s",
+                    titles,
+                    e,
+                )
+                return {title: None for title in titles}
+
+        titles_to_fetch = list(title_to_canonical.keys())
+        title_batches = [
+            titles_to_fetch[i:i + WIKIPEDIA_API_BATCH_SIZE]
+            for i in range(0, len(titles_to_fetch), WIKIPEDIA_API_BATCH_SIZE)
+        ]
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_fetch_batch, batch) for batch in title_batches]
+            for fut in as_completed(futures):
+                for title, content in fut.result().items():
+                    if not content:
+                        continue
+                    canonical_url = title_to_canonical.get(title)
+                    if not canonical_url:
+                        continue
+                    for raw_url in canonical_to_raw.get(canonical_url, []):
+                        for e in by_url.get(raw_url, []):
+                            e.wikipedia_content = content
+
+    @staticmethod
+    def _canonicalize_wikipedia_url(url: str) -> Optional[str]:
+        if not isinstance(url, str):
+            return None
+        value = url.strip()
+        if not value:
+            return None
+        if "/wiki/" not in value:
+            return None
+        title = value.split("/wiki/", 1)[-1].split("#", 1)[0].split("?", 1)[0]
+        title = unquote(title).strip().replace(" ", "_")
+        if not title:
+            return None
+        return f"https://en.wikipedia.org/wiki/{title}"
+
+    @staticmethod
+    def _extract_wikipedia_title(url: str) -> Optional[str]:
+        canonical = WikidataClient._canonicalize_wikipedia_url(url)
+        if not canonical:
+            return None
+        return canonical.split("/wiki/", 1)[-1]
+
+    @staticmethod
+    def _normalize_wikipedia_title(title: Optional[str]) -> Optional[str]:
+        if not isinstance(title, str):
+            return None
+        value = unquote(title).strip().replace(" ", "_")
+        return value or None
+
+    @classmethod
+    def _parse_wikipedia_revisions_response(
+        cls,
+        *,
+        requested_titles: List[str],
+        payload: Dict[str, Any],
+    ) -> Dict[str, Optional[str]]:
+        query = payload.get("query") or {}
+
+        normalized_rows = query.get("normalized") or []
+        redirect_rows = query.get("redirects") or []
+        page_rows = query.get("pages") or []
+
+        normalized_map = {
+            cls._normalize_wikipedia_title(row.get("from")): cls._normalize_wikipedia_title(row.get("to"))
+            for row in normalized_rows
+            if cls._normalize_wikipedia_title(row.get("from"))
+            and cls._normalize_wikipedia_title(row.get("to"))
+        }
+        redirect_map = {
+            cls._normalize_wikipedia_title(row.get("from")): cls._normalize_wikipedia_title(row.get("to"))
+            for row in redirect_rows
+            if cls._normalize_wikipedia_title(row.get("from"))
+            and cls._normalize_wikipedia_title(row.get("to"))
+        }
+        page_texts: Dict[str, Optional[str]] = {}
+        for page in page_rows:
+            normalized_title = cls._normalize_wikipedia_title(page.get("title"))
+            if not normalized_title or page.get("missing"):
+                continue
+            revisions = page.get("revisions") or []
+            slots = (revisions[0].get("slots") or {}) if revisions else {}
+            main_slot = slots.get("main") or {}
+            raw_content = (
+                main_slot.get("content")
+                or main_slot.get("*")
+                or (revisions[0].get("*") if revisions else None)
+            )
+            page_texts[normalized_title] = cls._clean_wikipedia_wikitext(raw_content)
+
+        results: Dict[str, Optional[str]] = {}
+        for requested in requested_titles:
+            normalized = cls._normalize_wikipedia_title(requested)
+            if not normalized:
+                continue
+            resolved = redirect_map.get(normalized_map.get(normalized, normalized), normalized_map.get(normalized, normalized))
+            results[requested] = page_texts.get(resolved)
+        return results
+
+    @staticmethod
+    def _clean_wikipedia_wikitext(text: Optional[str]) -> Optional[str]:
+        if not isinstance(text, str):
+            return None
+
+        cleaned = text
+        cleaned = re.sub(r"<!--.*?-->", "", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"<ref[^>/]*?>.*?</ref>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<ref[^>]*/>", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\{\|.*?\|\}", "", cleaned, flags=re.DOTALL)
+
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            cleaned = re.sub(r"\{\{[^{}]*\}\}", "", cleaned, flags=re.DOTALL)
+
+        cleaned = re.sub(r"\[\[(?:File|Image|Category):[^\]]+\]\]", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\[https?://[^\s\]]+\s+([^\]]+)\]", r"\1", cleaned)
+        cleaned = re.sub(r"\[https?://[^\]]+\]", "", cleaned)
+        cleaned = re.sub(r"\[\[[^\]|]+\|([^\]]+)\]\]", r"\1", cleaned)
+        cleaned = re.sub(r"\[\[([^\]|]+)\]\]", lambda m: m.group(1).split("#", 1)[0], cleaned)
+        cleaned = re.sub(r"={2,}\s*(.*?)\s*={2,}", r"\n\1\n", cleaned)
+        cleaned = re.sub(r"'{2,}", "", cleaned)
+        cleaned = re.sub(r"<[^>]+>", "", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = cleaned.replace("&nbsp;", " ")
+        cleaned = re.sub(r"^[|!].*$", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"\n[ \t]*\n+", "\n\n", cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r" ?\n ?", "\n", cleaned)
+        cleaned = cleaned.strip()
+        return cleaned or None
+
+    @staticmethod
+    def _load_wikipedia_dump_dataset():
+        try:
+            from datasets import load_dataset
+            ds = load_dataset(WIKIPEDIA_DUMP_DATASET, split="train")
+
+            # Precompute canonical URL once so per-call lookups can filter cheaply.
+            if "url" in getattr(ds, "column_names", []) and "_canonical_url" not in ds.column_names:
+                def _add_canonical(batch: Dict[str, Any]) -> Dict[str, Any]:
+                    urls = batch.get("url") or []
+                    canon = [WikidataClient._canonicalize_wikipedia_url(u) for u in urls]
+                    return {"_canonical_url": canon}
+
+                ds = ds.map(
+                    _add_canonical,
+                    batched=True,
+                    batch_size=10_000,
+                    num_proc=max(1, os.cpu_count() or 1),
+                    desc="Precompute Wikipedia canonical URLs",
+                )
+
+            # Build canonical_url -> [row_indices] for O(1) lookups.
+            # A page's content may be split across multiple rows, so we collect all indices.
+            url_index: Dict[str, List[int]] = {}
+            if "_canonical_url" in getattr(ds, "column_names", []):
+                logger.info("Building Wikipedia dump URL index (%d rows)...", len(ds))
+                url_series = ds.data.select(["_canonical_url"]).to_pandas()["_canonical_url"]
+                mask = url_series.notna()
+                for idx, url in zip(url_series[mask].index.tolist(), url_series[mask].values.tolist()):
+                    url_index.setdefault(url, []).append(idx)
+                logger.info("Wikipedia dump URL index built: %d unique URLs", len(url_index))
+
+            return ds, url_index
+        except Exception as e:
+            logger.debug(f"Failed to load Wikipedia dump dataset ({WIKIPEDIA_DUMP_DATASET}): {e}")
+            return None, {}
+
+    def _lookup_wikipedia_dump_contents(self, urls: Set[str]) -> Dict[str, Optional[str]]:
+        if not urls:
+            return {}
+
+        canonical_to_raw: Dict[str, List[str]] = {}
+        for raw in urls:
+            canonical = self._canonicalize_wikipedia_url(raw)
+            if canonical:
+                canonical_to_raw.setdefault(canonical, []).append(raw)
+
+        if not canonical_to_raw:
+            return {}
+
+        result: Dict[str, Optional[str]] = {}
+        if self._wikipedia_dump_dataset is None:
+            for raw_urls in canonical_to_raw.values():
+                for raw in raw_urls:
+                    result[raw] = None
+            return result
+
+        try:
+            target_canonicals = set(canonical_to_raw.keys())
+            ds = self._wikipedia_dump_dataset
+            # Serve cached results; collect only URLs missing from cache.
+            uncached = target_canonicals - self._wikidump_content_cache.keys()
+
+            if uncached:
+                # Use pre-built index for O(1) row selection — no full scan needed.
+                indices: List[int] = [
+                    idx
+                    for c in uncached
+                    if c in self._wikidump_url_index
+                    for idx in self._wikidump_url_index[c]
+                ]
+
+                aggregated: Dict[str, List[str]] = defaultdict(list)
+                if indices:
+                    selected = ds.select(indices)
+                    for row in selected:
+                        canonical_row_url = row.get("_canonical_url") or self._canonicalize_wikipedia_url(
+                            row.get("url")
+                            or row.get("source")
+                            or row.get("wikipedia_url")
+                            or row.get("wiki_url")
+                        )
+                        if not canonical_row_url or canonical_row_url not in uncached:
+                            continue
+                        content = (
+                            row.get("contents")
+                            or row.get("content")
+                            or row.get("text")
+                            or row.get("article")
+                        )
+                        if isinstance(content, str):
+                            text = content.strip()
+                            if text:
+                                aggregated[canonical_row_url].append(text)
+
+                for canonical in uncached:
+                    joined = "\n\n".join(aggregated.get(canonical, [])) or None
+                    self._wikidump_content_cache[canonical] = joined
+
+            for canonical, raw_urls in canonical_to_raw.items():
+                content = self._wikidump_content_cache.get(canonical)
+                for raw in raw_urls:
+                    result[raw] = content
+        except Exception as e:
+            logger.debug(f"Failed Wikipedia dump lookup ({WIKIPEDIA_DUMP_DATASET}): {e}")
+            for raw_urls in canonical_to_raw.values():
+                for raw in raw_urls:
+                    result[raw] = None
+        return result
+
+    def _has_fake_property_label(self, prop: Any) -> bool:
+        """Return True if the property has no real label (missing or equals PID)."""
+        if prop is None or not hasattr(prop, "pid") or not hasattr(prop, "label"):
+            return True
+        label = prop.label
+        if label is None or not str(label).strip():
+            return True
+        label = str(label).strip()
+        if label.upper() == getattr(prop, "pid", "").upper():
+            return True
+        if len(label) > 1 and label[0].upper() == "P" and label[1:].isdigit():
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Entity search / retrieval
+    # ------------------------------------------------------------------
+
+    def _rest_v1_search_entities(self, text: str, num_results: int) -> List[WikidataEntity]:
+        """Item search via Wikibase REST v1 JSON API."""
+        try:
+            resp = requests.get(
+                WIKIDATA_REST_SEARCH_ITEMS_URL,
+                params={"q": text, "language": "en", "limit": num_results},
+                headers={"User-Agent": USER_AGENT},
+                timeout=REST_SEARCH_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            logger.debug("Wikidata REST v1 search failed: %s", e)
+            return []
+
+        rows = payload.get("results") if isinstance(payload, dict) else None
+        if not rows:
+            return []
+
+        entities: List[WikidataEntity] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            qid = item.get("id")
+            if not qid:
+                continue
+            label = None
+            dl = item.get("display-label") or item.get("display_label")
+            if isinstance(dl, dict):
+                label = dl.get("value")
+            elif isinstance(dl, str):
+                label = dl
+            desc = None
+            dobj = item.get("description")
+            if isinstance(dobj, dict):
+                desc = dobj.get("value")
+            elif isinstance(dobj, str):
+                desc = dobj
+            entities.append(
+                WikidataEntity(
+                    qid=qid,
+                    label=label,
+                    description=desc,
+                    url=f"https://www.wikidata.org/wiki/{qid}",
+                )
+            )
+        return entities[:num_results]
+
+    def _search_entity_by_text(self, text: str, num_results: int = 1) -> List[WikidataEntity]:
+        found = self._rest_v1_search_entities(text, num_results=num_results)
+        if found:
+            return found
+
+        text_escaped = json.dumps(text)
+        sparql = f"""
+        SELECT ?entity ?ordinal WHERE {{
+          SERVICE wikibase:mwapi {{
+            bd:serviceParam wikibase:endpoint "www.wikidata.org" ;
+                            wikibase:api "EntitySearch" ;
+                            mwapi:search {text_escaped} ;
+                            mwapi:language "en" ;
+                            mwapi:type "item" ;
+                            mwapi:limit {num_results} .
+            ?entity wikibase:apiOutputItem mwapi:item .
+            ?ordinal wikibase:apiOrdinal true .
+          }}
+        }}
+        ORDER BY ASC(?ordinal)
+        """
+        bindings = self._sparql_query(sparql)
+        entities = []
+        for row in bindings:
+            uri = row.get("entity", {}).get("value", "")
+            qid = _extract_id_from_uri(uri)
+            if qid and qid.startswith("Q"):
+                entities.append(WikidataEntity(
+                    qid=qid, url=f"https://www.wikidata.org/wiki/{qid}",
+                ))
+        return entities[:num_results]
+
+    def _get_entity_by_qid(
+        self, qid: str, get_details: bool = False
+    ) -> Optional[WikidataEntity]:
+        entities = self._get_entities_batch([qid], get_details=get_details)
+        return entities.get(qid)
+
+    def _get_entities_batch(
+        self, qids: List[str], get_details: bool = False
+    ) -> Dict[str, WikidataEntity]:
+        if not qids:
+            return {}
+
+        entity_map: Dict[str, WikidataEntity] = {}
+
+        for start in range(0, len(qids), BATCH_SIZE):
+            batch = qids[start : start + BATCH_SIZE]
+            values_clause = " ".join(f"wd:{q}" for q in batch)
+            sparql = f"""
+            SELECT ?entity ?entityLabel ?entityDescription ?entityAltLabel ?article
+            WHERE {{
+              VALUES ?entity {{ {values_clause} }}
+              OPTIONAL {{
+                ?article schema:about ?entity ;
+                         schema:isPartOf <https://en.wikipedia.org/> .
+              }}
+              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
+            }}
+            """
+            for row in self._sparql_query(sparql):
+                uri = row.get("entity", {}).get("value", "")
+                if "/entity/" not in uri:
+                    continue
+                qid_val = uri.split("/")[-1].upper()
+
+                label = row.get("entityLabel", {}).get("value", "")
+                if label.startswith("Q") and label[1:].isdigit():
+                    label = ""
+
+                description = row.get("entityDescription", {}).get("value", "")
+
+                alt_label = row.get("entityAltLabel", {}).get("value", "")
+                aliases = [a.strip() for a in alt_label.split(",") if a.strip()] if alt_label else []
+
+                wikipedia_url = row.get("article", {}).get("value")
+
+                if qid_val not in entity_map:
+                    entity_map[qid_val] = WikidataEntity(
+                        qid=qid_val,
+                        label=label or None,
+                        description=description or None,
+                        aliases=aliases,
+                        url=f"https://www.wikidata.org/wiki/{qid_val}",
+                        wikipedia_url=wikipedia_url,
+                    )
+
+        if get_details:
+            self._fetch_wikipedia_contents_concurrent(list(entity_map.values()))
+
+        return entity_map
+
+    def search_entities(
+        self,
+        query: Union[str, List[str]],
+        num_results: int = 1,
+        get_details: bool = True,
+        *,
+        is_qids: bool = False,
+    ) -> Union[List[WikidataEntity], List[List[WikidataEntity]]]:
+        """Search for Wikidata entities by text query or QID(s).
+
+        When *is_qids* is True (e.g. Azure linking), strings that are not valid QIDs
+        yield empty lists instead of running label search.
+        """
+        is_single = isinstance(query, str)
+        queries = [query] if is_single else list(query)
+
+        # Classify: (index, qid) for QID lookups, (index, text) for text search
+        qid_entries: List[Tuple[int, str]] = []
+        text_entries: List[Tuple[int, str]] = []
+        for i, q in enumerate(queries):
+            qid = _normalize_qid(q)
+            if qid:
+                qid_entries.append((i, qid))
+            elif not is_qids:
+                text_entries.append((i, q))
+
+        # Batch fetch all QIDs in one call (or few if over BATCH_SIZE)
+        qid_batch: Dict[str, WikidataEntity] = {}
+        if qid_entries:
+            all_qids = [qid for _, qid in qid_entries]
+            qid_batch = self._get_entities_batch(all_qids, get_details=get_details)
+
+        # Text searches (sequential; no batch search API)
+        text_results: List[Tuple[int, List[WikidataEntity]]] = []
+        details_qids: List[str] = []
+        for i, q in text_entries:
+            found = self._search_entity_by_text(q, num_results=num_results)
+            if get_details and found:
+                details_qids.extend(e.qid for e in found)
+            text_results.append((i, found))
+
+        # One batch for details of all text-search results
+        details_batch: Dict[str, WikidataEntity] = {}
+        if get_details and details_qids:
+            details_batch = self._get_entities_batch(
+                details_qids, get_details=get_details
+            )
+
+        # Build results in query order
+        results: List[List[WikidataEntity]] = [[] for _ in range(len(queries))]
+        for i, qid in qid_entries:
+            entity = qid_batch.get(qid)
+            results[i] = [entity] if entity else []
+        for i, found in text_results:
+            if get_details and found and details_batch:
+                found = [details_batch.get(e.qid, e) for e in found]
+            results[i] = found
+
+        if not is_single:
+            assert len(results) == len(queries), "Number of results does not match number of queries"
+        return results[0] if is_single else results
+
+    # ------------------------------------------------------------------
+    # Property search / retrieval
+    # ------------------------------------------------------------------
+
+    def _get_properties_batch(self, pids: List[str]) -> Dict[str, WikidataProperty]:
+        result: Dict[str, WikidataProperty] = {}
+        to_fetch: List[str] = []
+
+        for pid in pids:
+            if pid in self.property_labels:
+                info = self.property_labels[pid]
+                label, desc = self._normalize_property_text(
+                    pid,
+                    info.get("label"),
+                    info.get("description"),
+                )
+                result[pid] = WikidataProperty(
+                    pid=pid,
+                    label=label,
+                    description=desc,
+                )
+            else:
+                to_fetch.append(pid)
+
+        if not to_fetch:
+            return result
+
+        for start in range(0, len(to_fetch), BATCH_SIZE):
+            batch = to_fetch[start : start + BATCH_SIZE]
+            values_clause = " ".join(f"wd:{p}" for p in batch)
+            sparql = f"""
+            SELECT ?property ?propertyLabel ?propertyDescription WHERE {{
+              VALUES ?property {{ {values_clause} }}
+              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
+            }}
+            """
+            for row in self._sparql_query(sparql):
+                uri = row.get("property", {}).get("value", "")
+                if "/entity/" not in uri:
+                    continue
+                pid_val = uri.split("/")[-1].upper()
+                raw_label = row.get("propertyLabel", {}).get("value", "")
+                raw_desc = row.get("propertyDescription", {}).get("value", "")
+                label, desc = self._normalize_property_text(pid_val, raw_label, raw_desc)
+                prop = WikidataProperty(pid=pid_val, label=label, description=desc)
+                result[pid_val] = prop
+                self.property_labels[pid_val] = {
+                    "label": prop.label,
+                    "description": prop.description,
+                }
+
+        return result
+
+    def search_properties(
+        self,
+        query: Union[str, List[str]],
+        num_results: int = 1,
+    ) -> Union[List[WikidataProperty], List[List[WikidataProperty]]]:
+        """Search for Wikidata properties by text query or PID(s)."""
+        is_single = isinstance(query, str)
+        queries = [query] if is_single else list(query)
+
+        results: List[List[WikidataProperty]] = []
+        for q in queries:
+            pid = _normalize_pid(q)
+            if pid:
+                # First try cached labels/descriptions with normalization
+                info = self.property_labels.get(pid, {})
+                label, desc = self._normalize_property_text(
+                    pid,
+                    info.get("label"),
+                    info.get("description"),
+                )
+
+                # If cache is missing or uninformative, fetch from Wikidata
+                if not (label or desc):
+                    batch = self._get_properties_batch([pid])
+                    prop = batch.get(pid)
+                    if prop:
+                        label, desc = prop.label, prop.description
+
+                # If still nothing meaningful, return an empty result for this PID
+                if not (label or desc):
+                    results.append([])
+                else:
+                    prop = WikidataProperty(pid=pid, label=label, description=desc)
+                    results.append([prop])
+            else:
+                text_escaped = json.dumps(q)
+                sparql = f"""
+                SELECT ?entity ?ordinal WHERE {{
+                  SERVICE wikibase:mwapi {{
+                    bd:serviceParam wikibase:endpoint "www.wikidata.org" ;
+                                    wikibase:api "EntitySearch" ;
+                                    mwapi:search {text_escaped} ;
+                                    mwapi:language "en" ;
+                                    mwapi:type "property" ;
+                                    mwapi:limit {num_results} .
+                    ?entity wikibase:apiOutputItem mwapi:item .
+                    ?ordinal wikibase:apiOrdinal true .
+                  }}
+                }}
+                ORDER BY ASC(?ordinal)
+                """
+                bindings = self._sparql_query(sparql)
+                pids_found = []
+                for row in bindings:
+                    uri = row.get("entity", {}).get("value", "")
+                    found_pid = _extract_id_from_uri(uri)
+                    if found_pid and found_pid.startswith("P"):
+                        pids_found.append(found_pid)
+
+                props: List[WikidataProperty] = []
+                if pids_found:
+                    prop_map = self._get_properties_batch(pids_found[:num_results])
+                    for p in pids_found[:num_results]:
+                        prop = prop_map.get(p)
+                        # Filter out completely uninformative properties
+                        if prop and (prop.label or prop.description):
+                            props.append(prop)
+                results.append(props)
+
+        return results[0] if is_single else results
+
+    # ------------------------------------------------------------------
+    # Triple retrieval
+    # ------------------------------------------------------------------
+
+    def _prop_uris_clause(self) -> str:
+        return " ".join(
+            f"<http://www.wikidata.org/prop/direct/{p}>" for p in self.properties
+        )
+
+    @staticmethod
+    def _batch_sparql_limit(num_seeds: int) -> int:
+        return min(MAX_BATCH_SPARQL_ROWS, max(LIMIT_PER_QUERY, LIMIT_PER_QUERY * max(1, num_seeds)))
+
+    def _parse_outgoing_row(self, subject_qid: str, row: Dict) -> Optional[WikiTriple]:
+        rel_uri = row.get("relation", {}).get("value", "")
+        if "/prop/direct/" not in rel_uri:
+            return None
+        pid = rel_uri.split("/")[-1]
+        label, desc = self._get_property_label(pid)
+        prop = WikidataProperty(pid=pid, label=label, description=desc)
+        subject = WikidataEntity(
+            qid=subject_qid, url=f"https://www.wikidata.org/wiki/{subject_qid}",
+        )
+        obj_data = row.get("object", {})
+        obj_type = obj_data.get("type", "")
+        obj_value = obj_data.get("value", "")
+
+        if obj_type == "uri" and "/entity/" in obj_value:
+            obj_qid = obj_value.split("/")[-1].upper()
+            if obj_qid.startswith("Q") and obj_qid[1:].isdigit():
+                obj_entity = WikidataEntity(
+                    qid=obj_qid, url=f"https://www.wikidata.org/wiki/{obj_qid}",
+                )
+                return WikiTriple(subject=subject, relation=prop, object=obj_entity)
+            return WikiTriple(subject=subject, relation=prop, object=obj_value)
+        return WikiTriple(subject=subject, relation=prop, object=obj_value)
+
+    def _parse_incoming_row(self, object_qid: str, row: Dict) -> Optional[WikiTriple]:
+        subj_uri = row.get("subject", {}).get("value", "")
+        rel_uri = row.get("relation", {}).get("value", "")
+        if "/entity/" not in subj_uri or "/prop/direct/" not in rel_uri:
+            return None
+        subj_qid = subj_uri.split("/")[-1].upper()
+        if not (subj_qid.startswith("Q") and subj_qid[1:].isdigit()):
+            return None
+        pid = rel_uri.split("/")[-1]
+        label, desc = self._get_property_label(pid)
+        prop = WikidataProperty(pid=pid, label=label, description=desc)
+        subj = WikidataEntity(qid=subj_qid, url=f"https://www.wikidata.org/wiki/{subj_qid}")
+        obj_entity = WikidataEntity(qid=object_qid, url=f"https://www.wikidata.org/wiki/{object_qid}")
+        return WikiTriple(subject=subj, relation=prop, object=obj_entity)
+
+    def _fetch_outgoing_triples_uncached(self, qid: str) -> List[WikiTriple]:
+        prop_uris = self._prop_uris_clause()
+        sparql = f"""
+        SELECT ?relation ?object WHERE {{
+          wd:{qid} ?relation ?object .
+          VALUES ?relation {{ {prop_uris} }}
+        }}
+        LIMIT {LIMIT_PER_QUERY}
+        """
+        bindings = self._sparql_query(sparql)
+        triples: List[WikiTriple] = []
+        for row in bindings:
+            t = self._parse_outgoing_row(qid, row)
+            if t is not None:
+                triples.append(t)
+        return triples
+
+    def _fetch_incoming_triples_uncached(self, qid: str) -> List[WikiTriple]:
+        prop_uris = self._prop_uris_clause()
+        sparql = f"""
+        SELECT ?subject ?relation WHERE {{
+          ?subject ?relation wd:{qid} .
+          VALUES ?relation {{ {prop_uris} }}
+        }}
+        LIMIT {LIMIT_PER_QUERY}
+        """
+        bindings = self._sparql_query(sparql)
+        triples: List[WikiTriple] = []
+        for row in bindings:
+            t = self._parse_incoming_row(qid, row)
+            if t is not None:
+                triples.append(t)
+        return triples
+
+    def _get_outgoing_triples(self, qid: str) -> List[WikiTriple]:
+        with self._cache_lock:
+            cached = self._lru_get(self._outgoing_triples_cache, qid)
+            if cached is not None:
+                return list(cached)
+        triples = self._fetch_outgoing_triples_uncached(qid)
+        with self._cache_lock:
+            self._lru_set(self._outgoing_triples_cache, qid, triples)
+        return list(triples)
+
+    def _get_bidirectional_triples(self, qid: str) -> List[WikiTriple]:
+        with self._cache_lock:
+            cached_bidirectional = self._lru_get(self._bidirectional_triples_cache, qid)
+            if cached_bidirectional is not None:
+                return list(cached_bidirectional)
+            cached_outgoing = self._lru_get(self._outgoing_triples_cache, qid)
+            if cached_outgoing is not None:
+                outgoing = list(cached_outgoing)
+            else:
+                outgoing = None
+        if outgoing is None:
+            outgoing = self._fetch_outgoing_triples_uncached(qid)
+            with self._cache_lock:
+                self._lru_set(self._outgoing_triples_cache, qid, outgoing)
+        incoming = self._fetch_incoming_triples_uncached(qid)
+        triples = self._deduplicate_triples(outgoing + incoming)
+        with self._cache_lock:
+            self._lru_set(self._bidirectional_triples_cache, qid, triples)
+        return list(triples)
+
+    def _fetch_outgoing_batch_uncached(self, qids: List[str]) -> Dict[str, List[WikiTriple]]:
+        """Outgoing triples for many seeds in one SPARQL query."""
+        if not qids:
+            return {}
+        prop_uris = self._prop_uris_clause()
+        values_clause = " ".join(f"wd:{q}" for q in qids)
+        limit = self._batch_sparql_limit(len(qids))
+        sparql = f"""
+        SELECT ?seed ?relation ?object WHERE {{
+          VALUES ?seed {{ {values_clause} }}
+          ?seed ?relation ?object .
+          VALUES ?relation {{ {prop_uris} }}
+        }}
+        LIMIT {limit}
+        """
+        bindings = self._sparql_query(sparql)
+        by_seed: Dict[str, List[WikiTriple]] = defaultdict(list)
+        for row in bindings:
+            seed_uri = row.get("seed", {}).get("value", "")
+            if "/entity/" not in seed_uri:
+                continue
+            seed_qid = seed_uri.split("/")[-1].upper()
+            if not (seed_qid.startswith("Q") and seed_qid[1:].isdigit()):
+                continue
+            t = self._parse_outgoing_row(seed_qid, row)
+            if t is not None:
+                by_seed[seed_qid].append(t)
+        return dict(by_seed)
+
+    def _fetch_incoming_batch_uncached(self, qids: List[str]) -> Dict[str, List[WikiTriple]]:
+        """Incoming triples (subject ?relation seed) for many seeds in one SPARQL query."""
+        if not qids:
+            return {}
+        prop_uris = self._prop_uris_clause()
+        values_clause = " ".join(f"wd:{q}" for q in qids)
+        limit = self._batch_sparql_limit(len(qids))
+        sparql = f"""
+        SELECT ?seed ?subject ?relation WHERE {{
+          VALUES ?seed {{ {values_clause} }}
+          ?subject ?relation ?seed .
+          VALUES ?relation {{ {prop_uris} }}
+        }}
+        LIMIT {limit}
+        """
+        bindings = self._sparql_query(sparql)
+        by_seed: Dict[str, List[WikiTriple]] = defaultdict(list)
+        for row in bindings:
+            seed_uri = row.get("seed", {}).get("value", "")
+            if "/entity/" not in seed_uri:
+                continue
+            seed_qid = seed_uri.split("/")[-1].upper()
+            if not (seed_qid.startswith("Q") and seed_qid[1:].isdigit()):
+                continue
+            t = self._parse_incoming_row(seed_qid, row)
+            if t is not None:
+                by_seed[seed_qid].append(t)
+        return dict(by_seed)
+
+    @staticmethod
+    def _triple_touches_seed(t: WikiTriple, seed_qid: str) -> bool:
+        if hasattr(t.subject, "qid") and t.subject.qid == seed_qid:
+            return True
+        if isinstance(t.object, WikidataEntity) and t.object.qid == seed_qid:
+            return True
+        return False
+
+    def _get_k_hop_multi_seed_one_hop(
+        self,
+        normalized: List[Optional[str]],
+        bidirectional: bool,
+        enrich: bool,
+    ) -> List[List[WikiTriple]]:
+        """Optimized path: k=1, two or more valid QIDs — batched SPARQL + one enrichment pass."""
+        unique_seeds = list(dict.fromkeys(nq for nq in normalized if nq))
+
+        # Check cache first; only fetch seeds that are not already cached.
+        out_by_seed: Dict[str, List[WikiTriple]] = {}
+        in_by_seed: Dict[str, List[WikiTriple]] = {}
+        uncached_seeds: List[str] = []
+        cache_key = self._bidirectional_triples_cache if bidirectional else self._outgoing_triples_cache
+        with self._cache_lock:
+            for s in unique_seeds:
+                cached = self._lru_get(cache_key, s)
+                if cached is not None:
+                    if bidirectional:
+                        in_by_seed[s] = []  # bidirectional cache already merged
+                        out_by_seed[s] = list(cached)
+                    else:
+                        out_by_seed[s] = list(cached)
+                else:
+                    uncached_seeds.append(s)
+
+        if uncached_seeds:
+            fetched_out = self._fetch_outgoing_batch_uncached(uncached_seeds)
+            fetched_in = self._fetch_incoming_batch_uncached(uncached_seeds) if bidirectional else {}
+            for s in uncached_seeds:
+                out_list = fetched_out.get(s, [])
+                inc_list = fetched_in.get(s, []) if bidirectional else []
+                bid_list = self._deduplicate_triples(out_list + inc_list)
+                with self._cache_lock:
+                    self._lru_set(self._outgoing_triples_cache, s, list(out_list))
+                    self._lru_set(self._bidirectional_triples_cache, s, bid_list)
+                out_by_seed[s] = out_list
+                if bidirectional:
+                    in_by_seed[s] = inc_list
+
+        merged: List[WikiTriple] = []
+        for s in unique_seeds:
+            merged.extend(out_by_seed.get(s, []))
+            if bidirectional:
+                merged.extend(in_by_seed.get(s, []))
+        merged = self._deduplicate_triples(merged)
+        if enrich:
+            merged = self._enrich_triples(merged)
+        merged = [
+            t for t in merged
+            if not self._has_fake_property_label(getattr(t, "relation", None))
+        ]
+
+        all_results: List[List[WikiTriple]] = []
+        for nq in normalized:
+            if not nq:
+                all_results.append([])
+                continue
+            all_results.append([t for t in merged if self._triple_touches_seed(t, nq)])
+        return all_results
+
+    @staticmethod
+    def _deduplicate_triples(triples: List[WikiTriple]) -> List[WikiTriple]:
+        seen: Set[Tuple] = set()
+        unique: List[WikiTriple] = []
+        for t in triples:
+            if isinstance(t.object, WikidataEntity):
+                key = (t.subject.qid, t.relation.pid, t.object.qid)
+            else:
+                key = (t.subject.qid, t.relation.pid, str(t.object))
+            if key not in seen:
+                seen.add(key)
+                unique.append(t)
+        return unique
+
+    def get_k_hop_triples(
+        self,
+        qids: Union[str, List[str]],
+        k: int = 1,
+        bidirectional: bool = True,
+        enrich: bool = True,
+    ) -> Union[List[WikiTriple], List[List[WikiTriple]]]:
+        """Get k-hop triples from entity QIDs via SPARQL."""
+        t_all = time.perf_counter()
+        is_single = isinstance(qids, str)
+        raw_list = [qids] if is_single else list(qids)
+        normalized: List[Optional[str]] = []
+        for q in raw_list:
+            normalized.append(_normalize_qid(q))
+
+        num_valid = sum(1 for n in normalized if n)
+        # Batched SPARQL + single enrichment when multiple seeds and exactly one hop.
+        if k == 1 and num_valid >= 2:
+            all_results = self._get_k_hop_multi_seed_one_hop(
+                normalized, bidirectional, enrich,
+            )
+            return all_results[0] if is_single else all_results
+
+        all_results: List[List[WikiTriple]] = []
+        for seed_qid in normalized:
+            if not seed_qid:
+                all_results.append([])
+                continue
+
+            collected: List[WikiTriple] = []
+            visited: Set[str] = set()
+            frontier: Set[str] = {seed_qid}
+
+            for _hop in range(k):
+                next_frontier: Set[str] = set()
+                for entity_qid in frontier:
+                    if entity_qid in visited:
+                        continue
+                    visited.add(entity_qid)
+
+                    if bidirectional:
+                        hop_triples = self._get_bidirectional_triples(entity_qid)
+                    else:
+                        hop_triples = self._get_outgoing_triples(entity_qid)
+
+                    collected.extend(hop_triples)
+
+                    for t in hop_triples:
+                        if isinstance(t.object, WikidataEntity) and t.object.qid not in visited:
+                            next_frontier.add(t.object.qid)
+                        if bidirectional and t.subject.qid not in visited:
+                            next_frontier.add(t.subject.qid)
+
+                if len(next_frontier) > MAX_ENTITIES_PER_HOP:
+                    next_frontier = set(list(next_frontier)[:MAX_ENTITIES_PER_HOP])
+                frontier = next_frontier
+                if not frontier:
+                    break
+
+            collected = self._deduplicate_triples(collected)
+            if enrich:
+                collected = self._enrich_triples(collected)
+            collected = [
+                t for t in collected
+                if not self._has_fake_property_label(getattr(t, "relation", None))
+            ]
+            all_results.append(collected)
+        return all_results[0] if is_single else all_results
+
+    # ------------------------------------------------------------------
+    # Path finding
+    # ------------------------------------------------------------------
+
+    def find_path(
+        self,
+        source_qid: str,
+        target_qid: str,
+        max_hops: int = 2,
+        enrich: bool = True,
+    ) -> Optional[WikidataPathBetweenEntities]:
+        """Find path between two entities using bidirectional BFS on SPARQL."""
+        src = _normalize_qid(source_qid)
+        tgt = _normalize_qid(target_qid)
+        if not src or not tgt:
+            return None
+
+        if src == tgt:
+            entity = self._get_entity_by_qid(src)
+            if entity:
+                return WikidataPathBetweenEntities(
+                    source=entity, target=entity, path=[], path_length=0,
+                )
+            return None
+
+        forward_visited: Dict[str, Tuple[Optional[str], Optional[WikiTriple]]] = {src: (None, None)}
+        forward_frontier: Set[str] = {src}
+        backward_visited: Dict[str, Tuple[Optional[str], Optional[WikiTriple]]] = {tgt: (None, None)}
+        backward_frontier: Set[str] = {tgt}
+        meeting_qid: Optional[str] = None
+
+        for _hop in range(max_hops):
+            if not forward_frontier and not backward_frontier:
+                break
+
+            expand_forward = forward_frontier and (
+                not backward_frontier or len(forward_frontier) <= len(backward_frontier)
+            )
+            if expand_forward:
+                meeting_qid, forward_frontier = self._expand_frontier(
+                    forward_frontier, forward_visited, backward_visited,
+                )
+            else:
+                meeting_qid, backward_frontier = self._expand_frontier(
+                    backward_frontier, backward_visited, forward_visited,
+                )
+            if meeting_qid:
+                break
+
+        if not meeting_qid:
+            logger.info(f"No path found between {src} and {tgt} within {max_hops} hops")
+            return None
+
+        forward_path = self._reconstruct_path(forward_visited, meeting_qid)
+        forward_path.reverse()
+        backward_path = self._reconstruct_path(backward_visited, meeting_qid)
+        full_path = forward_path + backward_path
+
+        if enrich and full_path:
+            full_path = self._enrich_triples(full_path)
+            full_path = [
+                t for t in full_path
+                if not self._has_fake_property_label(getattr(t, "relation", None))
+            ]
+
+        source_entity = self._get_entity_by_qid(src)
+        target_entity = self._get_entity_by_qid(tgt)
+        if not source_entity or not target_entity:
+            return None
+
+        return WikidataPathBetweenEntities(
+            source=source_entity,
+            target=target_entity,
+            path=full_path,
+            path_length=len(full_path),
+        )
+
+    def _expand_frontier(
+        self,
+        frontier: Set[str],
+        own_visited: Dict[str, Tuple[Optional[str], Optional[WikiTriple]]],
+        other_visited: Dict[str, Tuple[Optional[str], Optional[WikiTriple]]],
+    ) -> Tuple[Optional[str], Set[str]]:
+        new_frontier: Set[str] = set()
+        for entity_qid in frontier:
+            triples = self._get_bidirectional_triples(entity_qid)
+            for t in triples:
+                neighbors: List[str] = []
+                if t.subject.qid == entity_qid and isinstance(t.object, WikidataEntity):
+                    neighbors.append(t.object.qid)
+                elif isinstance(t.object, WikidataEntity) and t.object.qid == entity_qid:
+                    neighbors.append(t.subject.qid)
+
+                for nq in neighbors:
+                    if nq not in own_visited:
+                        own_visited[nq] = (entity_qid, t)
+                        new_frontier.add(nq)
+                        if nq in other_visited:
+                            return nq, new_frontier
+        return None, new_frontier
+
+    @staticmethod
+    def _reconstruct_path(
+        visited: Dict[str, Tuple[Optional[str], Optional[WikiTriple]]],
+        end_qid: str,
+    ) -> List[WikiTriple]:
+        path: List[WikiTriple] = []
+        current = end_qid
+        while visited[current][0] is not None:
+            parent_qid, triple = visited[current]
+            path.append(triple)
+            current = parent_qid
+        return path
+
+    # ------------------------------------------------------------------
+    # Enrichment
+    # ------------------------------------------------------------------
+
+    def enrich_entities(
+        self, entities: List[WikidataEntity], get_details: bool = False,
+    ) -> List[WikidataEntity]:
+        """Batch enrich entities with labels, descriptions, aliases."""
+        qids_to_enrich = [
+            e.qid for e in entities if e and not self._is_entity_enriched(e)
+        ]
+        if qids_to_enrich:
+            enriched_map = self._get_entities_batch(
+                list(set(qids_to_enrich)), get_details=get_details,
+            )
+        else:
+            enriched_map = {}
+        all_entities = [enriched_map.get(e.qid, e) for e in entities]
+        # Fetch Wikipedia content if not already fetched
+        if get_details:
+            self._fetch_wikipedia_contents_concurrent(all_entities)
+
+        return all_entities
+
+    async def aenrich_entities(
+        self, entities: List[WikidataEntity], get_details: bool = False,
+    ) -> List[WikidataEntity]:
+        return await asyncio.to_thread(self.enrich_entities, entities, get_details)
+
+    def enrich_properties(
+        self, properties: List[WikidataProperty],
+    ) -> List[WikidataProperty]:
+        """Batch enrich properties with labels and descriptions."""
+        pids_to_enrich = [
+            p.pid for p in properties if p and not self._is_property_enriched(p)
+        ]
+        if not pids_to_enrich:
+            return properties
+
+        enriched_map = self._get_properties_batch(list(set(pids_to_enrich)))
+        return [enriched_map.get(p.pid, p) if p else p for p in properties]
+
+    def _enrich_triples(
+        self,
+        triples: List[WikiTriple],
+        get_details: bool = False,
+    ) -> List[WikiTriple]:
+        entity_qids: Set[str] = set()
+        property_pids: Set[str] = set()
+
+        for t in triples:
+            if hasattr(t.subject, "qid") and not self._is_entity_enriched(t.subject):
+                entity_qids.add(t.subject.qid)
+            if isinstance(t.object, WikidataEntity) and not self._is_entity_enriched(t.object):
+                entity_qids.add(t.object.qid)
+            if hasattr(t.relation, "pid") and not self._is_property_enriched(t.relation):
+                property_pids.add(t.relation.pid)
+
+        entity_map: Dict[str, WikidataEntity] = {}
+        if entity_qids:
+            entity_map = self._get_entities_batch(list(entity_qids), get_details=get_details)
+
+        prop_map: Dict[str, WikidataProperty] = {}
+        if property_pids:
+            prop_map = self._get_properties_batch(list(property_pids))
+
+        enriched: List[WikiTriple] = []
+        for t in triples:
+            subject = entity_map.get(t.subject.qid, t.subject) if hasattr(t.subject, "qid") else t.subject
+            relation = prop_map.get(t.relation.pid, t.relation) if hasattr(t.relation, "pid") else t.relation
+            if isinstance(t.object, WikidataEntity):
+                obj = entity_map.get(t.object.qid, t.object)
+            else:
+                obj = t.object
+            enriched.append(WikiTriple(subject=subject, relation=relation, object=obj))
+
+        return enriched
+
+    # ------------------------------------------------------------------
+    # Async wrappers
+    # ------------------------------------------------------------------
+
+    async def asearch_entities(
+        self,
+        query: Union[str, List[str]],
+        num_results: int = 1,
+        get_details: bool = True,
+        *,
+        is_qids: bool = False,
+    ) -> Union[List[WikidataEntity], List[List[WikidataEntity]]]:
+        return await asyncio.to_thread(
+            self.search_entities,
+            query,
+            num_results,
+            get_details,
+            is_qids=is_qids,
+        )
+
+    async def aget_k_hop_triples(
+        self,
+        qids: Union[str, List[str]],
+        k: int = 1,
+        bidirectional: bool = True,
+        enrich: bool = True,
+    ) -> Union[List[WikiTriple], List[List[WikiTriple]]]:
+        return await asyncio.to_thread(
+            self.get_k_hop_triples, qids, k, bidirectional, enrich,
+        )
+
+    async def afind_path(
+        self,
+        source_qid: str,
+        target_qid: str,
+        max_hops: int = 2,
+        enrich: bool = True,
+    ) -> Optional[WikidataPathBetweenEntities]:
+        return await asyncio.to_thread(
+            self.find_path, source_qid, target_qid, max_hops, enrich,
+        )

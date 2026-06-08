@@ -6,12 +6,12 @@ This file provides guidance when working with code in this repository.
 
 Two implementations of the same research idea live side by side:
 
-- `wemg/` — original **pure-Python** implementation (MCTS/CoT search, working-memory coordination, custom retrieval). Treated as **legacy reference**.
+- `coe/` — original **pure-Python** implementation (MCTS/CoT search, working-memory coordination, custom retrieval). Treated as **legacy reference**.
 - `langgraph_coe/` — **active** "naive" port onto the LangChain / LangGraph ecosystem. New work goes here.
 
-When asked to add a feature or fix a bug, default to `langgraph_coe/` and use LangChain/LangGraph primitives (`create_agent`, `StateGraph`, `@tool`, `with_structured_output`). Only touch `wemg/` if the user explicitly says so or if a shared utility lives there.
+When asked to add a feature or fix a bug, default to `langgraph_coe/` and use LangChain/LangGraph primitives (`create_agent`, `StateGraph`, `@tool`, `with_structured_output`). Only touch `coe/` if the user explicitly says so or if a shared utility lives there.
 
-The research framing (graph + textual memory coordination, dual retrieval, multi-hop reasoning) is described in `README.md`. Read it for vocabulary, not for implementation details — the README still describes the `wemg/` package.
+The research framing (graph + textual memory coordination, dual retrieval, multi-hop reasoning) is described in `README.md`. Read it for vocabulary, not for implementation details — the README still describes the `coe/` package.
 
 ## langgraph_coe architecture
 
@@ -85,8 +85,8 @@ The default `api_base` (`http://n0142:4000/v1`) and embedder/reranker URLs (`n03
 # Install (editable, with dev extras)
 pip install -e ".[dev]"
 
-# Legacy CLI (wemg/ package; langgraph_coe has no CLI yet)
-python -m wemg "What is the capital of France?"
+# Legacy CLI (coe/ package; langgraph_coe has no CLI yet)
+python -m coe "What is the capital of France?"
 
 # Tests — pytest config in pyproject.toml; asyncio_mode=auto, log_cli=INFO
 pytest                             # testpaths = ["tests"]
@@ -95,7 +95,7 @@ pytest tests/path/to/test_x.py::test_name   # single test
 
 Notes on tests: the legacy `tests/` tree was deleted on the current `langchain` branch (see `git status`); new tests should land in `langgraph_coe/tests/`. Until `pyproject.toml` is updated, you may need `pytest langgraph_coe/tests`. `pytest-asyncio` is in `[dev]` and `asyncio_mode = "auto"` is set, so async test functions don't need an explicit `@pytest.mark.asyncio`.
 
-Python: pyproject pins `>=3.12`; the README's "3.10+" applies only to the legacy `wemg` path.
+Python: pyproject pins `>=3.12`; the README's "3.10+" applies only to the legacy `coe` path.
 
 ## Agent / tooling setup
 

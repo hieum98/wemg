@@ -14,7 +14,7 @@ def load_dataset_any(
     """Load a dataset from HuggingFace, local disk, or JSON file.
 
     Known dataset names use the same loaders as ``main`` branch
-    ``wemg/evaluation/evaluate.py`` (``preprocess_dataset``).
+    ``coe/evaluation/evaluate.py`` (``preprocess_dataset``).
 
     Returns a HuggingFace Dataset object.
     """

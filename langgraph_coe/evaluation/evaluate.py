@@ -4,7 +4,7 @@
         dataset_name_or_path=bamboogle output_path=./results/lgc_bamboogle \
         search.strategy=mcts
 
-Accepts the same evaluation keys as ``wemg.evaluation.evaluate`` plus dotted
+Accepts the same evaluation keys as ``coe.evaluation.evaluate`` plus dotted
 ``langgraph_coe`` config overrides (e.g. ``search.strategy=cot``,
 ``search.mcts.num_iterations=8``, ``llm.tiers.heavy.api_base=...``). Writes the
 resolved config to ``<output_path>/config.yaml`` for reproducibility, then runs

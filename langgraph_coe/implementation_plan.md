@@ -1,6 +1,6 @@
 # LangGraph CoE Implementation Plan
 
-> Port of the legacy `wemg/` pure-Python MCTS/CoT pipeline onto LangChain / LangGraph primitives.
+> Port of the legacy `coe/` pure-Python MCTS/CoT pipeline onto LangChain / LangGraph primitives.
 > Locked design decisions also live in project memory at `project_langgraph_coe_port_design.md`.
 
 ## 1. Architectural Overview
@@ -181,11 +181,11 @@ graph TD
 
 1. LangGraph `recursion_limit` on `agent.ainvoke(config=...)`.
 2. In-state `queries_issued` counter against `config.web_search.max_queries_per_agent`.
-3. ContextVar `_cv_visited_urls: ContextVar[Set[str]]` populated by the `web_search` tool to dedup within a question (parity with [project_langchain_ainvoke_context_isolation](../../../.claude/projects/-home-hieum-projects-wemg/memory/project_langchain_ainvoke_context_isolation.md)).
+3. ContextVar `_cv_visited_urls: ContextVar[Set[str]]` populated by the `web_search` tool to dedup within a question (parity with [project_langchain_ainvoke_context_isolation](../../../.claude/projects/-home-hieum-projects-coe/memory/project_langchain_ainvoke_context_isolation.md)).
 
 ### 3.6 Role catalogue: kept, kept-for-future, dropped
 
-The port preserves more of `wemg/llm/roles.py` than the active subgraphs need today. Roles split into three groups:
+The port preserves more of `coe/llm/roles.py` than the active subgraphs need today. Roles split into three groups:
 
 **Kept (active callers in Phase 1–3):** `subquestion_generator`, `answer_generator`, `web_researcher`, `self_corrector`, `final_answer_synthesizer`, `verifier`, `memory_consolidation`, `relation_extraction`, `triple_pruner`, `named_entity_recognition`, `extractor`, plus the two KG-agent system prompts.
 
@@ -205,7 +205,7 @@ These three are intentionally **not** wired into any subgraph in this port phase
 |---|---|
 | `query_generator` | Subsumed by the updated `subquestion_generator` prompt (retrieval-ready phrasing, temporal grounding). See §7.3. |
 | `majority_voter` | Replaced by `final_answer_synthesizer` over MCTS-scored candidates (§8.3 synthesize). |
-| `consensus_evaluator` | Pairwise consensus check, never used by wemg MCTS. |
+| `consensus_evaluator` | Pairwise consensus check, never used by coe MCTS. |
 
 If a dropped role becomes necessary later, restore from git history rather than reintroducing a new variant — the prompts have been tuned and should not be rewritten.
 
@@ -213,7 +213,7 @@ If a dropped role becomes necessary later, restore from git history rather than 
 
 ## 4. MemoryUpdateGraph (Phase 1)
 
-Decomposes legacy `synchronize_memory` (`wemg/reasoning/working_memory.py`) into a deterministic graph with parallel relation extraction and entity linking.
+Decomposes legacy `synchronize_memory` (`coe/reasoning/working_memory.py`) into a deterministic graph with parallel relation extraction and entity linking.
 
 ### 4.1 State
 
@@ -228,7 +228,7 @@ class MemoryUpdateState(TypedDict):
     new_raw_triples: List[Any]               # Structured triples from KG retrieval
     current_text_memory: List[str]
     current_graph: nx.DiGraph
-    entity_dict: Dict[str, Any]              # QID -> WikidataEntity (wemg parity; avoids re-resolution)
+    entity_dict: Dict[str, Any]              # QID -> WikidataEntity (coe parity; avoids re-resolution)
 
     # Intermediates (populated concurrently)
     consolidated_memory: List[str]
@@ -255,12 +255,12 @@ graph TD
     consolidate_post --> END((END))
 ```
 
-- **`consolidate_pre`**: `memory_consolidation` role on `current_text_memory + new_text_items`. Enforces `config.memory.max_textual_memory_tokens` (wemg default 16384). → `consolidated_memory`.
+- **`consolidate_pre`**: `memory_consolidation` role on `current_text_memory + new_text_items`. Enforces `config.memory.max_textual_memory_tokens` (coe default 16384). → `consolidated_memory`.
 - **`extract_relations`**: `relation_extraction` role on `consolidated_memory`. Yields `(src, rel, tgt)` tuples → `extracted_relations`.
 - **`link_entities`**: `named_entity_recognition` role on `consolidated_memory` → entity names; then `link_entities` tool resolves QIDs (skipping names already in `entity_dict`). Updates `linked_entities` and `updated_entity_dict`.
 - **`merge_and_prune`**:
   - Ingests `extracted_relations` (from text) + `new_raw_triples` (from direct KG retrieval).
-  - `triple_pruner` role on **newly proposed edges only**, batched at 16 (`wemg/reasoning/generator.py:31` parity).
+  - `triple_pruner` role on **newly proposed edges only**, batched at 16 (`coe/reasoning/generator.py:31` parity).
   - Merges validated edges into an independent copy of `current_graph` → `updated_graph`.
   - Collapses duplicate nodes by QID (parity with `_GraphStore.merge_same_qid_nodes()`).
 - **`textualize_graph`**: Serializes newly validated edges as `"Subject: X | Relation: Y | Object: Z"` strings; appends to `consolidated_memory`.
@@ -318,7 +318,7 @@ See §3.5.
 
 ## 7. CoTGraph (Phase 2)
 
-Replaces legacy `cot_search` while-loop (`wemg/reasoning/cot.py`) with explicit nodes and native fan-out.
+Replaces legacy `cot_search` while-loop (`coe/reasoning/cot.py`) with explicit nodes and native fan-out.
 
 ### 7.1 Reducer pattern (`Clear` marker)
 
@@ -415,7 +415,7 @@ graph TD
 
   All three append into `retrieved_raw_context` via `append_or_clear`. KG also appends structured triples into `retrieved_raw_triples`.
 
-  **No LLM call inside `corpus_join`.** The `subquestion_generator` prompt already enforces retrieval-ready phrasing, rank verification, and temporal grounding; the `query_generator` role wemg used here has been dropped from the port (see §3.6). If alias fallbacks turn out to matter empirically, prefer a cheap heuristic expansion (subquestion + top entity labels from `entity_dict`) before re-introducing an LLM step.
+  **No LLM call inside `corpus_join`.** The `subquestion_generator` prompt already enforces retrieval-ready phrasing, rank verification, and temporal grounding; the `query_generator` role coe used here has been dropped from the port (see §3.6). If alias fallbacks turn out to matter empirically, prefer a cheap heuristic expansion (subquestion + top entity labels from `entity_dict`) before re-introducing an LLM step.
 
 - **`rerank`**: Waits for all fan-outs (LangGraph synchronization barrier). Scores joined `retrieved_raw_context` against `subquestions` via reranker endpoint. Trims to top-k → `reranked_context`.
 
@@ -427,7 +427,7 @@ graph TD
 
   **Fallback.** If EXTRACTOR returns no facts (e.g. structured-output parse failure), the node falls back to the raw `reranked_context` so `gen_subanswers` still has evidence to ground on. Silent evidence loss is unacceptable.
 
-  **Cost.** +1 light-tier LLM call per CoT iteration in the common case (one batch); +N when reranked top-k overflows the char budget. Cheaper than wemg's per-document extraction (which scaled as `subqs × branches × docs`) at the cost of slightly coarser per-document relevance — the reranker compensates.
+  **Cost.** +1 light-tier LLM call per CoT iteration in the common case (one batch); +N when reranked top-k overflows the char budget. Cheaper than coe's per-document extraction (which scaled as `subqs × branches × docs`) at the cost of slightly coarser per-document relevance — the reranker compensates.
 
 - **`gen_subanswers`**: `answer_generator` role per `(subquestion, extracted_facts)`, parallel via `asyncio.gather`. The `context` field receives the joined output of `extract_relevant` (or the raw rerank passages if extraction yielded nothing). Populates `current_subanswers`.
 - **`mem_update`**: Invokes compiled `MemoryUpdateGraph` with `current_subanswers` → `new_text_items` and `retrieved_raw_triples` → `new_raw_triples`. Merges results back into `text_memory`, `graph_memory`, `entity_dict`.
@@ -451,11 +451,11 @@ graph TD
 
 ## 8. MCTSGraph (Phase 3)
 
-Stores the search tree as a dict in state. Integrates compiled `CoTGraph` as the rollout subgraph with **shared memory** semantics (wemg parity — rollouts mutate parent's `text_memory` / `graph_memory` / `entity_dict` directly).
+Stores the search tree as a dict in state. Integrates compiled `CoTGraph` as the rollout subgraph with **shared memory** semantics (coe parity — rollouts mutate parent's `text_memory` / `graph_memory` / `entity_dict` directly).
 
 ### 8.1 Node types and priors
 
-True wemg parity — only the node types wemg's MCTS strategy map ([wemg/reasoning/mcts.py:64-66](../wemg/reasoning/mcts.py#L64)) actually generates. `SUB_QA_BATCH_NODE` is CoT-only; `REPHRASED_QUESTION_NODE` and `SYNTHESIS_NODE` exist in wemg's enum but have no MCTS generator — port omits them.
+True coe parity — only the node types coe's MCTS strategy map ([coe/reasoning/mcts.py:64-66](../coe/reasoning/mcts.py#L64)) actually generates. `SUB_QA_BATCH_NODE` is CoT-only; `REPHRASED_QUESTION_NODE` and `SYNTHESIS_NODE` exist in coe's enum but have no MCTS generator — port omits them.
 
 ```python
 from enum import Enum
@@ -473,7 +473,7 @@ NODE_TYPE_PRIOR: dict[MCTSNodeType, float] = {
 }
 ```
 
-Values port from legacy `_NODE_TYPE_PRIOR` ([wemg/reasoning/mcts.py:27-34](../wemg/reasoning/mcts.py#L27)); tune during Phase 3.
+Values port from legacy `_NODE_TYPE_PRIOR` ([coe/reasoning/mcts.py:27-34](../coe/reasoning/mcts.py#L27)); tune during Phase 3.
 
 ### 8.2 State
 
@@ -547,9 +547,9 @@ graph TD
     synthesize --> END((END))
 ```
 
-- **`select`**: Traverses `tree` from `root_id` using pUCT — `Q(s,a) + c·P(s,a)·√N(parent)/(1 + N(child))`, port of `wemg/reasoning/nodes.py:243-265`. Stops at unvisited leaf. Updates `current_path`.
+- **`select`**: Traverses `tree` from `root_id` using pUCT — `Q(s,a) + c·P(s,a)·√N(parent)/(1 + N(child))`, port of `coe/reasoning/nodes.py:243-265`. Stops at unvisited leaf. Updates `current_path`.
 
-- **`expand`**: Dispatches by leaf's `node_type` into parallel generators via `Send`. Strategy map mirrors [wemg/reasoning/mcts.py:64-66](../wemg/reasoning/mcts.py#L64):
+- **`expand`**: Dispatches by leaf's `node_type` into parallel generators via `Send`. Strategy map mirrors [coe/reasoning/mcts.py:64-66](../coe/reasoning/mcts.py#L64):
 
   | Parent type | Generators run in parallel | Children emitted |
   |---|---|---|
@@ -588,11 +588,11 @@ graph TD
 
   Nodes are attached as a linear chain from `expanded_node_id`. If CoT terminated with a final answer, append one `FINAL_ANSWER` node at the tail (carrying `final_state["final_answer"]`). The terminal node's `node_id` becomes the path target for `evaluate`.
 
-  **Cost note:** Each rollout step now invokes the full CoTGraph iteration (retrieval fan-out + rerank + `extract_relevant` + memory_update), which is heavier than wemg's `_generate_subqa_nodes`-only rollout. Recommended default `max_simulation_depth = 3` (down from wemg's 5) to keep total per-evaluate cost in a similar envelope. The extractor adds one light-tier LLM call per rollout iteration in the common case (more only when the reranked top-k overflows `cfg.memory.extractor_max_input_chars`). The upside: each rollout step is a real reasoning trajectory grounded on atomic facts, not a random-child walk — stronger evidence for the verifier reward.
+  **Cost note:** Each rollout step now invokes the full CoTGraph iteration (retrieval fan-out + rerank + `extract_relevant` + memory_update), which is heavier than coe's `_generate_subqa_nodes`-only rollout. Recommended default `max_simulation_depth = 3` (down from coe's 5) to keep total per-evaluate cost in a similar envelope. The extractor adds one light-tier LLM call per rollout iteration in the common case (more only when the reranked top-k overflows `cfg.memory.extractor_max_input_chars`). The upside: each rollout step is a real reasoning trajectory grounded on atomic facts, not a random-child walk — stronger evidence for the verifier reward.
 
-  **Note on the BATCH-to-SUB_QA concat:** wemg's MCTS expand never produces `SUB_QA_BATCH_NODE`, so importing CoT-shaped batches as-is would create an asymmetry between expand-produced and rollout-imported tree nodes. The concat adapter resolves this — `SUB_QA`'s validator only requires `sub_question` and `sub_answer` to be strings; multi-Q concatenations pass cleanly. Trajectory rendering preserves per-pair structure via the `Sub Q{i}` / `Sub A{i}` numbering.
+  **Note on the BATCH-to-SUB_QA concat:** coe's MCTS expand never produces `SUB_QA_BATCH_NODE`, so importing CoT-shaped batches as-is would create an asymmetry between expand-produced and rollout-imported tree nodes. The concat adapter resolves this — `SUB_QA`'s validator only requires `sub_question` and `sub_answer` to be strings; multi-Q concatenations pass cleanly. Trajectory rendering preserves per-pair structure via the `Sub Q{i}` / `Sub A{i}` numbering.
 
-- **`evaluate`**: Three parallel `verifier` calls (wemg parity, `wemg/reasoning/mcts.py:189-243`):
+- **`evaluate`**: Three parallel `verifier` calls (coe parity, `coe/reasoning/mcts.py:189-243`):
 
   1. **No-context view** — verifier with question + answer only.
   2. **Text-memory view** — verifier with formatted `text_memory`.
@@ -611,7 +611,7 @@ graph TD
 
   **No extractor pass here either.** All three input sources are model-generated text (subanswers from `gen_subqa` / rollout subanswers, verifier critiques) — already atomic and self-contained by construction. The rollout text was distilled by CoTGraph's `extract_relevant` before becoming a subanswer, so passing it through another EXTRACTOR call would be redundant. Memory consolidation inside `MemoryUpdateGraph` (Phase 1) is sufficient at this boundary.
 
-- **`route`** (conditional edge): Port wemg's early-termination knobs from `wemg/reasoning/mcts.py:352-361`:
+- **`route`** (conditional edge): Port coe's early-termination knobs from `coe/reasoning/mcts.py:352-361`:
 
   | Condition | Action |
   |---|---|
@@ -655,7 +655,7 @@ async def answer(question: str, config: LangGraphCoeConfig) -> AnswerResult:
     return AnswerResult.from_state(result)
 ```
 
-Strategy switch (`mcts` vs `cot`) preserves wemg's `config.search.strategy` knob. Batch entry preserved via `answer_batch()` (ThreadPoolExecutor over independent `answer()` calls).
+Strategy switch (`mcts` vs `cot`) preserves coe's `config.search.strategy` knob. Batch entry preserved via `answer_batch()` (ThreadPoolExecutor over independent `answer()` calls).
 
 ---
 

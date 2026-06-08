@@ -107,12 +107,12 @@ def _random_id(n: int = 10) -> str:
 def default_user_agent() -> str:
     """Wikimedia-compliant UA (https://w.wiki/4wJS): project id + contact, not ``bot/``."""
     override = os.environ.get("WIKIDATA_USER_AGENT") or os.environ.get(
-        "WEMG_USER_AGENT"
+        "COE_USER_AGENT"
     )
     if override:
         return override.strip()
     contact = os.environ.get("WIKIDATA_CONTACT", "contact/hieum@uoregon.edu").strip()
-    return f"WEMG/0.2.0.{_random_id()} (langgraph_coe; {contact}) python-httpx"
+    return f"COE/0.2.0.{_random_id()} (langgraph_coe; {contact}) python-httpx"
 
 
 DEFAULT_USER_AGENT = default_user_agent()

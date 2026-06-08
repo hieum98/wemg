@@ -15,8 +15,8 @@ and `langgraph_coe/config.yaml` under `cache`.
 
 ## Prerequisites
 
-- Python env with `redis` installed (`uv` project venv or conda `wemg`).
-- `redis-server` binary (bundled in conda `wemg`, or system package).
+- Python env with `redis` installed (`uv` project venv or conda `coe`).
+- `redis-server` binary (bundled in conda `coe`, or system package).
 - For web cache hits during eval: `SERPER_API_KEY` in `.env` or `web_search.api_key` (optional; DuckDuckGo fallback if unset).
 
 Redis **password auth** is not configured in `CacheRedisConfig` today — use host/port on a trusted network or extend `langgraph_coe/config.py` if you need it.
@@ -25,12 +25,12 @@ Redis **password auth** is not configured in `CacheRedisConfig` today — use ho
 
 ## 1. Install and start Redis
 
-### Local dev (conda `wemg`)
+### Local dev (conda `coe`)
 
 ```bash
-conda activate wemg
-mkdir -p /tmp/redis-wemg-test
-redis-server --daemonize yes --port 6379 --dir /tmp/redis-wemg-test --save ""
+conda activate coe
+mkdir -p /tmp/redis-coe-test
+redis-server --daemonize yes --port 6379 --dir /tmp/redis-coe-test --save ""
 redis-cli -p 6379 ping   # expect PONG
 ```
 

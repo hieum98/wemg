@@ -1,6 +1,6 @@
-"""Example usage of WEMG Question Answering System.
+"""Example usage of COE Question Answering System.
 
-This file demonstrates various ways to use WEMG for answering questions.
+This file demonstrates various ways to use COE for answering questions.
 """
 
 import os
@@ -13,7 +13,7 @@ from pathlib import Path
 
 def example_basic_usage():
     """Basic usage with default configuration."""
-    from wemg import answer_question
+    from coe import answer_question
     
     question = "What is the capital of France?"
     answer = answer_question(question)
@@ -22,11 +22,11 @@ def example_basic_usage():
 
 
 def example_with_system_class():
-    """Using WEMGSystem class for more control."""
-    from wemg import WEMGSystem
+    """Using COESystem class for more control."""
+    from coe import COESystem
     
     # Create system with default config
-    system = WEMGSystem()
+    system = COESystem()
     
     # Ask multiple questions with the same system instance
     questions = [
@@ -48,7 +48,7 @@ def example_with_system_class():
 
 def example_with_config_overrides():
     """Using configuration overrides."""
-    from wemg import WEMGSystem
+    from coe import COESystem
     
     # Override specific configuration values
     overrides = [
@@ -58,7 +58,7 @@ def example_with_config_overrides():
         "search.cot.max_depth=5",
     ]
     
-    system = WEMGSystem(config_overrides=overrides)
+    system = COESystem(config_overrides=overrides)
     
     try:
         result = system.answer("Explain quantum entanglement in simple terms.")
@@ -69,7 +69,7 @@ def example_with_config_overrides():
 
 def example_with_dict_config():
     """Using dictionary configuration."""
-    from wemg import WEMGSystem
+    from coe import COESystem
     
     # Create configuration from dictionary
     config = {
@@ -92,7 +92,7 @@ def example_with_dict_config():
         }
     }
     
-    system = WEMGSystem(config_dict=config)
+    system = COESystem(config_dict=config)
     
     try:
         result = system.answer("What are the main causes of climate change?")
@@ -104,7 +104,7 @@ def example_with_dict_config():
 
 def example_with_mcts():
     """Using MCTS search strategy."""
-    from wemg import WEMGSystem
+    from coe import COESystem
     
     config = {
         "search": {
@@ -117,7 +117,7 @@ def example_with_mcts():
         }
     }
     
-    system = WEMGSystem(config_dict=config)
+    system = COESystem(config_dict=config)
     
     try:
         result = system.answer("What is the relationship between Einstein and Newton's work?")
@@ -129,7 +129,7 @@ def example_with_mcts():
 
 def example_batch_processing():
     """Process multiple questions efficiently."""
-    from wemg import answer_questions_batch
+    from coe import answer_questions_batch
     
     questions = [
         "What is artificial intelligence?",
@@ -146,13 +146,13 @@ def example_batch_processing():
 
 def example_custom_config_file():
     """Using a custom configuration file."""
-    from wemg import WEMGSystem
+    from coe import COESystem
     
     # Create a custom config file path
     custom_config_path = Path(__file__).parent / "custom_config.yaml"
     
     if custom_config_path.exists():
-        system = WEMGSystem(config_path=custom_config_path)
+        system = COESystem(config_path=custom_config_path)
         
         try:
             result = system.answer("What is deep learning?")
@@ -161,12 +161,12 @@ def example_custom_config_file():
             system.close()
     else:
         print(f"Custom config not found at: {custom_config_path}")
-        print("Please create a custom_config.yaml file based on wemg/config.yaml")
+        print("Please create a custom_config.yaml file based on coe/config.yaml")
 
 
 def example_with_corpus_retriever():
     """Using corpus-based retriever (requires corpus setup)."""
-    from wemg import WEMGSystem
+    from coe import COESystem
     
     config = {
         "retriever": {
@@ -185,7 +185,7 @@ def example_with_corpus_retriever():
     
     # Only run if corpus paths are properly configured
     if config["retriever"]["corpus"]["corpus_path"] != "/path/to/your/corpus":
-        system = WEMGSystem(config_dict=config)
+        system = COESystem(config_dict=config)
         try:
             result = system.answer("Your domain-specific question")
             print(f"Answer: {result.answer}")
@@ -198,7 +198,7 @@ def example_with_corpus_retriever():
 def main():
     """Run all examples."""
     print("=" * 60)
-    print("WEMG Usage Examples")
+    print("COE Usage Examples")
     print("=" * 60)
     
     # Check for API key
@@ -210,7 +210,7 @@ def main():
         # Print example code without executing
         examples = [
             ("Basic Usage", example_basic_usage),
-            ("WEMGSystem Class", example_with_system_class),
+            ("COESystem Class", example_with_system_class),
             ("Config Overrides", example_with_config_overrides),
             ("Dictionary Config", example_with_dict_config),
             ("MCTS Strategy", example_with_mcts),
@@ -228,7 +228,7 @@ def main():
     # Run examples
     examples = [
         ("Basic Usage", example_basic_usage),
-        ("WEMGSystem Class", example_with_system_class),
+        ("COESystem Class", example_with_system_class),
         ("Config Overrides", example_with_config_overrides),
         ("Dictionary Config", example_with_dict_config),
         ("MCTS Strategy", example_with_mcts),

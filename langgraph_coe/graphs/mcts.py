@@ -1,7 +1,7 @@
 """MCTSGraph (Phase 3).
 
 Monte Carlo Tree Search with CoT rollouts and shared text↔graph memory. Ports
-``wemg/reasoning/mcts.py`` onto LangGraph, storing the search tree as a dict in
+``coe/reasoning/mcts.py`` onto LangGraph, storing the search tree as a dict in
 state (``Annotated[Dict, dict_merge]``). See ``implementation_plan.md`` §8.
 
 Flow (one iteration = one superstep cycle)::
@@ -19,7 +19,7 @@ Flow (one iteration = one superstep cycle)::
 
 Cross-iteration memory (``text_memory`` / ``graph_memory`` / ``entity_dict``)
 is plain LastValue and is passed **by reference** into the rollout CoTGraph so
-rollouts mutate the parent's memory directly (wemg parity). Only ``mem_update``
+rollouts mutate the parent's memory directly (coe parity). Only ``mem_update``
 replaces those channels with the consolidated result.
 """
 
@@ -68,7 +68,7 @@ class MCTSNodeType(str, Enum):
     FINAL_ANSWER = "final_answer"  # terminal
 
 
-# Ports legacy ``_NODE_TYPE_PRIOR`` (wemg/reasoning/mcts.py:27). USER_QUESTION
+# Ports legacy ``_NODE_TYPE_PRIOR`` (coe/reasoning/mcts.py:27). USER_QUESTION
 # (root) has no prior — it is never a UCB candidate.
 NODE_TYPE_PRIOR: Dict[MCTSNodeType, float] = {
     MCTSNodeType.SUB_QA: 0.60,
@@ -427,7 +427,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
         # Rollout through the compiled CoTGraph. text_memory / graph_memory /
         # entity_dict are passed BY REFERENCE so the rollout mutates the parent's
-        # shared memory (wemg parity).
+        # shared memory (coe parity).
         cot_out = await cot_graph.ainvoke(
             {
                 "question": state.get("question", ""),
@@ -552,7 +552,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                 f"Verifier (text memory): {r2.reasoning}",
                 f"Verifier (graph memory): {r3.reasoning}",
             ]
-        except Exception as e:  # noqa: BLE001 — neutral reward on parse failure (wemg parity)
+        except Exception as e:  # noqa: BLE001 — neutral reward on parse failure (coe parity)
             logger.warning("Verifier reward computation failed; reward=0.0: %s", e)
             reward, critiques = 0.0, []
 
