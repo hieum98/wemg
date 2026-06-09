@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import get_args, get_origin
 
-
 # Phase 0 introduces these symbols; tests will fail to collect until they exist.
 # Import at module top-level so collection failure pinpoints the gap.
 from langgraph_coe import roles as roles_mod

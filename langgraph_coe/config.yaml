@@ -102,7 +102,7 @@ llm:
     named_entity_recognition: classify
     question_rephraser: classify
     web_researcher: medium
-    extractor: medium
+    extractor: heavy
     kg_ner_agent: light
     kg_triple_search_agent: medium
 
@@ -123,7 +123,7 @@ wikidata:
   triple_cache_max_entries: 5000
   max_hops: 1
   # Leave null so integration tests exercise Wikidata-only paths (Stage A rerank skipped).
-  reranker_url: http://n0997:30000/v1
+  reranker_url: http://n0164:30000/v1
   reranker_model: Qwen3-Reranker-4B
   # Task instruction (Qwen3-Reranker ``instruct`` field) for Stage-A triple
   # pruning. Without it the reranker saturates (~0.998 flat scores) on short,
@@ -143,7 +143,7 @@ web_search:
 
 retriever:
   corpus:
-    index_path: /home/hieum/uonlp/coe/retriever_corpora/Qwen3-4B-Emb-index.faiss
+    index_path: /gpfs/projects/uonlp/hieum/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss
     search_k: 10
     corpus_path: Hieuman/wiki23-processed
     corpus_split: train
@@ -156,7 +156,7 @@ retriever:
 reranker:
   enabled: true
   model_name: Qwen3-Reranker-4B
-  url: http://n0997:30000/v1
+  url: http://n0164:30000/v1
   api_key: EMPTY
   top_k: 5
   instruction: "Given a web search query, retrieve relevant passages that answer the query."

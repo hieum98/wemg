@@ -1,7 +1,7 @@
 """Shared fixtures for langgraph_coe tests.
 
 Selectively reuses the FakeWikidataBackend / mini-graph infrastructure already
-in ``tests/wikidata/`` to avoid duplication. New, langgraph-specific fixtures
+in ``coe/tests/wikidata/`` to avoid duplication. New, langgraph-specific fixtures
 live here.
 """
 
@@ -13,9 +13,9 @@ from typing import Any
 
 import pytest
 
-# Make ``tests.wikidata.*`` importable when this conftest is loaded as part of
-# ``langgraph_coe/tests``. pyproject testpaths includes both trees, but the
-# ``tests/`` package only appears on sys.path once pytest discovers it; reading
+# Make ``coe.tests.wikidata.*`` importable when this conftest is loaded as part
+# of ``langgraph_coe/tests``. pyproject testpaths includes both trees, but the
+# ``coe`` package only appears on sys.path once pytest discovers it; reading
 # from it directly inside this conftest needs the repo root.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -25,7 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
 def pytest_configure(config) -> None:
     """Register the custom markers these suites use.
 
-    Mirrors the root ``tests/conftest.py`` so the markers are also known when the
+    Mirrors the ``coe/tests/conftest.py`` so the markers are also known when the
     suite is run on its own (``pytest langgraph_coe/tests``) — that sibling
     conftest is not loaded in that case, which otherwise raises
     ``PytestUnknownMarkWarning``.
@@ -49,7 +49,7 @@ def config():
 
 @pytest.fixture
 def fake_redis():
-    """Synchronous in-process Redis emulator. Matches ``tests/wikidata/conftest.py``."""
+    """Synchronous in-process Redis emulator. Matches ``coe/tests/wikidata/conftest.py``."""
     fakeredis = pytest.importorskip("fakeredis")
     return fakeredis.FakeStrictRedis(decode_responses=False)
 
@@ -68,15 +68,15 @@ def fake_redis_factory():
 @pytest.fixture
 def mini_backend():
     """Pre-populated ``FakeWikidataBackend`` (Berlin/Germany/Paris/France/...)."""
-    from tests.wikidata._fixtures import build_mini_graph
-    from tests.wikidata.fake_backend import FakeWikidataBackend
+    from coe.tests.wikidata._fixtures import build_mini_graph
+    from coe.tests.wikidata.fake_backend import FakeWikidataBackend
 
     return build_mini_graph(FakeWikidataBackend())
 
 
 @pytest.fixture
 def empty_backend():
-    from tests.wikidata.fake_backend import FakeWikidataBackend
+    from coe.tests.wikidata.fake_backend import FakeWikidataBackend
 
     return FakeWikidataBackend()
 

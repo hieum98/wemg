@@ -5,18 +5,18 @@ import logging
 from contextvars import ContextVar
 from typing import Any, Dict, List
 
+from langchain.agents import create_agent
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langchain.agents import create_agent
 from typing_extensions import Annotated, TypedDict
 
-from ._reasoning_middleware import strip_reasoning_middleware
 from ..config import WebSearchConfig
 from ..llm import RoleModelRegistry
 from ..roles import WEB_RESEARCHER
 from ..tools.web import web_search
+from ._reasoning_middleware import strip_reasoning_middleware
 
 logger = logging.getLogger(__name__)
 

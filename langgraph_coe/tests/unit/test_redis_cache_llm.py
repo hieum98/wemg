@@ -153,9 +153,9 @@ async def test_llm_cache_hit_skips_second_model_call(fresh_global_cache):
     against the cached path must NOT call the underlying chat model.
     """
     pytest.importorskip("langchain_community.cache")
+    import fakeredis
     from langchain_community.cache import RedisCache
     from langchain_core.language_models.fake_chat_models import FakeListChatModel
-    import fakeredis
 
     redis_client = fakeredis.FakeStrictRedis(decode_responses=False)
     set_llm_cache(RedisCache(redis_=redis_client))

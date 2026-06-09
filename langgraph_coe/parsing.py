@@ -192,19 +192,6 @@ def _convert_value(value: Any, vtype: str) -> Any:
     raise ValueError(f"Could not convert value '{value}' to type '{vtype}'")
 
 
-def _get_default_value(vtype: str) -> Any:
-    defaults = {
-        "str": "",
-        "Literal": "",
-        "bool": False,
-        "int": 0,
-        "float": 0,
-        "list": [],
-        "List": [],
-    }
-    return defaults.get(vtype)
-
-
 def _extract_field_with_regex(
     text: str, key: str, vtype: str, *, optional: bool = False
 ) -> Any:

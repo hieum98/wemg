@@ -23,7 +23,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.tools import tool
 from langchain_openai import OpenAIEmbeddings
 
-from ..config import EmbedderConfig, RerankerConfig, RetrieverConfig, CorpusConfig
+from ..config import CorpusConfig, EmbedderConfig, RerankerConfig, RetrieverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +235,8 @@ def _load_raw_faiss_corpus(
     index_path: str, embeddings: Any, corpus_cfg: CorpusConfig
 ) -> FAISS:
     """Wrap a bare HF-datasets FAISS index in a LangChain store via a side corpus."""
-    import faiss  # local import: only needed for the raw-index layout
     import datasets
+    import faiss  # local import: only needed for the raw-index layout
 
     dataset_ref = corpus_cfg.resolved_corpus_source()
     if not dataset_ref:

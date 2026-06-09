@@ -27,12 +27,12 @@ from typing import Any, Dict, List, Optional, Set
 import httpx
 from langchain_core.tools import tool
 
+from ..config import WikidataConfig
 from .wikidata_client import (
     WikidataClient,
     WikidataEntity,
     WikiTriple,
 )
-from ..config import WikidataConfig
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +87,6 @@ def _get_session() -> _SessionState:
         s = _SessionState()
         _cv_session.set(s)
     return s
-
-
-def _get_visited() -> Set[str]:
-    return _get_session().visited
 
 
 def init_wikidata(config: WikidataConfig, *, cache: Any = None) -> None:
@@ -197,8 +193,8 @@ async def _stage_b_prune(
     if not triples or registry is None:
         return triples
 
-    from ..roles import TriplePruneInput, TRIPLE_PRUNER
     from ..llm import execute_role_lc
+    from ..roles import TRIPLE_PRUNER, TriplePruneInput
 
     chunks = [
         triples[i : i + _PRUNE_BATCH_SIZE]

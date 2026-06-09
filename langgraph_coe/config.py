@@ -214,7 +214,7 @@ class CorpusConfig(BaseModel):
     embedder: EmbedderConfig = Field(default_factory=EmbedderConfig)
     # LangChain bundle (<name>.faiss + <name>.pkl) or raw HF-datasets index.
     index_path: str = (
-        "/home/hieum/uonlp/coe/retriever_corpora/Qwen3-4B-Emb-index.faiss"
+        "/gpfs/projects/uonlp/hieum/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss"
     )
     search_k: int = 10  # FAISS fetch depth before optional rerank / caller top_k cap
     # HF hub id or local ``load_from_disk`` path (same field name as legacy ``coe``).

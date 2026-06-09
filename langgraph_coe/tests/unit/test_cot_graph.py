@@ -851,8 +851,9 @@ async def test_extractor_splits_oversized_contexts_into_multiple_batches(monkeyp
     cfg.reranker.top_k = 5
     cfg.memory.extractor_max_input_chars = 6_000  # forces 1 ctx per batch
 
-    from langgraph_coe.llm import RoleModelRegistry
     from unittest.mock import MagicMock
+
+    from langgraph_coe.llm import RoleModelRegistry
 
     registry = RoleModelRegistry(cfg.llm)
     registry.get_model = lambda _role_name: MagicMock()  # type: ignore[assignment]

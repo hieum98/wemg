@@ -191,7 +191,9 @@ def _as_int(value: Any) -> Optional[int]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    logging.basicConfig(level=logging.INFO)
+    from langgraph_coe.logging_config import configure_logging
+
+    configure_logging()
     parser = argparse.ArgumentParser(
         description="Run langgraph_coe on a dataset and write metrics (JSONL log + metrics.json).",
     )

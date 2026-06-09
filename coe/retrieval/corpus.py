@@ -75,6 +75,19 @@ class CorpusRetriever:
         if self.index_path and Path(self.index_path).exists():
             corpus.load_faiss_index("embeddings", self.index_path)
         else:
+            if self.index_path:
+                logger.warning(
+                    "FAISS index not found at %s; rebuilding embeddings for the "
+                    "entire corpus over the embedding API. This is slow (hours for "
+                    "large corpora). Point retriever.corpus.index_path at a prebuilt "
+                    "index to avoid this.",
+                    self.index_path,
+                )
+            else:
+                logger.warning(
+                    "No retriever.corpus.index_path configured; building FAISS index "
+                    "from scratch over the embedding API (slow for large corpora)."
+                )
             corpus = self._build_index(corpus)
 
         return corpus

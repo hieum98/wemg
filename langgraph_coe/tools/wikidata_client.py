@@ -82,16 +82,6 @@ class WikidataEntity(pydantic.BaseModel):
         base = self.label or self.qid
         return f"{base} ({self.description})" if self.description else base
 
-    def to_context(self, include_wiki_page: bool = False) -> str:
-        parts = [self.label or self.qid]
-        if self.description:
-            parts.append(f"Description: {self.description}")
-        if self.aliases:
-            parts.append(f"Also known as: {', '.join(self.aliases)}")
-        if include_wiki_page and self.wikipedia_content:
-            parts.append(f"Wikipedia: {self.wikipedia_content[:500]}")
-        return "\n".join(parts)
-
 
 class WikidataProperty(pydantic.BaseModel):
     pid: str

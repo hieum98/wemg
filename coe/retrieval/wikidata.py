@@ -263,7 +263,21 @@ class WikidataPathBetweenEntities(pydantic.BaseModel):
 WIKIDATA_SPARQL_ENDPOINT = "http://n0162:1234/api/endpoint/sparql"
 # Wikibase REST item search (v1). wikibase-rest-api-client's search_item still targets removed v0 / wrong rewrite.
 WIKIDATA_REST_SEARCH_ITEMS_URL = "https://www.wikidata.org/w/rest.php/wikibase/v1/search/items"
+# Public MediaWiki API for entity/property text search. The local QEndpoint (a bare
+# HDT/RDF4J SPARQL store) cannot serve `SERVICE wikibase:mwapi`, so full-text entity
+# search must go to the public API; only k-hop `wdt:` traversals hit QEndpoint.
+WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 REST_SEARCH_TIMEOUT_S = 60
+# Public WDQS auto-injects standard prefixes; the local QEndpoint (RDF4J/HDT) does not,
+# so every query must declare them or QEndpoint returns 400 QueryBadFormed. Prepended
+# centrally in `_sparql_query` so individual query strings can stay prefix-free.
+SPARQL_PREFIXES = (
+    "PREFIX wd: <http://www.wikidata.org/entity/>\n"
+    "PREFIX wdt: <http://www.wikidata.org/prop/direct/>\n"
+    "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
+    "PREFIX skos: <http://www.w3.org/2004/02/skos/core#>\n"
+    "PREFIX schema: <http://schema.org/>\n"
+)
 random_str = lambda n: "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=5)) # for user agent uniqueness to help with Wikidata rate limits (this is just a best effort and does not guarantee avoiding rate limits, but can help a bit by making it less likely to be identified as a single client across multiple runs)
 USER_AGENT = f"COE/0.2.0.{os.uname().nodename}.{random_str(10)}"
 MAX_RETRIES = 3
@@ -518,7 +532,7 @@ class WikidataClient:
             )
             client.setMethod(POST)
             client.setTimeout(SPARQL_TIMEOUT_S)
-            client.setQuery(sparql)
+            client.setQuery(SPARQL_PREFIXES + sparql)
             for attempt in range(MAX_RETRIES):
                 _sparql_rate_limit(self._max_sparql_rps)
                 try:
@@ -950,6 +964,40 @@ class WikidataClient:
     # Entity search / retrieval
     # ------------------------------------------------------------------
 
+    def _wbsearchentities(
+        self, text: str, num_results: int, *, entity_type: str = "item"
+    ) -> List[str]:
+        """Full-text entity/property search via the public MediaWiki API.
+
+        Replaces the Blazegraph-only `SERVICE wikibase:mwapi` EntitySearch, which the
+        local QEndpoint cannot serve. Returns ranked QIDs/PIDs (search order preserved).
+        """
+        try:
+            resp = requests.get(
+                WIKIDATA_API_URL,
+                params={
+                    "action": "wbsearchentities",
+                    "search": text,
+                    "language": "en",
+                    "type": entity_type,
+                    "limit": num_results,
+                    "format": "json",
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=REST_SEARCH_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            logger.debug("Wikidata wbsearchentities (%s) failed: %s", entity_type, e)
+            return []
+
+        ids: List[str] = []
+        for item in payload.get("search", []) if isinstance(payload, dict) else []:
+            if isinstance(item, dict) and item.get("id"):
+                ids.append(item["id"])
+        return ids[:num_results]
+
     def _rest_v1_search_entities(self, text: str, num_results: int) -> List[WikidataEntity]:
         """Item search via Wikibase REST v1 JSON API."""
         try:
@@ -1003,31 +1051,12 @@ class WikidataClient:
         if found:
             return found
 
-        text_escaped = json.dumps(text)
-        sparql = f"""
-        SELECT ?entity ?ordinal WHERE {{
-          SERVICE wikibase:mwapi {{
-            bd:serviceParam wikibase:endpoint "www.wikidata.org" ;
-                            wikibase:api "EntitySearch" ;
-                            mwapi:search {text_escaped} ;
-                            mwapi:language "en" ;
-                            mwapi:type "item" ;
-                            mwapi:limit {num_results} .
-            ?entity wikibase:apiOutputItem mwapi:item .
-            ?ordinal wikibase:apiOrdinal true .
-          }}
-        }}
-        ORDER BY ASC(?ordinal)
-        """
-        bindings = self._sparql_query(sparql)
-        entities = []
-        for row in bindings:
-            uri = row.get("entity", {}).get("value", "")
-            qid = _extract_id_from_uri(uri)
-            if qid and qid.startswith("Q"):
-                entities.append(WikidataEntity(
-                    qid=qid, url=f"https://www.wikidata.org/wiki/{qid}",
-                ))
+        # Fallback via the public MediaWiki API (QEndpoint can't serve mwapi search).
+        entities = [
+            WikidataEntity(qid=qid, url=f"https://www.wikidata.org/wiki/{qid}")
+            for qid in self._wbsearchentities(text, num_results, entity_type="item")
+            if qid.startswith("Q")
+        ]
         return entities[:num_results]
 
     def _get_entity_by_qid(
@@ -1047,16 +1076,24 @@ class WikidataClient:
         for start in range(0, len(qids), BATCH_SIZE):
             batch = qids[start : start + BATCH_SIZE]
             values_clause = " ".join(f"wd:{q}" for q in batch)
+            # Explicit label/description/altLabel triples instead of the Blazegraph-only
+            # `SERVICE wikibase:label`, which the local QEndpoint rejects (400). altLabel
+            # is GROUP_CONCAT'd to one comma-joined row per entity, matching the prior
+            # service output consumed below.
             sparql = f"""
-            SELECT ?entity ?entityLabel ?entityDescription ?entityAltLabel ?article
+            SELECT ?entity ?entityLabel ?entityDescription
+                   (GROUP_CONCAT(DISTINCT ?alt; separator=", ") AS ?entityAltLabel) ?article
             WHERE {{
               VALUES ?entity {{ {values_clause} }}
               OPTIONAL {{
                 ?article schema:about ?entity ;
                          schema:isPartOf <https://en.wikipedia.org/> .
               }}
-              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
+              OPTIONAL {{ ?entity rdfs:label ?entityLabel . FILTER(LANG(?entityLabel) = "en") }}
+              OPTIONAL {{ ?entity schema:description ?entityDescription . FILTER(LANG(?entityDescription) = "en") }}
+              OPTIONAL {{ ?entity skos:altLabel ?alt . FILTER(LANG(?alt) = "en") }}
             }}
+            GROUP BY ?entity ?entityLabel ?entityDescription ?article
             """
             for row in self._sparql_query(sparql):
                 uri = row.get("entity", {}).get("value", "")
@@ -1182,10 +1219,14 @@ class WikidataClient:
         for start in range(0, len(to_fetch), BATCH_SIZE):
             batch = to_fetch[start : start + BATCH_SIZE]
             values_clause = " ".join(f"wd:{p}" for p in batch)
+            # Explicit triples instead of Blazegraph-only `SERVICE wikibase:label`
+            # (rejected by the local QEndpoint). Property entities carry rdfs:label /
+            # schema:description in the dump.
             sparql = f"""
             SELECT ?property ?propertyLabel ?propertyDescription WHERE {{
               VALUES ?property {{ {values_clause} }}
-              SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" . }}
+              OPTIONAL {{ ?property rdfs:label ?propertyLabel . FILTER(LANG(?propertyLabel) = "en") }}
+              OPTIONAL {{ ?property schema:description ?propertyDescription . FILTER(LANG(?propertyDescription) = "en") }}
             }}
             """
             for row in self._sparql_query(sparql):
@@ -1240,29 +1281,12 @@ class WikidataClient:
                     prop = WikidataProperty(pid=pid, label=label, description=desc)
                     results.append([prop])
             else:
-                text_escaped = json.dumps(q)
-                sparql = f"""
-                SELECT ?entity ?ordinal WHERE {{
-                  SERVICE wikibase:mwapi {{
-                    bd:serviceParam wikibase:endpoint "www.wikidata.org" ;
-                                    wikibase:api "EntitySearch" ;
-                                    mwapi:search {text_escaped} ;
-                                    mwapi:language "en" ;
-                                    mwapi:type "property" ;
-                                    mwapi:limit {num_results} .
-                    ?entity wikibase:apiOutputItem mwapi:item .
-                    ?ordinal wikibase:apiOrdinal true .
-                  }}
-                }}
-                ORDER BY ASC(?ordinal)
-                """
-                bindings = self._sparql_query(sparql)
-                pids_found = []
-                for row in bindings:
-                    uri = row.get("entity", {}).get("value", "")
-                    found_pid = _extract_id_from_uri(uri)
-                    if found_pid and found_pid.startswith("P"):
-                        pids_found.append(found_pid)
+                # Public MediaWiki API for property text search (QEndpoint can't serve mwapi).
+                pids_found = [
+                    pid
+                    for pid in self._wbsearchentities(q, num_results, entity_type="property")
+                    if pid.startswith("P")
+                ]
 
                 props: List[WikidataProperty] = []
                 if pids_found:

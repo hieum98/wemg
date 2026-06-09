@@ -44,12 +44,12 @@ retriever:
       api_key: null
       embedder_type: "openai"
     corpus_path: "Hieuman/wiki23-processed"
-    index_path: "/home/hieum/uonlp/coe/retriever_corpora/Qwen3-4B-Emb-index.faiss"
+    index_path: "/gpfs/projects/uonlp/hieum/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss"
 
 reranker:
   enabled: true
   model_name: "Qwen3-Reranker-4B"
-  url: "http://n0997:30000/v1"
+  url: "http://n0164:30000/v1"
   api_key: "EMPTY"
   instruction: "Given a web search query, retrieve relevant passages that answer the query."
   top_k: 10

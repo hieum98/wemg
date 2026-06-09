@@ -15,12 +15,10 @@ from typing import Any, Dict, List, Sequence, cast
 
 from langchain.agents import create_agent
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
-
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from ._reasoning_middleware import strip_reasoning_middleware
 from ..llm import RoleModelRegistry
 from ..roles import KG_TRIPLE_AGENT_SYSTEM, NEROutput
 from ..tools.wikidata import (
@@ -31,6 +29,7 @@ from ..tools.wikidata import (
     # node never calls it (session reset lives in system.py, not here).
     reset_wikidata_session,  # noqa: F401
 )
+from ._reasoning_middleware import strip_reasoning_middleware
 
 logger = logging.getLogger(__name__)
 

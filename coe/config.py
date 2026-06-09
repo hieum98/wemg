@@ -65,7 +65,7 @@ class EmbedderConfig(BaseModel):
 class CorpusConfig(BaseModel):
     embedder: EmbedderConfig = EmbedderConfig()
     corpus_path: str = "Hieuman/wiki23-processed"
-    index_path: str = "/home/hieum/uonlp/coe/retriever_corpora/Qwen3-4B-Emb-index.faiss"
+    index_path: str = "/gpfs/projects/uonlp/hieum/wemg/retriever_corpora/Qwen3-4B-Emb-index.faiss"
 
 
 class RetrieverConfig(BaseModel):

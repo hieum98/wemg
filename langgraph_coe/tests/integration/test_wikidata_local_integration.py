@@ -32,7 +32,6 @@ from langgraph_coe.tools.wikidata_client import WikidataClient, WikiTriple
 
 from .._fixtures import log_config_override
 
-
 SPARQL_URL = os.environ.get(
     "LANGGRAPH_TEST_SPARQL_URL",
     "http://127.0.0.1:30162/api/endpoint/sparql",

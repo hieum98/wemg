@@ -4,6 +4,22 @@ COE is a research-oriented question-answering system that combines graph retriev
 
 The central novelty of this research is memory management: a coordinated textual memory and graph memory that are continuously synchronized during reasoning.
 
+## Two implementations
+
+This repository ships **two** implementations of COE. They share the same research idea (graph–text memory coordination), the same reasoning strategies (MCTS and CoT), and the same evaluation interface and artifacts.
+
+| | `coe` (legacy) | `langgraph_coe` (recommended) |
+| --- | --- | --- |
+| Status | Original reference implementation | Newer, actively developed |
+| Engine | Hand-rolled async orchestration | Built on [LangGraph](https://github.com/langchain-ai/langgraph) |
+| Performance | Slower, less optimized | Faster, more optimized (tiered LLM roles, better batching/caching, reasoning middleware) |
+| Entry point | `python -m coe "<question>"` | `langgraph_coe.system.answer(...)` (async API) |
+| Evaluation | `python -m coe.evaluation.evaluate` | `python -m langgraph_coe.evaluation.evaluate` |
+
+Use **`langgraph_coe`** for new work and benchmarking. The `coe` package is kept as a slower reference and for backward compatibility.
+
+The two sections below ("Architecture", "Quick start", "Evaluation", etc.) describe the legacy `coe` package; see [The `langgraph_coe` implementation](#the-langgraph_coe-implementation-recommended) for the recommended one.
+
 ## Highlights
 
 COE is designed around graph-text memory coordination as the primary research contribution, not retrieval alone.
@@ -171,7 +187,60 @@ After changing it, run tests:
 conda run -n coe pytest tests/retrieval/test_wikidata.py
 ```
 
-## Evaluation
+## The `langgraph_coe` implementation (recommended)
+
+`langgraph_coe` is the faster, more optimized rebuild of COE on top of LangGraph. It implements the same MCTS and CoT strategies and emits the same evaluation artifacts as the legacy package, but with tiered LLM roles, improved batching/caching, and reasoning-aware middleware.
+
+Key modules:
+
+- `langgraph_coe/system.py`: top-level `answer()` / `answer_batch()` entry points and runtime init.
+- `langgraph_coe/graphs/`: compiled LangGraph strategies (`cot.py`, `mcts.py`) plus KG search, web research, and memory-update subgraphs.
+- `langgraph_coe/tools/`: Wikidata, retrieval, web search, and cache tools.
+- `langgraph_coe/config.py` + `config.yaml`: `LangGraphCoeConfig` schema and tiered LLM role configuration.
+- `langgraph_coe/evaluation/`: dataset evaluation CLI and runner.
+
+### Quick start
+
+The public API is async. Answer a single question:
+
+```python
+import asyncio
+from langgraph_coe.system import answer
+
+result = asyncio.run(answer("Who directed Inception?"))
+print(result.answer)
+```
+
+Answer many questions concurrently:
+
+```python
+import asyncio
+from langgraph_coe.system import answer_batch
+
+results = asyncio.run(answer_batch(["Q1", "Q2", "Q3"], max_workers=4))
+```
+
+### Configuration
+
+- Default config file: `langgraph_coe/config.yaml`
+- Schema: `langgraph_coe/config.py` (`LangGraphCoeConfig`)
+- LLM roles are organized into tiers (`heavy`, `medium`, `light`, `classify`); edit `llm.tiers.*` to change model, sampling, and thinking-budget settings per tier.
+- Sensitive values (`API_KEY` / `OPENAI_API_KEY`) are read from the repo-root `.env`.
+
+### Evaluation
+
+```bash
+conda run -n coe python -m langgraph_coe.evaluation.evaluate \
+  dataset_name_or_path=bamboogle \
+  output_path=results/lgc_bamboogle \
+  search.strategy=mcts
+```
+
+Accepts dotted `langgraph_coe` config overrides such as `search.strategy=cot`, `search.mcts.num_iterations=8`, `llm.tiers.heavy.api_base=http://n0152:30000/v1`, and `cache.enabled=true`. The resolved config is written to `<output_path>/config.yaml`, and the runner emits the same `evaluation_log.jsonl` / `metrics.json` / `summary.txt` files as the legacy system.
+
+See `langgraph_coe/evaluation/README.md` for full CLI options and artifact details.
+
+## Evaluation (legacy `coe`)
 
 Run evaluation:
 
@@ -202,7 +271,7 @@ See `tests/README.md` for markers and environment setup.
 ## Project layout
 
 ```text
-coe/
+coe/                  # legacy implementation
   config.py
   config.yaml
   system.py
@@ -211,6 +280,13 @@ coe/
   reasoning/
   evaluation/
   utils/
+langgraph_coe/        # recommended LangGraph implementation
+  config.py
+  config.yaml
+  system.py
+  graphs/
+  tools/
+  evaluation/
 tests/
 examples/
 retriever_corpora/

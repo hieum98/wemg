@@ -31,7 +31,6 @@ from langgraph_coe.llm import RoleModelRegistry
 from .._fixtures import log_config_override, override_tier_endpoint
 from .._servers import endpoint_alive as _endpoint_alive
 
-
 LLM_URL = os.environ.get("LANGGRAPH_TEST_LLM_URL", "http://localhost:30172/v1")
 LLM_MODEL = os.environ.get("LANGGRAPH_TEST_LLM_MODEL", "openai/Qwen/Qwen3-8B")
 EMBED_URL = os.environ.get("LANGGRAPH_TEST_EMBED_URL", "http://localhost:30164/v1")

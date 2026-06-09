@@ -5,15 +5,14 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import Runnable
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_litellm import ChatLiteLLM
 from pydantic import BaseModel
 
-from langchain_litellm import ChatLiteLLM
-
 from .config import LLMConfig
-from .roles import Role
 from .parsing import extract_info_from_text, extraction_type_from_annotation
+from .roles import Role
 from .thinking_budget import build_request_kwargs
 
 logger = logging.getLogger(__name__)

@@ -8,18 +8,18 @@ from typing import Any, Dict, List, Sequence
 import networkx as nx
 import redis
 from dotenv import load_dotenv
-from langchain_core.globals import set_llm_cache
 from langchain_community.cache import RedisCache
+from langchain_core.globals import set_llm_cache
 
 from .config import LangGraphCoeConfig
 from .graphs import build_cot_graph, build_mcts_graph
 from .graphs.mcts import MCTSNodeType
 from .graphs.web_research import set_web_research_config
 from .llm import RoleModelRegistry
+from .tools import web as web_tools
 from .tools.cache import RedisDictCache
 from .tools.retrieval import init_retrieval_pipeline
 from .tools.web import init_web_search, reset_web_research_session
-from .tools import web as web_tools
 from .tools.wikidata import init_wikidata, reset_wikidata_session
 
 # Preload fakeredis when available so test monkeypatching ``redis.Redis`` does

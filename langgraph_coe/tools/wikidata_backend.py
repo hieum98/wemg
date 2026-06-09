@@ -12,9 +12,9 @@ Endpoints used:
 from __future__ import annotations
 
 import logging
+import os
 import random
 import string
-import os
 from typing import Any, Optional, Protocol, TypedDict, runtime_checkable
 
 import httpx
@@ -106,9 +106,7 @@ def _random_id(n: int = 10) -> str:
 
 def default_user_agent() -> str:
     """Wikimedia-compliant UA (https://w.wiki/4wJS): project id + contact, not ``bot/``."""
-    override = os.environ.get("WIKIDATA_USER_AGENT") or os.environ.get(
-        "COE_USER_AGENT"
-    )
+    override = os.environ.get("WIKIDATA_USER_AGENT") or os.environ.get("COE_USER_AGENT")
     if override:
         return override.strip()
     contact = os.environ.get("WIKIDATA_CONTACT", "contact/hieum@uoregon.edu").strip()

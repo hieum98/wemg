@@ -86,7 +86,7 @@ class LLMClient:
         # Must pass the Python bool False explicitly to trigger the empty-think prefix.
         chat_template_kwargs: Dict[str, Any] = {"enable_thinking": bool(enable_thinking)}
 
-        return {
+        model_kwargs: Dict[str, Any] = {
             "model": self.model_name,
             "temperature": kwargs.get("temperature", self.temperature),
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
@@ -96,8 +96,6 @@ class LLMClient:
             "seed": kwargs.get("random_seed", self.random_seed),
             "response_format": response_format,
             "timeout": kwargs.get("timeout", self.timeout),
-            "logprobs": kwargs.get("logprobs", None),
-            "top_logprobs": kwargs.get("top_logprobs", None),
             "extra_body": {
                 "top_k": kwargs.get("top_k", self.top_k),
                 "min_p": kwargs.get("min_p", self.min_p),
@@ -105,6 +103,18 @@ class LLMClient:
                 "chat_template_kwargs": chat_template_kwargs,
             },
         }
+
+        # Only forward logprobs/top_logprobs when explicitly requested via kwargs.
+        # Newer SGLang servers validate ``logprobs`` as a strict boolean and reject
+        # a literal ``null`` in the request body, so never send it unset.
+        logprobs = kwargs.get("logprobs", None)
+        if logprobs is not None:
+            model_kwargs["logprobs"] = logprobs
+        top_logprobs = kwargs.get("top_logprobs", None)
+        if top_logprobs is not None:
+            model_kwargs["top_logprobs"] = top_logprobs
+
+        return model_kwargs
 
     def generate(
         self, index: int, messages: List[Dict[str, str]], **kwargs
