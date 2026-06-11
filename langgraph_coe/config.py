@@ -151,7 +151,7 @@ class MCTSConfig(BaseModel):
     # Floor on iterations before any early-termination condition (high-confidence,
     # semantic-sufficiency, convergence-patience) may fire. ``num_iterations``
     # always wins as the hard cap. Honored by ``route_after_iteration``.
-    min_iterations: int = 3
+    min_iterations: int = 5
     # Minimum tree depth (root = 0) before expand emits a FINAL_ANSWER child from
     # ``_gen_final``. Matches coe ``should_explore = depth < 2`` — skip synthesis
     # while memory is still shallow (legacy skipped retrieval there; we skip the
@@ -159,7 +159,7 @@ class MCTSConfig(BaseModel):
     final_answer_min_depth: int = 2
     high_confidence_threshold: float = 0.9
     convergence_patience: int = 5
-    semantic_sufficiency_count: int = 3
+    semantic_sufficiency_count: int = 5
     # LangGraph superstep budget for one MCTS run. Each iteration is ~7 supersteps
     # (select→expand→simulate→evaluate→backprop→mem_update→route); size with
     # headroom over ``num_iterations × 7``.

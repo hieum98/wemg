@@ -54,6 +54,11 @@ class MemoryUpdateState(TypedDict, total=False):
     # Inputs
     question: str
     new_text_items: List[str]
+    # Retrieval-grounded facts (e.g. EXTRACTOR output over reranked passages).
+    # Tagged ``[Retrieval]`` in consolidation so provenance-aware rules
+    # (conflict resolution, provenance audit) can prefer them over
+    # ``[System Prediction]`` items from ``new_text_items``.
+    new_retrieval_items: List[str]
     new_raw_triples: List[Any]
     current_text_memory: List[str]
     current_graph: nx.DiGraph
@@ -92,14 +97,35 @@ def _format_lines(items: Sequence[str]) -> str:
     return "\n".join(f"- {i.strip()}" for i in items if i and i.strip())
 
 
-def _format_raw_memory(items: Sequence[str]) -> str:
-    return _format_lines(
-        [_format_memory_item(item, SourceType.SYSTEM_PREDICTION) for item in items]
-    )
+_PROVENANCE_TAGS = ("[System Prediction]", "[Retrieval]")
+
+
+def _strip_provenance_tag(text: str) -> str:
+    stripped = (text or "").strip()
+    for tag in _PROVENANCE_TAGS:
+        if stripped.startswith(tag):
+            stripped = stripped[len(tag) :].lstrip(": ").strip()
+            break
+    return stripped
 
 
 def _consolidated_to_text(output: MemoryConsolidationOutput) -> List[str]:
-    return [item.content for item in output.consolidated_memory]
+    """Render consolidated items as provenance-tagged strings.
+
+    Tags must survive the round-trip into ``text_memory``: downstream prompts
+    (FINAL_ANSWER_SYNTHESIZER adjudication, the consolidator's own provenance
+    audit on later passes) key on ``[Retrieval]`` vs ``[System Prediction]``.
+    Dropping them here would silently demote all retrieval evidence.
+    """
+    items: List[str] = []
+    for item in output.consolidated_memory:
+        prov = (
+            SourceType.RETRIEVAL
+            if (item.provenance or "").strip().lower() == "retrieval"
+            else SourceType.SYSTEM_PREDICTION
+        )
+        items.append(_format_memory_item(_strip_provenance_tag(item.content), prov))
+    return items
 
 
 def _stringify_triple(rel: Relation) -> str:
@@ -316,11 +342,23 @@ def build_memory_update_graph(
     async def consolidate_pre(state: MemoryUpdateState) -> Dict[str, Any]:
         current = list(state.get("current_text_memory") or [])
         new_items = list(state.get("new_text_items") or [])
-        combined = current + new_items
-        if not combined:
+        new_retrieval = list(state.get("new_retrieval_items") or [])
+        if not (current or new_items or new_retrieval):
             return {"consolidated_memory": []}
 
-        raw_blob = _format_raw_memory(combined)
+        # ``current`` items already carry tags from a previous consolidation
+        # pass (``_format_memory_item`` passes pre-tagged strings through);
+        # untagged strings default to [System Prediction]. Retrieval-grounded
+        # facts are tagged [Retrieval] so the consolidator's provenance audit
+        # and conflict-resolution rules can anchor on them.
+        tagged = [
+            _format_memory_item(item, SourceType.SYSTEM_PREDICTION)
+            for item in current + new_items
+        ] + [
+            _format_memory_item(item, SourceType.RETRIEVAL) for item in new_retrieval
+        ]
+
+        raw_blob = _format_lines(tagged)
         inp = MemoryConsolidationInput(
             question=state.get("question", ""), memory=raw_blob
         )
@@ -337,8 +375,10 @@ def build_memory_update_graph(
             e for e in entity_dict.values() if isinstance(e, WikidataEntity)
         ]
 
+        # Strip provenance tags before extraction so "[Retrieval]" /
+        # "[System Prediction]" never leak into entity/relation surface forms.
         inp = OpenIEInput(
-            text="\n".join(consolidated),
+            text="\n".join(_strip_provenance_tag(c) for c in consolidated),
             known_entities=known_entities or None,
         )
         out, _ = await execute_role_lc(registry, OPEN_IE, inp)

@@ -219,6 +219,36 @@ async def rerank_context(
     return [items[idx] for idx, _ in ranked[:top_k]]
 
 
+async def rerank_per_query(
+    queries: Sequence[str],
+    contexts: Sequence[str],
+    top_k: int,
+    cfg: Optional[RerankerConfig],
+) -> List[str]:
+    """Rerank ``contexts`` against each query independently; union the top-k.
+
+    Reranking against a single concatenated multi-subquestion query lets
+    evidence for one subquestion crowd out the others inside one shared top-k
+    budget. Per-query reranking guarantees each subquestion keeps its own
+    ``top_k`` slots; the union is deduplicated preserving first-seen order.
+    """
+    qs = [q for q in queries if isinstance(q, str) and q.strip()]
+    if not qs:
+        return []
+    ranked_lists = await asyncio.gather(
+        *[rerank_context(q, contexts, top_k=top_k, cfg=cfg) for q in qs]
+    )
+    merged: List[str] = []
+    seen: set[str] = set()
+    for ranked in ranked_lists:
+        for ctx in ranked or []:
+            key = ctx.strip()
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(ctx)
+    return merged
+
+
 _EXTRACTOR_BATCH_SEP = "\n\n---\n\n"
 
 
@@ -254,6 +284,162 @@ def _split_into_char_batches(
     if current:
         batches.append(sep.join(current))
     return batches
+
+
+async def extract_facts(
+    registry: RoleModelRegistry,
+    question: str,
+    subquestions: Sequence[str],
+    contexts: Sequence[str],
+    max_chars: int,
+) -> List[str]:
+    """EXTRACTOR pass: distill passages into atomic, self-contained facts.
+
+    Shared core of the CoT ``extract_relevant`` node and MCTS-expansion
+    evidence gathering. Batches by char budget, runs batches in parallel,
+    dedupes case-insensitively. Returns ``[]`` when there is nothing to
+    extract; callers decide their own fallback (typically the raw passages).
+    """
+    items = [c for c in contexts if isinstance(c, str) and c.strip()]
+    if not items:
+        return []
+
+    subqs = [s for s in subquestions if s and s.strip()]
+    question_blob = question or ""
+    if subqs:
+        subq_lines = "\n".join(f"- {sq}" for sq in subqs)
+        question_blob = (
+            f"{question_blob}\n\nCurrent subquestions:\n{subq_lines}"
+            if question_blob
+            else f"Current subquestions:\n{subq_lines}"
+        )
+
+    batches = _split_into_char_batches(items, max_chars)
+    if not batches:
+        return []
+
+    async def _extract_one(blob: str) -> List[str]:
+        out, _ = await execute_role_lc(
+            registry,
+            EXTRACTOR,
+            ExtractionInput(question=question_blob, raw_data=blob),
+        )
+        return list(getattr(out, "relevant_information", None) or [])
+
+    results = await asyncio.gather(*[_extract_one(b) for b in batches])
+
+    facts: List[str] = []
+    seen: set[str] = set()
+    for batch in results:
+        for fact in batch:
+            if not isinstance(fact, str):
+                continue
+            key = fact.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            facts.append(fact.strip())
+    return facts
+
+
+async def gather_evidence(
+    registry: RoleModelRegistry,
+    question: str,
+    subquestions: Sequence[str],
+    *,
+    needs_kg: Optional[Sequence[bool]] = None,
+    memory_context: str = "Not provided",
+    entity_dict: Optional[Dict[str, Any]] = None,
+    kg_graph: Any = None,
+    web_graph: Any = None,
+    web_enabled: bool = False,
+    reranker_cfg: Optional[RerankerConfig] = None,
+    rerank_top_k: int = 10,
+    extractor_max_chars: int = 24_000,
+) -> Dict[str, Any]:
+    """One full retrieval pass for a set of subquestions, outside the CoT loop.
+
+    Mirrors the CoT iteration's evidence path (corpus + gated KG [+ web]
+    fan-out → per-subquestion rerank → EXTRACTOR distillation) as a plain
+    callable, so MCTS expansion can ground subanswers in retrieved evidence
+    instead of memory/parametric knowledge alone.
+
+    Returns ``{"extracted_facts": [...], "raw_triples": [...]}``. When the
+    extractor yields nothing, ``extracted_facts`` falls back to the reranked
+    passages — no evidence is silently lost.
+    """
+    subqs = [s.strip() for s in subquestions if isinstance(s, str) and s.strip()]
+    if not subqs:
+        return {"extracted_facts": [], "raw_triples": []}
+
+    flags = list(needs_kg or [])
+    known_labels = _known_entity_labels(entity_dict)
+
+    tasks = [corpus_search.ainvoke({"query": sq}) for sq in subqs]
+    n_corpus = len(tasks)
+    kg_index: List[int] = []
+    for i, sq in enumerate(subqs):
+        tagged_kg = flags[i] if i < len(flags) else True
+        if kg_graph is not None and (
+            tagged_kg or _subq_hits_known_entity(sq, known_labels)
+        ):
+            kg_index.append(i)
+            tasks.append(
+                kg_graph.ainvoke(
+                    {
+                        "subquery": sq,
+                        "original_query": question,
+                        "context": memory_context,
+                    }
+                )
+            )
+    n_kg = len(kg_index)
+    if web_enabled and web_graph is not None:
+        for sq in subqs:
+            tasks.append(
+                web_graph.ainvoke(
+                    {
+                        "subquery": sq,
+                        "original_query": question,
+                        "context": memory_context,
+                    }
+                )
+            )
+
+    results = await asyncio.gather(*tasks)
+    corpus_results = results[:n_corpus]
+    kg_results = results[n_corpus : n_corpus + n_kg]
+    web_results = results[n_corpus + n_kg :]
+
+    pooled: List[str] = []
+    seen: set[str] = set()
+
+    def _add(item: Any) -> None:
+        if not isinstance(item, str):
+            return
+        stripped = item.strip()
+        if stripped and stripped not in seen:
+            seen.add(stripped)
+            pooled.append(item)
+
+    for batch in corpus_results:
+        for item in batch or []:
+            _add(item)
+    raw_triples: List[Any] = []
+    for kg_out in kg_results:
+        for art in (kg_out or {}).get("kg_articles") or []:
+            _add(art)
+        raw_triples.extend(t for t in ((kg_out or {}).get("triples") or []) if t)
+    for web_out in web_results:
+        for row in (web_out or {}).get("results") or []:
+            if isinstance(row, dict):
+                _add(_format_web_result(row))
+
+    reranked = await rerank_per_query(subqs, pooled, rerank_top_k, reranker_cfg)
+    facts = await extract_facts(
+        registry, question, subqs, reranked, extractor_max_chars
+    )
+    return {"extracted_facts": facts or reranked, "raw_triples": raw_triples}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -362,13 +548,14 @@ def build_cot_graph(
 
     async def rerank(state: CoTState) -> Dict[str, Any]:
         contexts = list(state.get("retrieved_raw_context") or [])
-        subqs = state.get("subquestions") or []
-        query = "\n".join(subqs) if subqs else state.get("question", "")
-        # Late lookup so monkeypatch.setattr on the module replaces the call target.
+        subqs = [s for s in (state.get("subquestions") or []) if s and s.strip()]
+        # Per-subquestion rerank (union of per-query top-k) so one subquestion's
+        # evidence cannot crowd the others out of a single shared top-k budget.
         # ``cfg.reranker`` is captured from the builder closure and forwarded so
         # ``rerank_context`` can decide between SGLang call vs identity slice.
-        reranked = await rerank_context(
-            query, contexts, top_k=rerank_top_k, cfg=cfg.reranker
+        queries = subqs or [state.get("question", "")]
+        reranked = await rerank_per_query(
+            queries, contexts, rerank_top_k, cfg.reranker
         )
         return {"reranked_context": list(reranked or [])}
 
@@ -394,40 +581,13 @@ def build_cot_graph(
         # the EXTRACTOR's relevance lens covers both the global intent and the
         # specific gaps the loop is currently filling.
         subqs = [s for s in (state.get("subquestions") or []) if s and s.strip()]
-        question_blob = state.get("question", "")
-        if subqs:
-            subq_lines = "\n".join(f"- {sq}" for sq in subqs)
-            question_blob = (
-                f"{question_blob}\n\nCurrent subquestions:\n{subq_lines}"
-                if question_blob
-                else f"Current subquestions:\n{subq_lines}"
-            )
-
-        batches = _split_into_char_batches(contexts, extractor_max_chars)
-        if not batches:
-            return {}
-
-        async def _extract_one(blob: str) -> List[str]:
-            out, _ = await execute_role_lc(
-                registry,
-                EXTRACTOR,
-                ExtractionInput(question=question_blob, raw_data=blob),
-            )
-            return list(getattr(out, "relevant_information", None) or [])
-
-        results = await asyncio.gather(*[_extract_one(b) for b in batches])
-
-        facts: List[str] = []
-        seen: set[str] = set()
-        for batch in results:
-            for fact in batch:
-                if not isinstance(fact, str):
-                    continue
-                key = fact.strip().lower()
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                facts.append(fact.strip())
+        facts = await extract_facts(
+            registry,
+            state.get("question", ""),
+            subqs,
+            contexts,
+            extractor_max_chars,
+        )
 
         # Write to ``extracted_facts`` (not ``reranked_context``) so the rerank
         # passages stay visible in the trace. If the extractor produced nothing,
@@ -463,6 +623,9 @@ def build_cot_graph(
         payload = {
             "question": state.get("question", ""),
             "new_text_items": list(state.get("current_subanswers") or []),
+            # Retrieval-grounded facts persist with [Retrieval] provenance so
+            # consolidation can prefer them over generated subanswers.
+            "new_retrieval_items": list(state.get("extracted_facts") or []),
             "new_raw_triples": list(state.get("retrieved_raw_triples") or []),
             "current_text_memory": list(state.get("text_memory") or []),
             "current_graph": state.get("graph_memory") or nx.DiGraph(),

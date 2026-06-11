@@ -667,14 +667,20 @@ Do not let noisy or off-topic triples override coherent candidate reasoning.
 **Phase III — Synthesis & Self-Critique**
 Build a superior answer that:
 - Grounds factual claims in `[Retrieval]` evidence or high-score candidates
-- Resolves or explicitly acknowledges significant conflicts
+- Resolves conflicts via the adjudication hierarchy — the losing values are discussed only in `reasoning`, never in the answer fields
 - Introduces no facts absent from the candidates or supporting evidence
 Then verify: Is the answer directly responsive to the question? Is every factual claim traceable to at least one reliable source? Revise if not.
 
+## Answer Commitment Rules (strict)
+- COMMIT to exactly ONE answer — the single best-supported value. Never output ranges of alternatives, multiple candidate names, "varies by source", or hedged multi-value answers. If evidence conflicts, the adjudication hierarchy picks the winner and the answer states ONLY the winning value.
+- Maximum specificity: dates must be as complete as the evidence supports (e.g. "May 29, 1932", never just "1932" when a fuller date appears anywhere in candidates or evidence); quantities are a single number with units, not a range.
+- Answer "unknown" only when NO candidate and NO evidence item offers any plausible value. A value flagged as unverified is still better than refusing to answer.
+- `concise_answer` contains the answer alone (a name, full date, number, or short phrase) — no qualifiers, no alternatives, no explanations.
+
 ## Output Format:
 Respond with a JSON object with exactly these keys:
-- final_answer: string — complete, well-reasoned answer to the question
-- concise_answer: string — minimal wording, direct answer only (e.g. a name, date, or one sentence)
+- final_answer: string — complete, well-reasoned answer to the question, committed to a single value per the commitment rules
+- concise_answer: string — minimal wording, direct answer only (e.g. a name, full date, or one sentence)
 - reasoning: string — how conflicts were resolved and which evidence anchored the final answer
 - confidence_level: string — one of: "high", "medium", "low", or "uncertain"
 """

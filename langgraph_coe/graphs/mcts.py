@@ -50,8 +50,10 @@ from ..roles import (
     SubquestionGenerationInput,
 )
 from ._memory_text import textualize_graph as _textualize_graph
-from .cot import Clear, append_or_clear, build_cot_graph
+from .cot import Clear, append_or_clear, build_cot_graph, gather_evidence
+from .kg_search import build_kg_search_graph
 from .memory_update import build_memory_update_graph
+from .web_research import build_web_research_graph
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +123,16 @@ class MCTSState(TypedDict, total=False):
     simulation_result: Dict[str, Any]
     reward: float
 
-    # Per-iteration retrieval accumulator (cleared each iteration)
+    # Per-iteration retrieval accumulators (cleared each iteration)
     new_raw_triples: Annotated[List[Any], append_or_clear]
+    # Retrieval-grounded facts from expansion (gather_evidence). Fed to
+    # mem_update as [Retrieval]-provenance items, then cleared.
+    new_retrieval_texts: Annotated[List[str], append_or_clear]
+
+    # Per-iteration semantic-sufficiency flags (expand / rollout). Folded into
+    # ``semantic_sufficiency_signals`` by backprop, then reset.
+    expand_semantic_signal: bool
+    rollout_semantic_signal: bool
 
     # Cross-iteration shared memory (rollouts mutate in place)
     text_memory: List[str]
@@ -249,9 +259,33 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         registry, memory_cfg=getattr(config, "memory", None)
     )
 
+    # Retrieval surfaces for expansion-time evidence gathering (gather_evidence).
+    # Read knobs defensively — the test harness passes a minimal namespace.
+    kg_graph = build_kg_search_graph(registry)
+    web_enabled = bool(
+        getattr(getattr(config, "web_search", None), "enabled", False)
+    )
+    web_graph = build_web_research_graph(registry) if web_enabled else None
+    reranker_cfg = getattr(config, "reranker", None)
+    rerank_top_k = max(1, int(getattr(reranker_cfg, "top_k", 10) or 10))
+    extractor_max_chars = int(
+        getattr(getattr(config, "memory", None), "extractor_max_input_chars", 24_000)
+        or 24_000
+    )
+
     # ── Expansion generators ────────────────────────────────────────────────
 
-    async def _gen_subqa(question: str, parent_id: str, ctx: str) -> List[MCTSTreeNode]:
+    async def _gen_subqa(
+        question: str, parent_id: str, ctx: str, state: MCTSState
+    ) -> tuple[List[MCTSTreeNode], bool, Dict[str, Any]]:
+        """Decompose, retrieve evidence, and answer each subquestion.
+
+        Returns ``(nodes, semantic_signal, evidence)``. ``semantic_signal`` is
+        True when the generator deems the question answerable from context (coe
+        parity: ``should_direct or not subquestions``); the caller then expands
+        a FINAL_ANSWER child instead. ``evidence`` carries the retrieval facts/
+        triples for memory persistence.
+        """
         out, _ = await execute_role_lc(
             registry,
             SUBQUESTION_GENERATOR,
@@ -260,9 +294,40 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         subqs = [
             s for s in (getattr(out, "subquestions", None) or []) if s and s.strip()
         ]
-        if not subqs:
-            return []
-        inputs = [AnswerGenerationInput(question=sq, context=ctx) for sq in subqs]
+        if bool(getattr(out, "is_answerable", False)) or not subqs:
+            return [], True, {}
+
+        # Ground subanswers in retrieved evidence (corpus + gated KG fan-out →
+        # per-subquestion rerank → EXTRACTOR), not memory/parametric knowledge.
+        evidence = await gather_evidence(
+            registry,
+            question,
+            subqs,
+            needs_kg=list(getattr(out, "needs_kg", None) or []),
+            memory_context=ctx,
+            entity_dict=state.get("entity_dict"),
+            kg_graph=kg_graph,
+            web_graph=web_graph,
+            web_enabled=web_enabled,
+            reranker_cfg=reranker_cfg,
+            rerank_top_k=rerank_top_k,
+            extractor_max_chars=extractor_max_chars,
+        )
+        facts = [
+            f
+            for f in (evidence.get("extracted_facts") or [])
+            if isinstance(f, str) and f.strip()
+        ]
+        answer_ctx = ctx
+        if facts:
+            evidence_block = "Retrieved evidence:\n" + "\n".join(
+                f"- {f}" for f in facts
+            )
+            answer_ctx = f"{evidence_block}\n\n{ctx}" if ctx else evidence_block
+
+        inputs = [
+            AnswerGenerationInput(question=sq, context=answer_ctx) for sq in subqs
+        ]
         answers, _ = await execute_role_lc(registry, ANSWER_GENERATOR, inputs)
         if not isinstance(answers, list):
             answers = [answers]
@@ -275,7 +340,10 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                     {"sub_question": sq, "sub_answer": _answer_text(ans)},
                 )
             )
-        return nodes
+        return nodes, False, {
+            "facts": facts,
+            "triples": list(evidence.get("raw_triples") or []),
+        }
 
     async def _gen_final(
         question: str, parent_id: str, ctx: str, state: MCTSState
@@ -372,44 +440,74 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         tree = state.get("tree") or {}
         path = state.get("current_path") or []
         if not path:
-            return {"expanded_node_ids": []}
-        leaf = tree[path[-1]]
+            return {"expanded_node_ids": [], "expand_semantic_signal": False}
+        target = tree[path[-1]]
+        target_path = list(path)
 
-        # FINAL_ANSWER nodes are terminal — never expanded (§8.3).
-        if _is_terminal(leaf):
-            return {"expanded_node_ids": []}
+        # FINAL_ANSWER nodes are terminal — never expanded themselves. But a
+        # previously-visited terminal leaf means selection found no unexplored
+        # sibling: re-expand its PARENT so the tree keeps growing instead of
+        # re-walking the same chain forever (coe parity: mcts_search picks
+        # ``path[-2]`` in that case). A fresh terminal (visits == 0) is simply
+        # evaluated this iteration.
+        if _is_terminal(target):
+            if int(target.get("visits", 0) or 0) > 0 and len(path) >= 2:
+                target = tree[path[-2]]
+                target_path = list(path[:-1])
+            else:
+                return {"expanded_node_ids": [], "expand_semantic_signal": False}
 
-        ntype = _ntype(leaf)
-        pid = leaf["node_id"]
+        ntype = _ntype(target)
+        pid = target["node_id"]
         ctx = _join_memory_context(state)
         question = state.get("question", "")
 
+        signal = False
+        evidence: Dict[str, Any] = {}
         if ntype == MCTSNodeType.USER_QUESTION.value:
-            subqa = await _gen_subqa(question, pid, ctx)
+            subqa, signal, evidence = await _gen_subqa(question, pid, ctx, state)
             children = list(subqa)
-            if _should_gen_final(path, min_depth=final_min_depth):
+            if signal or _should_gen_final(target_path, min_depth=final_min_depth):
                 children.extend(await _gen_final(question, pid, ctx, state))
         elif ntype == MCTSNodeType.SUB_QA.value:
-            subqa, sc = await asyncio.gather(
-                _gen_subqa(question, pid, ctx),
-                _gen_self_correct(leaf, ctx),
+            (subqa, signal, evidence), sc = await asyncio.gather(
+                _gen_subqa(question, pid, ctx, state),
+                _gen_self_correct(target, ctx),
             )
             children = subqa + sc
+            if signal:
+                children.extend(await _gen_final(question, pid, ctx, state))
         elif ntype == MCTSNodeType.SELF_CORRECTED.value:
-            children = await _gen_subqa(question, pid, ctx)
+            subqa, signal, evidence = await _gen_subqa(question, pid, ctx, state)
+            children = list(subqa)
+            if signal:
+                children.extend(await _gen_final(question, pid, ctx, state))
         else:
             children = []
 
+        out: Dict[str, Any] = {"expand_semantic_signal": signal}
+        if evidence.get("facts"):
+            out["new_retrieval_texts"] = list(evidence["facts"])
+        if evidence.get("triples"):
+            out["new_raw_triples"] = list(evidence["triples"])
+        if target_path != list(path):
+            # Redirected to the parent: backprop/simulate must work from there,
+            # not through the stale terminal sibling.
+            out["current_path"] = target_path
+
         if not children:
-            return {"expanded_node_ids": []}
+            out["expanded_node_ids"] = []
+            return out
 
         updates: Dict[str, MCTSTreeNode] = {c["node_id"]: c for c in children}
-        parent = dict(leaf)
+        parent = dict(target)
         parent["children_ids"] = list(parent.get("children_ids") or []) + [
             c["node_id"] for c in children
         ]
         updates[pid] = parent
-        return {"tree": updates, "expanded_node_ids": [c["node_id"] for c in children]}
+        out["tree"] = updates
+        out["expanded_node_ids"] = [c["node_id"] for c in children]
+        return out
 
     async def simulate(state: MCTSState) -> Dict[str, Any]:
         tree = state.get("tree") or {}
@@ -423,11 +521,18 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         if start_id is None:
             if expanded:
                 path = path + [expanded[0]]
-            return {"current_path": path, "simulation_result": {"rollout_texts": []}}
+            return {
+                "current_path": path,
+                "simulation_result": {"rollout_texts": []},
+                "rollout_semantic_signal": False,
+            }
 
-        # Rollout through the compiled CoTGraph. text_memory / graph_memory /
-        # entity_dict are passed BY REFERENCE so the rollout mutates the parent's
-        # shared memory (coe parity).
+        # Rollout through the compiled CoTGraph. LangGraph channel updates
+        # REPLACE values rather than mutating them in place, so the rollout's
+        # final memory channels are captured from ``cot_out`` and returned
+        # below — otherwise every retrieval/consolidation the rollout performed
+        # would be silently discarded (coe parity: the legacy rollout mutated
+        # the shared WorkingMemory object).
         cot_out = await cot_graph.ainvoke(
             {
                 "question": state.get("question", ""),
@@ -443,18 +548,21 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         chain_ids: List[str] = []
         rollout_texts: List[str] = []
 
+        # One SUB_QA chain node per (subquestion, subanswer) pair — packing a
+        # whole CoT iteration into one node hides the decomposition from UCB
+        # selection and from the evaluate() candidate text.
         for entry in cot_out.get("iteration_history") or []:
             subqs = entry.get("subquestions") or []
             subas = entry.get("subanswers") or []
-            concat_q = "\n".join(f"Sub Q{i + 1}: {q}" for i, q in enumerate(subqs))
-            concat_a = "\n".join(f"Sub A{i + 1}: {a}" for i, a in enumerate(subas))
-            node = _make_node(
-                MCTSNodeType.SUB_QA,
-                None,
-                {"sub_question": concat_q, "sub_answer": concat_a},
-            )
-            chain_ids.append(node["node_id"])
-            updates[node["node_id"]] = node
+            for i, sq in enumerate(subqs):
+                sa = subas[i] if i < len(subas) else ""
+                node = _make_node(
+                    MCTSNodeType.SUB_QA,
+                    None,
+                    {"sub_question": sq, "sub_answer": sa},
+                )
+                chain_ids.append(node["node_id"])
+                updates[node["node_id"]] = node
             rollout_texts.extend(a for a in subas if isinstance(a, str) and a.strip())
 
         final_answer = cot_out.get("final_answer")
@@ -486,12 +594,23 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
         new_path = path + [start_id] + chain_ids
         rollout_triples = [t for t in (cot_out.get("retrieved_raw_triples") or []) if t]
-        return {
+        out: Dict[str, Any] = {
             "tree": updates,
             "current_path": new_path,
             "new_raw_triples": rollout_triples,
             "simulation_result": {"rollout_texts": rollout_texts},
+            # The rollout finalizing via "answerable from context" is a
+            # semantic-sufficiency vote (coe parity: simulate's rollout_signal).
+            "rollout_semantic_signal": bool(cot_out.get("is_answerable")),
         }
+        # Persist the rollout's consolidated memory (see comment above).
+        if cot_out.get("text_memory") is not None:
+            out["text_memory"] = list(cot_out.get("text_memory") or [])
+        if cot_out.get("graph_memory") is not None:
+            out["graph_memory"] = cot_out.get("graph_memory")
+        if cot_out.get("entity_dict") is not None:
+            out["entity_dict"] = dict(cot_out.get("entity_dict") or {})
+        return out
 
     async def evaluate(state: MCTSState) -> Dict[str, Any]:
         tree = state.get("tree") or {}
@@ -566,6 +685,14 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         path = state.get("current_path") or []
         reward = float(state.get("reward", 0.0) or 0.0)
 
+        # Snapshot BEFORE visit increments: convergence tracking must only
+        # count newly created terminals (coe parity: ``is_new_terminal``),
+        # otherwise re-walking an already-evaluated chain burns patience
+        # without exploring anything.
+        leaf = tree.get(path[-1]) if path else None
+        leaf_is_terminal = leaf is not None and _is_terminal(leaf)
+        is_new_terminal = leaf_is_terminal and int(leaf.get("visits", 0) or 0) == 0
+
         updates: Dict[str, MCTSTreeNode] = {}
         for nid in path:
             node = dict(updates.get(nid) or tree[nid])
@@ -575,16 +702,24 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
         best = float(state.get("best_value", 0.0) or 0.0)
         no_imp = int(state.get("iterations_without_improvement", 0) or 0)
-        if reward > best:
-            best, no_imp = reward, 0
-        else:
-            no_imp += 1
+        if leaf_is_terminal:
+            if reward > best:
+                best, no_imp = reward, 0
+            elif is_new_terminal:
+                no_imp += 1
+
+        signals = int(state.get("semantic_sufficiency_signals", 0) or 0)
+        if state.get("expand_semantic_signal") or state.get("rollout_semantic_signal"):
+            signals += 1
 
         return {
             "tree": updates,
             "iteration": int(state.get("iteration", 0) or 0) + 1,
             "best_value": best,
             "iterations_without_improvement": no_imp,
+            "semantic_sufficiency_signals": signals,
+            "expand_semantic_signal": False,
+            "rollout_semantic_signal": False,
         }
 
     async def mem_update(state: MCTSState) -> Dict[str, Any]:
@@ -616,6 +751,9 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         payload = {
             "question": state.get("question", ""),
             "new_text_items": new_text_items,
+            # Expansion-time retrieval facts carry [Retrieval] provenance so
+            # consolidation can prefer them over generated answers/critiques.
+            "new_retrieval_items": list(state.get("new_retrieval_texts") or []),
             "new_raw_triples": list(state.get("new_raw_triples") or []),
             "current_text_memory": list(state.get("text_memory") or []),
             "current_graph": state.get("graph_memory") or nx.DiGraph(),
@@ -627,6 +765,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             "graph_memory": result.get("updated_graph") or nx.DiGraph(),
             "entity_dict": dict(result.get("updated_entity_dict") or {}),
             "new_raw_triples": Clear(),
+            "new_retrieval_texts": Clear(),
         }
 
     async def synthesize(state: MCTSState) -> Dict[str, Any]:

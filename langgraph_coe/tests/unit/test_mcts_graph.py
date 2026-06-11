@@ -181,9 +181,6 @@ class RoleExecutorSpy:
                 outputs.append(_verify_out(rating, reason))
             return (outputs if isinstance(input_data, list) else outputs[0]), {}
 
-        if role.name == "extractor":
-            raise AssertionError("MCTSGraph must not run an extractor pass (§8.3)")
-
         raise AssertionError(f"Unexpected role call: {role.name}")
 
     def role_inputs(self, role_name: str) -> List[Any]:
@@ -235,6 +232,30 @@ def _cot_graph(output: Dict[str, Any] | None = None) -> CompiledGraphSpy:
     )
 
 
+class GatherEvidenceSpy:
+    """Async stand-in for ``gather_evidence`` recording expansion retrievals."""
+
+    def __init__(
+        self,
+        facts: Sequence[str] = (),
+        triples: Sequence[Any] = (),
+    ) -> None:
+        self.calls: List[Dict[str, Any]] = []
+        self._facts = list(facts)
+        self._triples = list(triples)
+
+    async def __call__(
+        self, registry: Any, question: str, subquestions: Sequence[str], **kwargs: Any
+    ) -> Dict[str, Any]:
+        self.calls.append(
+            {"question": question, "subquestions": list(subquestions), **kwargs}
+        )
+        return {
+            "extracted_facts": list(self._facts),
+            "raw_triples": list(self._triples),
+        }
+
+
 def _install_graph_spies(
     monkeypatch: pytest.MonkeyPatch,
     mcts_mod: Any,
@@ -242,9 +263,11 @@ def _install_graph_spies(
     executor: RoleExecutorSpy,
     cot_graph: CompiledGraphSpy | None = None,
     memory_graph: CompiledGraphSpy | None = None,
+    evidence: GatherEvidenceSpy | None = None,
 ) -> tuple[CompiledGraphSpy, CompiledGraphSpy]:
     cot_graph = cot_graph or _cot_graph()
     memory_graph = memory_graph or _memory_graph()
+    evidence = evidence or GatherEvidenceSpy()
 
     monkeypatch.setattr(mcts_mod, "execute_role_lc", executor, raising=False)
     monkeypatch.setattr(
@@ -254,6 +277,21 @@ def _install_graph_spies(
         mcts_mod,
         "build_memory_update_graph",
         lambda *_a, **_kw: memory_graph,
+        raising=False,
+    )
+    # Expansion-time retrieval is stubbed: unit tests assert orchestration,
+    # not the (network-bound) corpus/KG/web fan-out inside gather_evidence.
+    monkeypatch.setattr(mcts_mod, "gather_evidence", evidence, raising=False)
+    monkeypatch.setattr(
+        mcts_mod,
+        "build_kg_search_graph",
+        lambda *_a, **_kw: CompiledGraphSpy({}),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mcts_mod,
+        "build_web_research_graph",
+        lambda *_a, **_kw: CompiledGraphSpy({}),
         raising=False,
     )
     return cot_graph, memory_graph
@@ -450,7 +488,7 @@ async def test_simulate_invokes_cot_graph_with_shared_memory_and_configured_dept
 
 
 async def test_cot_iteration_history_is_adapted_to_linear_subqa_chain(monkeypatch):
-    """CoT batch iterations import as concatenated ``SUB_QA`` nodes, then final answer."""
+    """Each (subquestion, subanswer) pair imports as its own ``SUB_QA`` chain node."""
     mcts_mod = _import_module()
     cot = _cot_graph(
         {
@@ -479,17 +517,26 @@ async def test_cot_iteration_history_is_adapted_to_linear_subqa_chain(monkeypatc
     final = await graph.ainvoke(_state(max_iterations=1))
 
     tree = final["tree"]
-    rollout_nodes = [
-        node
-        for node in _nodes_of_type(tree, "sub_qa")
-        if "Sub Q1: Q one?" in str(node.get("content", {}))
-    ]
-    assert rollout_nodes, "simulate must adapt CoT iteration_history into SUB_QA nodes"
-    content = rollout_nodes[0]["content"]
-    assert "Sub Q1: Q one?" in content["sub_question"]
-    assert "Sub Q2: Q two?" in content["sub_question"]
-    assert "Sub A1: A one." in content["sub_answer"]
-    assert "Sub A2: A two." in content["sub_answer"]
+
+    def _rollout_node(question: str) -> Dict[str, Any]:
+        matches = [
+            node
+            for node in _nodes_of_type(tree, "sub_qa")
+            if node.get("content", {}).get("sub_question") == question
+        ]
+        assert matches, f"rollout must create a SUB_QA node for {question!r}"
+        return matches[0]
+
+    n1 = _rollout_node("Q one?")
+    n2 = _rollout_node("Q two?")
+    n3 = _rollout_node("Q three?")
+    assert n1["content"]["sub_answer"] == "A one."
+    assert n2["content"]["sub_answer"] == "A two."
+    assert n3["content"]["sub_answer"] == "A three."
+
+    # Linear chain wiring: Q one? → Q two? → Q three? → rollout final.
+    assert n2["parent_id"] == n1["node_id"]
+    assert n3["parent_id"] == n2["node_id"]
 
     rollout_final = [
         node
@@ -499,7 +546,7 @@ async def test_cot_iteration_history_is_adapted_to_linear_subqa_chain(monkeypatc
     assert rollout_final, (
         "simulate must append a FINAL_ANSWER node for final_state['final_answer']"
     )
-    assert rollout_final[0]["parent_id"] in tree
+    assert rollout_final[0]["parent_id"] == n3["node_id"]
 
 
 async def test_evaluate_uses_three_verifier_views_and_normalizes_reward(monkeypatch):
@@ -511,7 +558,25 @@ async def test_evaluate_uses_three_verifier_views_and_normalizes_reward(monkeypa
         verifier_ratings=[10.0, 5.0, 0.0],
         verifier_reasons=["known answer", "text partial", "graph contradicts"],
     )
-    _install_graph_spies(monkeypatch, mcts_mod, executor=executor)
+    # Rollout memory persists into MCTS state (simulate captures the CoT
+    # output channels), so the spy passes the original memory through for the
+    # verifier-view assertions below.
+    cot = _cot_graph(
+        {
+            "iteration_history": [
+                {
+                    "depth": 0,
+                    "subquestions": ["What is France's capital?"],
+                    "subanswers": ["Paris is France's capital."],
+                }
+            ],
+            "final_answer": "Paris.",
+            "text_memory": ["France has capital Paris."],
+            "graph_memory": graph_memory,
+            "entity_dict": {"Q90": "Paris"},
+        }
+    )
+    _install_graph_spies(monkeypatch, mcts_mod, executor=executor, cot_graph=cot)
 
     graph = _build_graph(mcts_mod)
     final = await graph.ainvoke(
@@ -636,6 +701,130 @@ async def test_final_answer_nodes_are_terminal_not_expanded(monkeypatch):
     assert not executor.role_inputs("subquestion_generator")
     assert not executor.role_inputs("self_corrector")
     assert final["current_path"][-1] == final_id
+
+
+async def test_expansion_grounds_subanswers_in_gathered_evidence(monkeypatch):
+    """Expand must retrieve evidence (gather_evidence) and ground the
+    ANSWER_GENERATOR context in it, then persist facts to mem_update as
+    ``new_retrieval_items``."""
+    mcts_mod = _import_module()
+    memory = _memory_graph()
+    evidence = GatherEvidenceSpy(
+        facts=["Paris has been France's capital since 987."],
+        triples=["France | capital | Paris"],
+    )
+    executor = RoleExecutorSpy(
+        subquestions=["What is France's capital?"],
+        answers=["Paris is the capital."],
+    )
+    _install_graph_spies(
+        monkeypatch,
+        mcts_mod,
+        executor=executor,
+        memory_graph=memory,
+        evidence=evidence,
+    )
+
+    graph = _build_graph(mcts_mod)
+    await graph.ainvoke(_state(max_iterations=1))
+
+    assert evidence.calls, "expand must call gather_evidence for new subquestions"
+    assert evidence.calls[0]["subquestions"] == ["What is France's capital?"]
+
+    answer_inputs = executor.role_inputs("answer_generator")
+    assert answer_inputs, "expand must answer subquestions"
+    first = answer_inputs[0]
+    items = first if isinstance(first, list) else [first]
+    assert all(
+        "Paris has been France's capital since 987." in str(item.context)
+        for item in items
+    ), "subanswer context must include the retrieved evidence"
+
+    assert memory.calls, "mem_update must run"
+    payload = memory.calls[0]
+    assert "Paris has been France's capital since 987." in (
+        payload.get("new_retrieval_items") or []
+    ), "expansion retrieval facts must reach memory with retrieval provenance"
+    assert "France | capital | Paris" in (payload.get("new_raw_triples") or [])
+
+
+async def test_visited_terminal_leaf_triggers_parent_reexpansion(monkeypatch):
+    """When selection lands on an already-visited terminal leaf, expand must
+    grow the PARENT instead of stalling (coe parity)."""
+    mcts_mod = _import_module()
+    root_id = "root"
+    final_id = "final-1"
+    tree = {
+        root_id: {
+            "node_id": root_id,
+            "parent_id": None,
+            "children_ids": [final_id],
+            "node_type": "user_question",
+            "content": {"question": "What is the capital of France?"},
+            "visits": 3,
+            "value": 1.5,
+            "prior": 1.0,
+        },
+        final_id: {
+            "node_id": final_id,
+            "parent_id": root_id,
+            "children_ids": [],
+            "node_type": "final_answer",
+            "content": {"final_answer": "Paris."},
+            "visits": 2,
+            "value": 1.0,
+            "prior": 0.30,
+        },
+    }
+    executor = RoleExecutorSpy(
+        subquestions=["What is France's capital?"],
+        answers=["Paris is the capital."],
+    )
+    _install_graph_spies(monkeypatch, mcts_mod, executor=executor)
+
+    graph = _build_graph(mcts_mod)
+    final = await graph.ainvoke(_state(max_iterations=1, tree=tree, root_id=root_id))
+
+    assert executor.role_inputs("subquestion_generator"), (
+        "a visited terminal leaf must redirect expansion to its parent"
+    )
+    root_children = final["tree"][root_id]["children_ids"]
+    assert len(root_children) > 1, "the root must have gained new children"
+    assert final_id not in final["current_path"], (
+        "the stale terminal must not be on the evaluated path after redirect"
+    )
+
+
+async def test_answerable_signal_counts_toward_semantic_sufficiency(monkeypatch):
+    """``is_answerable`` from the subquestion generator must emit a FINAL_ANSWER
+    child and increment ``semantic_sufficiency_signals`` (previously dead)."""
+    mcts_mod = _import_module()
+
+    executor = RoleExecutorSpy(
+        subquestions=[],
+        final_answers=["Expand final.", "Synth final."],
+    )
+
+    async def _answerable_executor(registry, role, input_data, n=1, tier_override=None):
+        if role.name == "subquestion_generator":
+            return _subq_out(answerable=True), {}
+        return await executor(registry, role, input_data, n, tier_override)
+
+    _install_graph_spies(monkeypatch, mcts_mod, executor=executor)
+    monkeypatch.setattr(
+        mcts_mod, "execute_role_lc", _answerable_executor, raising=False
+    )
+
+    graph = _build_graph(mcts_mod)
+    final = await graph.ainvoke(_state(max_iterations=1))
+
+    assert final["semantic_sufficiency_signals"] >= 1, (
+        "answerable decomposition must register a semantic-sufficiency signal"
+    )
+    final_nodes = _nodes_of_type(final["tree"], "final_answer")
+    assert any(
+        "Expand final." in str(node.get("content", {})) for node in final_nodes
+    ), "answerable signal must emit a FINAL_ANSWER child from expand"
 
 
 def test_search_mcts_config_exposes_termination_knobs():

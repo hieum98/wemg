@@ -158,7 +158,7 @@ reranker:
   model_name: Qwen3-Reranker-4B
   url: http://n0164:30000/v1
   api_key: EMPTY
-  top_k: 5
+  top_k: 10
   instruction: "Given a web search query, retrieve relevant passages that answer the query."
 
 # Search strategy (system.py picks MCTSGraph vs CoTGraph via `strategy`).
@@ -169,14 +169,14 @@ search:
     recursion_limit: 150     # LangGraph superstep budget per CoT run
   mcts:
     num_iterations: 20      # hard cap on MCTS iterations
-    min_iterations: 3       # floor before any early-termination condition may fire
+    min_iterations: 5       # floor before any early-termination condition may fire
     exploration_weight: 2.0
     max_tree_depth: 10
     max_simulation_depth: 3 # per-rollout CoTGraph depth
     final_answer_min_depth: 2
     high_confidence_threshold: 0.9
     convergence_patience: 5
-    semantic_sufficiency_count: 3
+    semantic_sufficiency_count: 5
     recursion_limit: 300    # LangGraph superstep budget per MCTS run
 
 # Redis cache for LLM (db 0), Wikidata + web_search (db 1). Setup: docs/setup_redis_cache.md

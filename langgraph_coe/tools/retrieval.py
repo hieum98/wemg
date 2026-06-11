@@ -28,6 +28,47 @@ from ..config import CorpusConfig, EmbedderConfig, RerankerConfig, RetrieverConf
 logger = logging.getLogger(__name__)
 
 
+def close_fsspec_async_sessions() -> None:
+    """Close lingering ``aiohttp`` sessions opened by ``datasets``/fsspec.
+
+    ``datasets.load_dataset`` streams remote parquet shards through fsspec's
+    async HTTP filesystem, which opens an ``aiohttp.ClientSession``. fsspec
+    caches the filesystem instance but never closes that session, so Python's
+    GC later emits ``ERROR:asyncio:Unclosed client session``. We proactively
+    close every cached async-filesystem session after a load; this is cosmetic
+    cleanup, so any failure is swallowed.
+    """
+    try:
+        import fsspec
+        from fsspec.asyn import AsyncFileSystem, sync
+    except Exception:
+        return
+
+    # fsspec's _Cached metaclass gives every filesystem subclass its own
+    # ``_cache`` dict, so walk the whole subclass tree rather than only the base.
+    def _all_subclasses(cls):
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from _all_subclasses(sub)
+
+    seen: set = set()
+    for cls in _all_subclasses(fsspec.AbstractFileSystem):
+        if not issubclass(cls, AsyncFileSystem):
+            continue
+        for fs in list(getattr(cls, "_cache", {}).values()):
+            if id(fs) in seen:
+                continue
+            seen.add(id(fs))
+            session = getattr(fs, "_session", None)
+            if session is None or getattr(session, "closed", True):
+                continue
+            try:
+                sync(fs.loop, session.close)
+                fs._session = None
+            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+                logger.debug("Could not close fsspec aiohttp session: %s", exc)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # SGLang reranker HTTP client
 # ──────────────────────────────────────────────────────────────────────────────
@@ -250,6 +291,9 @@ def _load_raw_faiss_corpus(
             ds = ds[corpus_cfg.corpus_split]
     else:
         ds = datasets.load_dataset(dataset_ref, split=corpus_cfg.corpus_split)
+        # Streaming the remote shards opened an aiohttp session via fsspec; close
+        # it now so the GC doesn't later log "Unclosed client session".
+        close_fsspec_async_sessions()
 
     if not os.path.exists(index_path):
         logger.info("Index not found at %r, building index...", index_path)

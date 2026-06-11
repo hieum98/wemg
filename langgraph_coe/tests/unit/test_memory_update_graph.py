@@ -317,7 +317,7 @@ async def test_pre_and_post_consolidation_use_memory_consolidation_role(monkeypa
         consolidation_inputs[1]
     )
     assert final["updated_text_memory"] == [
-        "Consolidated post memory with graph triples."
+        "[System Prediction]: Consolidated post memory with graph triples."
     ]
 
 
@@ -346,7 +346,7 @@ async def test_skips_post_consolidation_when_no_kept_triples(monkeypatch):
     final = await graph.ainvoke(_state(graph=current_graph))
 
     assert len(executor.role_inputs("memory_consolidation")) == 1
-    assert final["updated_text_memory"] == ["Consolidated pre only."]
+    assert final["updated_text_memory"] == ["[System Prediction]: Consolidated pre only."]
 
 
 async def test_open_ie_consumes_consolidated_memory(monkeypatch):
@@ -549,6 +549,51 @@ async def test_pruner_keep_indices_control_graph_and_textualized_edges(monkeypat
     assert _graph_mentions(final["updated_graph"], "Paris")
     assert not _graph_mentions(final["updated_graph"], "Spain")
     assert not _graph_mentions(final["updated_graph"], "Euro")
+
+
+async def test_retrieval_items_are_tagged_and_provenance_survives(monkeypatch):
+    """``new_retrieval_items`` enter consolidation tagged [Retrieval]; the
+    consolidator's provenance is preserved in ``updated_text_memory`` so later
+    passes / the synthesizer can keep adjudicating on it."""
+    mem_mod = _import_module()
+    executor = RoleExecutorSpy(
+        consolidation_outputs=[
+            roles_mod.MemoryConsolidationOutput(
+                consolidated_memory=[
+                    roles_mod.MemoryItem(
+                        content="Paris is the capital of France.",
+                        provenance=roles_mod.SourceType.RETRIEVAL.value,
+                        hop_depth=1,
+                    ),
+                    roles_mod.MemoryItem(
+                        content="The capital is probably Paris.",
+                        provenance=roles_mod.SourceType.SYSTEM_PREDICTION.value,
+                        hop_depth=None,
+                    ),
+                ]
+            ),
+        ],
+        relations=[],
+        entities=[],
+    )
+    _install_spies(monkeypatch, mem_mod, executor, link_mapping={})
+
+    graph = mem_mod.build_memory_update_graph(_registry())
+    state = _state(new_text_items=["The capital is probably Paris."])
+    state["new_retrieval_items"] = ["Paris is the capital of France."]
+    final = await graph.ainvoke(state)
+
+    pre_input = _input_text(executor.role_inputs("memory_consolidation")[0])
+    assert "[Retrieval]: Paris is the capital of France." in pre_input
+    assert "[System Prediction]: The capital is probably Paris." in pre_input
+
+    assert (
+        "[Retrieval]: Paris is the capital of France." in final["updated_text_memory"]
+    )
+    assert (
+        "[System Prediction]: The capital is probably Paris."
+        in final["updated_text_memory"]
+    )
 
 
 def test_memory_config_exposes_textual_memory_token_budget():

@@ -37,6 +37,15 @@ def load_dataset_any(
     if max_examples is not None and len(ds) > max_examples:
         ds = ds.select(range(max_examples))
 
+    # Remote loads stream shards through fsspec's aiohttp filesystem; close those
+    # sessions so the GC doesn't later log "Unclosed client session".
+    try:
+        from langgraph_coe.tools.retrieval import close_fsspec_async_sessions
+
+        close_fsspec_async_sessions()
+    except Exception:  # noqa: BLE001 - cleanup is best-effort
+        pass
+
     return ds
 
 
