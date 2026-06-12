@@ -556,6 +556,7 @@ SELF_CORRECT_PROMPT = """You are an expert in answer verification and refinement
     -  PARTIAL:  Correct but incomplete or lacking detail
     -  INCORRECT:  Contains factual errors or logical flaws
     -  UNSUPPORTED:  Cannot be verified against available context
+   Constraint check: the answer must satisfy EVERY explicit constraint in the question (entity type/category, role, place, time period, scope). An answer naming the wrong kind of entity (e.g. a talk show when the question asks about a game show) is INCORRECT even if otherwise well-supported.
 4. Generate refined answer
 
 ## Output Format:
@@ -647,8 +648,8 @@ SYNTHESIZE_FINAL_ANSWER_PROMPT = """You are an expert in argumentative synthesis
 Each candidate exposes a `Final Answer` and a `Reasoning` chain.
 
 **supporting_evidence** contains knowledge accumulated during research. It has two components:
-- Textual facts (lines tagged `[Retrieval]` or `[System Prediction]`): `[Retrieval]` facts come from web search — high reliability, prioritize for factual grounding. `[System Prediction]` facts are model-inferred — medium reliability, corroborate with Retrieval evidence or candidate consensus before trusting.
-- Knowledge graph triples (under `**Information N**` sections, tagged `[System Prediction]`): structured entity-relationship facts extracted during research. Use for verifying entity attributes and relationships; discard triples unrelated to the question.
+- Textual facts (lines tagged `[Retrieval]` or `[System Prediction]`): `[Retrieval]` facts come from retrieved sources (document corpus, the Wikidata knowledge graph) — high reliability, prioritize for factual grounding. `[System Prediction]` facts are model-inferred — medium reliability, corroborate with Retrieval evidence or candidate consensus before trusting.
+- Graph memory triples (`subject — relation — object` lines): structured entity-relationship facts accumulated during research. Use for verifying entity attributes and relationships; discard triples unrelated to the question.
 
 ## Synthesis Procedure
 
@@ -663,6 +664,7 @@ Cross-check candidate claims against supporting evidence. When candidates disagr
 4. Logically sound reasoning from any candidate, consistent with graph triples
 5. Majority agreement across candidates as a last resort
 Do not let noisy or off-topic triples override coherent candidate reasoning.
+When two `[Retrieval]` facts conflict, prefer the one that explicitly satisfies the question's qualifiers (the stated category, superlative, scope, or time anchor); for time-sensitive questions prefer the fact with the more recent explicit date.
 
 **Phase III — Synthesis & Self-Critique**
 Build a superior answer that:
@@ -679,7 +681,7 @@ Then verify: Is the answer directly responsive to the question? Is every factual
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
-- final_answer: string — complete, well-reasoned answer to the question, committed to a single value per the commitment rules
+- final_answer: string — a complete,well-reasoned answer to the question (not just the answer itself, but the answer with the reasoning behind it)
 - concise_answer: string — minimal wording, direct answer only (e.g. a name, full date, or one sentence)
 - reasoning: string — how conflicts were resolved and which evidence anchored the final answer
 - confidence_level: string — one of: "high", "medium", "low", or "uncertain"
@@ -715,6 +717,8 @@ EXTRACT_PROMPT = """You are a meticulous research analyst. Build a comprehensive
 Rules:
 - Consider both direct and indirect relevant information. An information is considered relevant if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 - Extracted information must be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items.
+- Source fidelity (strict): extract ONLY what the provided text states. Never supplement facts from your own knowledge and never fill gaps with plausible values — if the text does not state it, do not output it.
+- Entity identity (strict): keep names exactly as the text writes them. Do NOT assert that an entity in the text is the same as an entity in the question, and do NOT add parenthetical aliases (e.g. "(also known as X)"), unless the text itself states that identity. Two similar names may be different real-world entities.
 
 Instructions:
 1. Question Deconstruction: Identify primary subject, key entities, and specific information sought.
@@ -743,6 +747,8 @@ Scoring:
 - 5.0-6.9: Partially supported or uncertain
 - 3.0-4.9: Weakly supported, significant doubts
 - 0.0-2.9: Contradicted by evidence or completely unsupported
+
+An answer that violates an explicit constraint of the question (wrong entity type/category, wrong place, wrong time period, wrong scope) counts as contradicted — score it 0.0-2.9 even if evidence supports parts of it.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:

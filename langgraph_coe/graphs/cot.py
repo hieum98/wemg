@@ -50,6 +50,7 @@ from ..roles import (
     SubquestionGenerationInput,
 )
 from ..tools.retrieval import call_sglang_reranker, corpus_search
+from ..tools.wikidata import reset_wikidata_session
 from ._memory_text import textualize_graph as _textualize_graph
 from .kg_search import build_kg_search_graph
 from .memory_update import build_memory_update_graph
@@ -375,6 +376,18 @@ async def gather_evidence(
     flags = list(needs_kg or [])
     known_labels = _known_entity_labels(entity_dict)
 
+    async def _kg_search_isolated(payload: Dict[str, Any]) -> Any:
+        # Fresh hop budget + visited set per KG search. The session ContextVar
+        # rebinding stays local to this gather child task (see
+        # tools/wikidata.py). Without it the whole question shares a single
+        # ``max_hops`` budget: the first subquery's fetch exhausts it and every
+        # later expansion's KG fan-out degrades to "[hop budget exhausted]",
+        # so facts needed at hop 2+ (e.g. attributes of a bridge entity
+        # resolved mid-search) never surface. Legacy coe scoped the budget per
+        # retrieval call (`_retrieve_from_kb`), not per question.
+        reset_wikidata_session()
+        return await kg_graph.ainvoke(payload)
+
     tasks = [corpus_search.ainvoke({"query": sq}) for sq in subqs]
     n_corpus = len(tasks)
     kg_index: List[int] = []
@@ -385,7 +398,7 @@ async def gather_evidence(
         ):
             kg_index.append(i)
             tasks.append(
-                kg_graph.ainvoke(
+                _kg_search_isolated(
                     {
                         "subquery": sq,
                         "original_query": question,
@@ -483,6 +496,9 @@ def build_cot_graph(
         subquery = state.get("subquery") or ""
         if not subquery:
             return {}
+        # Per-search hop budget — see ``_kg_search_isolated`` in
+        # :func:`gather_evidence` for why the session must not span the question.
+        reset_wikidata_session()
         result = await kg_graph.ainvoke(
             {
                 "subquery": subquery,

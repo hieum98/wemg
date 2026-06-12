@@ -70,6 +70,10 @@ class MemoryUpdateState(TypedDict, total=False):
     extracted_relations: List[Relation]
     linked_entities: Dict[str, str]
     kept_triples: List[str]
+    # Stringified forms of kept triples that originated from ``new_raw_triples``
+    # (KG retrieval) rather than OpenIE over generated text — these carry
+    # [Retrieval] provenance when textualized.
+    kg_triple_strings: List[str]
 
     # Outputs
     updated_text_memory: List[str]
@@ -420,10 +424,12 @@ def build_memory_update_graph(
     async def merge_and_prune(state: MemoryUpdateState) -> Dict[str, Any]:
         question = state.get("question", "")
         relations = list(state.get("extracted_relations") or [])
+        kg_strings: set[str] = set()
         for raw in state.get("new_raw_triples") or []:
             coerced = _coerce_raw_triple_to_relation(raw)
             if coerced is not None:
                 relations.append(coerced)
+                kg_strings.add(_stringify_triple(coerced))
 
         linked_map = dict(state.get("linked_entities") or {})
         entity_dict = dict(
@@ -492,6 +498,7 @@ def build_memory_update_graph(
             "updated_graph": new_graph,
             "updated_entity_dict": entity_dict,
             "kept_triples": kept_triple_strings,
+            "kg_triple_strings": sorted(kg_strings),
         }
 
     async def textualize_graph(state: MemoryUpdateState) -> Dict[str, Any]:
@@ -500,8 +507,17 @@ def build_memory_update_graph(
         if not kept_triples:
             return {"consolidated_memory": consolidated}
 
+        # Triples fetched from the knowledge graph are retrieval evidence;
+        # tagging them [System Prediction] would let consolidation's
+        # conflict-resolution rule discard a true Wikidata fact in favor of a
+        # conflicting [Retrieval]-tagged extractor claim.
+        kg_set = set(state.get("kg_triple_strings") or [])
         appended = consolidated + [
-            _format_memory_item(t, SourceType.SYSTEM_PREDICTION) for t in kept_triples
+            _format_memory_item(
+                t,
+                SourceType.RETRIEVAL if t in kg_set else SourceType.SYSTEM_PREDICTION,
+            )
+            for t in kept_triples
         ]
         return {"consolidated_memory": appended}
 

@@ -21,14 +21,22 @@ def textualize_graph(graph: Optional[nx.DiGraph]) -> str:
     """
     if graph is None or graph.number_of_edges() == 0:
         return ""
+
+    def _label(node_id: str) -> str:
+        # QID-linked nodes are keyed by QID; prompts need the human-readable
+        # ``name`` attribute or the line is opaque to the model.
+        name = graph.nodes[node_id].get("name") if node_id in graph else None
+        return str(name) if name else str(node_id)
+
     lines: List[str] = []
     for u, v, data in graph.edges(data=True):
+        su, sv = _label(u), _label(v)
         rel = data.get("relation")
         if isinstance(rel, (set, list, tuple)):
             for r in rel:
-                lines.append(f"{u} — {r} — {v}")
+                lines.append(f"{su} — {r} — {sv}")
         elif rel:
-            lines.append(f"{u} — {rel} — {v}")
+            lines.append(f"{su} — {rel} — {sv}")
         else:
-            lines.append(f"{u} — related_to — {v}")
+            lines.append(f"{su} — related_to — {sv}")
     return "\n".join(lines)
