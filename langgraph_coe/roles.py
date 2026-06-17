@@ -482,7 +482,7 @@ If `intermediate_answer` is provided, it is the resolved result of the PREVIOUS 
 
 ## Core Principles
 Each subquestion must:
-- target a real knowledge gap not answerable from the provided context
+- target a real knowledge gap that has not been answered from the provided context
 - be atomic, self-contained, and understandable without the main question
 - be non-redundant with other generated subquestions
 
@@ -491,13 +491,14 @@ Each subquestion must:
 ## Instructions
 1. Analyze the main question: identify core intent, key entities, constraints, and required reasoning steps.
 2. Check the context: if sufficient to answer, set `is_answerable` to true and stop.
-3. Identify missing knowledge: only gaps that meaningfully advance reasoning toward the answer.
+3. Identify missing/ conflicting knowledge/ information/ facts: focus on the gaps that meaningfully advance reasoning toward to answer the main question. Also check if the context contains conflicting information that needs to be resolved.
 4. Generate subquestions:
    - For parallel gaps: each must be independently answerable.
    - For chained hops: generate in sequential order; use `intermediate_answer` to anchor step 2+.
    - For ranked/ordinal questions ("Nth X", "highest", "oldest", "most"): include a subquestion that retrieves the **complete ranked list**, not just confirms a candidate.
    - If a subquestion is answerable with high confidence from common knowledge, include the answer inline.
-5. Validate: remove subquestions that are answerable from context, redundant, or low-value. Keep at most 3.
+   - If the context contains conflicting information that needs to be resolved or some information needs to be verified, include a subquestion that resolves the conflict or verifies the information.
+5. Validate: remove subquestions that are redundant, or low-value. Keep at most 5, prioritize the subquestions that need to be verified or resolved.
 
 ## Scope Consistency
 Preserve the geographic or categorical scope of the main question. Do NOT silently narrow a global scope to a specific region without justification.
