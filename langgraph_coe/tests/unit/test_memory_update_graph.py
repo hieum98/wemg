@@ -313,9 +313,7 @@ async def test_pre_and_post_consolidation_use_memory_consolidation_role(monkeypa
     )
     assert "Current memory fact." in _input_text(consolidation_inputs[0])
     assert "New answer fact." in _input_text(consolidation_inputs[0])
-    assert "Subject: France | Relation: capital | Object: Paris" in _input_text(
-        consolidation_inputs[1]
-    )
+    assert "France — capital — Paris" in _input_text(consolidation_inputs[1])
     assert final["updated_text_memory"] == [
         "[System Prediction]: Consolidated post memory with graph triples."
     ]
@@ -543,7 +541,7 @@ async def test_pruner_keep_indices_control_graph_and_textualized_edges(monkeypat
     final = await graph.ainvoke(_state())
 
     post_input = _input_text(executor.role_inputs("memory_consolidation")[1])
-    assert "Subject: France | Relation: capital | Object: Paris" in post_input
+    assert "France — capital — Paris" in post_input
     assert "borders" not in post_input
     assert "currency" not in post_input
     assert _graph_mentions(final["updated_graph"], "Paris")
@@ -587,8 +585,14 @@ async def test_retrieval_items_are_tagged_and_provenance_survives(monkeypatch):
     assert "[Retrieval]: Paris is the capital of France." in pre_input
     assert "[System Prediction]: The capital is probably Paris." in pre_input
 
+    # The consolidator's per-item ``hop_depth`` is re-attached as a ``[hop=N]``
+    # prefix outside the provenance tag (mirroring legacy
+    # ``add_textual_memory(content, prov, hop_depth=item.hop_depth)``), so it
+    # survives into ``updated_text_memory`` for the next pass's Hop Depth
+    # Filtering. ``hop_depth=None`` items stay un-prefixed.
     assert (
-        "[Retrieval]: Paris is the capital of France." in final["updated_text_memory"]
+        "[hop=1] [Retrieval]: Paris is the capital of France."
+        in final["updated_text_memory"]
     )
     assert (
         "[System Prediction]: The capital is probably Paris."

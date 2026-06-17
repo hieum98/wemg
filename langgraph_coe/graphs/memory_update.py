@@ -23,6 +23,7 @@ Flow::
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -46,6 +47,7 @@ from ..roles import (
     WikidataEntity,
 )
 from ..tools.wikidata import link_entities
+from ._memory_text import format_triple_line
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,20 @@ class MemoryUpdateState(TypedDict, total=False):
     current_text_memory: List[str]
     current_graph: nx.DiGraph
     entity_dict: Dict[str, Any]
+    # Reasoning-tree depth at which this iteration's new items were produced.
+    # Prefixed as ``[hop=N]`` on new items so the consolidator's Hop Depth
+    # Filtering rule can prefer the lowest-hop item that fully answers the
+    # question. ``None`` disables annotation.
+    #
+    # Matches legacy ``WorkingMemory.add_textual_memory(..., hop_depth=...)``:
+    # hop is assigned *per producing node*, not uniformly per iteration.
+    # ``hop_depth`` tags generated sub-answers/rollouts and retrieval facts
+    # (legacy ``node.depth + 1``); ``critique_hop_depth`` tags verifier /
+    # self-correction items, which legacy emits one level shallower at
+    # ``node.depth`` (see ``mcts.py`` ``_self_correct_nodes`` assessments).
+    hop_depth: int
+    new_critique_items: List[str]
+    critique_hop_depth: int
 
     # Intermediates
     consolidated_memory: List[str]
@@ -92,7 +108,9 @@ def _format_memory_item(content: str, provenance: SourceType) -> str:
         SourceType.RETRIEVAL: "[Retrieval]",
     }.get(provenance, "")
     normalized = (content or "").strip()
-    if normalized.startswith(("[System Prediction]", "[Retrieval]")):
+    # Pass through items that already carry a provenance tag or a leading
+    # ``[hop=N]`` reasoning-depth annotation (see RC-C / hop-depth filtering).
+    if normalized.startswith(("[System Prediction]", "[Retrieval]", "[hop=")):
         return normalized
     return f"{tag}: {normalized}" if tag else normalized
 
@@ -106,11 +124,33 @@ _PROVENANCE_TAGS = ("[System Prediction]", "[Retrieval]")
 
 def _strip_provenance_tag(text: str) -> str:
     stripped = (text or "").strip()
+    # Strip an optional leading ``[hop=N]`` annotation before the provenance tag
+    # so neither leaks into entity/relation surface forms or re-tagged content.
+    if stripped.startswith("[hop="):
+        end = stripped.find("]")
+        if end != -1:
+            stripped = stripped[end + 1 :].lstrip()
     for tag in _PROVENANCE_TAGS:
         if stripped.startswith(tag):
             stripped = stripped[len(tag) :].lstrip(": ").strip()
             break
     return stripped
+
+
+def _is_retrieval_grounded(text: str) -> bool:
+    """True if a memory line carries the ``[Retrieval]`` provenance tag.
+
+    Skips an optional leading ``[hop=N]`` annotation first (same order as
+    :func:`_strip_provenance_tag`). ``[Retrieval]`` facts came from evidence and
+    are already grounded; re-verification targets ``[System Prediction]`` facts
+    (the model's own inferences), so callers use this to exclude grounded items.
+    """
+    stripped = (text or "").strip()
+    if stripped.startswith("[hop="):
+        end = stripped.find("]")
+        if end != -1:
+            stripped = stripped[end + 1 :].lstrip()
+    return stripped.startswith("[Retrieval]")
 
 
 def _consolidated_to_text(output: MemoryConsolidationOutput) -> List[str]:
@@ -128,12 +168,18 @@ def _consolidated_to_text(output: MemoryConsolidationOutput) -> List[str]:
             if (item.provenance or "").strip().lower() == "retrieval"
             else SourceType.SYSTEM_PREDICTION
         )
-        items.append(_format_memory_item(_strip_provenance_tag(item.content), prov))
+        formatted = _format_memory_item(_strip_provenance_tag(item.content), prov)
+        # Re-attach the consolidator's hop_depth so it survives into text_memory
+        # and the next consolidation pass can apply Hop Depth Filtering again.
+        hop = getattr(item, "hop_depth", None)
+        if hop is not None:
+            formatted = f"[hop={hop}] {formatted}"
+        items.append(formatted)
     return items
 
 
 def _stringify_triple(rel: Relation) -> str:
-    return f"Subject: {rel.subject} | Relation: {rel.relation} | Object: {rel.object}"
+    return format_triple_line(rel.subject, rel.relation, rel.object)
 
 
 def _node_key(name: str, qid: Optional[str]) -> str:
@@ -291,6 +337,33 @@ def _coerce_raw_triple_to_relation(triple: Any) -> Optional[Relation]:
         return None
     if isinstance(triple, Relation):
         return triple
+    if isinstance(triple, str):
+        # Readable KG triple ``subject [Qs] -- relation -- object [Qo]`` emitted
+        # by the wikidata tool. Split on ` -- `; pull the optional ``[Q…]`` id
+        # off each entity end so graph edges keep their QIDs.
+        parts = [p.strip() for p in triple.split(" -- ")]
+        if len(parts) != 3 or not all(parts):
+            return None
+
+        def _split_id(text: str) -> tuple[str, Optional[str]]:
+            m = re.search(r"\s*\[(Q\d+)\]\s*$", text)
+            if m:
+                return text[: m.start()].strip(), m.group(1)
+            return text.strip(), None
+
+        subj, subj_id = _split_id(parts[0])
+        obj, obj_id = _split_id(parts[2])
+        try:
+            return Relation(
+                subject=subj,
+                subject_id=subj_id,
+                relation=parts[1],
+                object=obj,
+                object_id=obj_id,
+                context=None,
+            )
+        except Exception:
+            return None
     if isinstance(triple, dict):
         try:
             return Relation(
@@ -346,21 +419,43 @@ def build_memory_update_graph(
     async def consolidate_pre(state: MemoryUpdateState) -> Dict[str, Any]:
         current = list(state.get("current_text_memory") or [])
         new_items = list(state.get("new_text_items") or [])
+        new_critiques = list(state.get("new_critique_items") or [])
         new_retrieval = list(state.get("new_retrieval_items") or [])
-        if not (current or new_items or new_retrieval):
+        if not (current or new_items or new_critiques or new_retrieval):
             return {"consolidated_memory": []}
 
-        # ``current`` items already carry tags from a previous consolidation
-        # pass (``_format_memory_item`` passes pre-tagged strings through);
-        # untagged strings default to [System Prediction]. Retrieval-grounded
-        # facts are tagged [Retrieval] so the consolidator's provenance audit
-        # and conflict-resolution rules can anchor on them.
-        tagged = [
-            _format_memory_item(item, SourceType.SYSTEM_PREDICTION)
-            for item in current + new_items
-        ] + [
-            _format_memory_item(item, SourceType.RETRIEVAL) for item in new_retrieval
-        ]
+        # ``current`` items already carry tags (and any ``[hop=N]`` prefix) from
+        # a previous consolidation pass (``_format_memory_item`` passes pre-tagged
+        # strings through); untagged strings default to [System Prediction].
+        # Retrieval-grounded facts are tagged [Retrieval] so the consolidator's
+        # provenance audit and conflict-resolution rules can anchor on them.
+        # NEW items get a ``[hop=N]`` prefix (when a depth is supplied) so Hop
+        # Depth Filtering can discard deeper items that overshoot a question
+        # already answered at a shallower hop. Mirroring legacy
+        # ``add_textual_memory(..., hop_depth=...)``, the hop is assigned per
+        # producing node: generated sub-answers/rollouts and retrieval facts at
+        # ``hop_depth``; verifier/self-correction critiques one level shallower
+        # at ``critique_hop_depth``.
+        def _hop_prefix(value: Optional[int]) -> str:
+            return f"[hop={value}] " if value is not None else ""
+
+        gen_prefix = _hop_prefix(state.get("hop_depth"))
+        crit_prefix = _hop_prefix(state.get("critique_hop_depth"))
+        tagged = (
+            [_format_memory_item(item, SourceType.SYSTEM_PREDICTION) for item in current]
+            + [
+                gen_prefix + _format_memory_item(item, SourceType.SYSTEM_PREDICTION)
+                for item in new_items
+            ]
+            + [
+                crit_prefix + _format_memory_item(item, SourceType.SYSTEM_PREDICTION)
+                for item in new_critiques
+            ]
+            + [
+                gen_prefix + _format_memory_item(item, SourceType.RETRIEVAL)
+                for item in new_retrieval
+            ]
+        )
 
         raw_blob = _format_lines(tagged)
         inp = MemoryConsolidationInput(

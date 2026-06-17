@@ -27,9 +27,14 @@ cleared via the :class:`Clear` sentinel reducer; cross-iteration memory
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import operator
+import os
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, TypeVar, Union
 
 import networkx as nx
@@ -214,6 +219,13 @@ async def rerank_context(
             return items
         return items[:top_k]
 
+    # When the candidate set already fits within top_k, reranking only reorders
+    # (it filters nothing). Downstream extraction reads the whole set, so order
+    # is immaterial — skip the network call. Avoids the bulk of small-batch
+    # reranker traffic (e.g. the 10-candidate calls in the eval logs).
+    if top_k is not None and top_k > 0 and len(items) <= top_k:
+        return items
+
     ranked = await call_sglang_reranker(query, items, cfg)
     if top_k is None or top_k <= 0:
         return [items[idx] for idx, _ in ranked]
@@ -287,6 +299,49 @@ def _split_into_char_batches(
     return batches
 
 
+def _maybe_dump_extraction(
+    question: str,
+    subqs: Sequence[str],
+    items: Sequence[str],
+    batches: Sequence[str],
+    facts: Sequence[str],
+) -> None:
+    """Diagnostic: dump EXTRACTOR input passages vs output facts to confirm or
+    kill the batching-dilution hypothesis (does the gold detail survive when
+    many reranked passages are packed into one extractor call?).
+
+    Off by default. Enable with ``COE_EXTRACT_DUMP_DIR=<dir>``; optionally narrow
+    to specific questions with ``COE_EXTRACT_DUMP_FILTER=<substr>`` (case-insensitive,
+    matched against the question) to avoid dumping the whole dataset. One JSON
+    file per extraction call. Never raises into the hot path.
+    """
+    dump_dir = os.environ.get("COE_EXTRACT_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        filt = os.environ.get("COE_EXTRACT_DUMP_FILTER")
+        if filt and filt.lower() not in (question or "").lower():
+            return
+        out_dir = Path(dump_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        qhash = hashlib.sha1((question or "").encode("utf-8")).hexdigest()[:10]
+        record = {
+            "question": question,
+            "subquestions": list(subqs),
+            "num_passages": len(items),
+            "passage_chars": [len(i) for i in items],
+            "num_batches": len(batches),
+            "batch_chars": [len(b) for b in batches],
+            "num_facts": len(facts),
+            "passages": list(items),  # raw reranked passages fed to the EXTRACTOR
+            "facts": list(facts),     # atomic facts that survived extraction
+        }
+        path = out_dir / f"{qhash}_{uuid.uuid4().hex[:8]}.json"
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
+    except Exception:  # diagnostics must never break a run
+        logger.warning("extraction dump failed", exc_info=True)
+
+
 async def extract_facts(
     registry: RoleModelRegistry,
     question: str,
@@ -340,7 +395,48 @@ async def extract_facts(
                 continue
             seen.add(key)
             facts.append(fact.strip())
+    _maybe_dump_extraction(question, subqs, items, batches, facts)
     return facts
+
+
+# coe parity: SUBQUESTION_GENERATOR is sampled with n completions and their
+# decompositions are pooled (coe/reasoning/generator.py:148 ``n_subquestions``).
+N_SUBQUESTIONS = 3
+
+
+def pool_subquestions(outputs: Any) -> tuple[List[str], List[bool], bool]:
+    """Pool ``n`` SUBQUESTION_GENERATOR completions into one decomposition.
+
+    Ports ``generate_subquestion`` (coe/reasoning/generator.py:144-163): only
+    completions that judged the question *not* answerable contribute their
+    subquestions; ``should_direct`` is the majority ``is_answerable`` vote.
+    Dedups ``(subquestion, needs_kg)`` pairs by text, preserving first-seen
+    order. Returns ``(subquestions, needs_kg_flags, should_direct)``.
+    """
+    if not isinstance(outputs, list):
+        outputs = [outputs]
+    outputs = [o for o in outputs if o is not None]
+    subqs: List[str] = []
+    flags: List[bool] = []
+    seen: set[str] = set()
+    answerable = 0
+    for out in outputs:
+        if bool(getattr(out, "is_answerable", False)):
+            answerable += 1
+            continue  # coe: answerable completions propose no subquestions
+        sq_list = getattr(out, "subquestions", None) or []
+        kg_list = getattr(out, "needs_kg", None) or []
+        for i, sq in enumerate(sq_list):
+            if not (isinstance(sq, str) and sq.strip()):
+                continue
+            key = sq.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            subqs.append(sq.strip())
+            flags.append(bool(kg_list[i]) if i < len(kg_list) else True)
+    should_direct = (answerable / len(outputs) > 0.5) if outputs else False
+    return subqs, flags, should_direct
 
 
 async def gather_evidence(
@@ -485,11 +581,16 @@ def build_cot_graph(
         question = state.get("question", "")
         ctx = _join_memory_context(state)
         inp = SubquestionGenerationInput(question=question, context=ctx)
-        out, _ = await execute_role_lc(registry, SUBQUESTION_GENERATOR, inp)
+        # coe parity: sample N completions, pool their decompositions.
+        outs, _ = await execute_role_lc(
+            registry, SUBQUESTION_GENERATOR, inp, n=N_SUBQUESTIONS
+        )
+        subqs, flags, should_direct = pool_subquestions(outs)
         return {
-            "is_answerable": bool(getattr(out, "is_answerable", False)),
-            "subquestions": list(getattr(out, "subquestions", None) or []),
-            "subquestion_needs_kg": list(getattr(out, "needs_kg", None) or []),
+            # "answerable" routes the loop to synthesis, same as the majority vote.
+            "is_answerable": should_direct or not subqs,
+            "subquestions": subqs,
+            "subquestion_needs_kg": flags,
         }
 
     async def kg_one(state: CoTState) -> Dict[str, Any]:
@@ -636,6 +737,12 @@ def build_cot_graph(
         return {"current_subanswers": answers}
 
     async def mem_update(state: CoTState) -> Dict[str, Any]:
+        # This iteration's sub-answers and retrieval facts were produced one hop
+        # below the current reasoning depth, so they get ``[hop=depth+1]`` —
+        # matching legacy CoT (``update_working_memory(result,
+        # hop_depth=current.depth + 1)``). ``depth`` here is still the current
+        # iteration's value; the ``increment`` node bumps it afterwards.
+        hop_depth = int(state.get("depth", 0) or 0) + 1
         payload = {
             "question": state.get("question", ""),
             "new_text_items": list(state.get("current_subanswers") or []),
@@ -646,6 +753,7 @@ def build_cot_graph(
             "current_text_memory": list(state.get("text_memory") or []),
             "current_graph": state.get("graph_memory") or nx.DiGraph(),
             "entity_dict": dict(state.get("entity_dict") or {}),
+            "hop_depth": hop_depth,
         }
         result = await memory_graph.ainvoke(payload)
         return {

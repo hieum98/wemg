@@ -16,7 +16,7 @@ class TierConfig(BaseModel):
     api_key: Optional[str] = None  # inherits from top-level llm.api_key
     temperature: float = 0.7
     max_tokens: int = 8192
-    max_input_tokens: int = 65536
+    max_input_tokens: int = 100000
     top_p: float = 0.95
     # Extra sampling controls. None = omit from the request so SGLang's own
     # default applies (don't send a neutral value you don't intend). top_k,

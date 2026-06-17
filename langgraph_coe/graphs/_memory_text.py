@@ -11,6 +11,14 @@ from typing import List, Optional
 
 import networkx as nx
 
+_TRIPLE_SEP = " — "
+
+
+def format_triple_line(subject: str, relation: str, obj: str) -> str:
+    """Render one triple as ``subj — rel — obj`` (canonical LGC memory format)."""
+    rel = (relation or "").strip() or "related_to"
+    return f"{subject}{_TRIPLE_SEP}{rel}{_TRIPLE_SEP}{obj}"
+
 
 def textualize_graph(graph: Optional[nx.DiGraph]) -> str:
     """Render a memory ``DiGraph`` as newline-joined ``subj — rel — obj`` lines.
@@ -34,9 +42,9 @@ def textualize_graph(graph: Optional[nx.DiGraph]) -> str:
         rel = data.get("relation")
         if isinstance(rel, (set, list, tuple)):
             for r in rel:
-                lines.append(f"{su} — {r} — {sv}")
+                lines.append(format_triple_line(su, str(r), sv))
         elif rel:
-            lines.append(f"{su} — {rel} — {sv}")
+            lines.append(format_triple_line(su, str(rel), sv))
         else:
-            lines.append(f"{su} — related_to — {sv}")
+            lines.append(format_triple_line(su, "related_to", sv))
     return "\n".join(lines)

@@ -9,6 +9,7 @@ The optional reranker speaks SGLang's Cohere-compatible ``/v1/rerank`` API.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Mapping
@@ -26,6 +27,25 @@ from langchain_openai import OpenAIEmbeddings
 from ..config import CorpusConfig, EmbedderConfig, RerankerConfig, RetrieverConfig
 
 logger = logging.getLogger(__name__)
+
+# Bound concurrent reranker requests. The eval fans out many rerank calls at
+# once (per-subquestion × subquestions × the memory re-verification pass), and
+# each opens a fresh connection to the single SGLang reranker. Without a cap the
+# simultaneous TCP handshakes overrun the server's accept backlog and new
+# connections ConnectTimeout (even though one call serves in ~50ms). Module-level
+# Semaphore is loop-agnostic on 3.10+ (binds to the running loop on first await).
+_RERANK_CONCURRENCY = 8
+_RERANK_SEM = asyncio.Semaphore(_RERANK_CONCURRENCY)
+
+# Bound concurrent corpus (FAISS) searches. Each ``corpus_search`` runs the
+# sync FAISS query on the 99GB index in a worker thread; the eval fans out many
+# at once (per-subquestion × subquestions × the memory re-verification pass).
+# Unbounded, they saturate the worker-thread pool that httpx also uses for DNS
+# (getaddrinfo) — starving it so new connections to ANY host (reranker, SPARQL,
+# Wikidata) ConnectTimeout even though those servers are idle. Cap leaves the
+# pool headroom for DNS/connect work.
+_CORPUS_CONCURRENCY = 8
+_CORPUS_SEM = asyncio.Semaphore(_CORPUS_CONCURRENCY)
 
 
 def close_fsspec_async_sessions() -> None:
@@ -100,7 +120,7 @@ async def call_sglang_reranker(
     texts: Sequence[str],
     cfg: RerankerConfig,
     *,
-    timeout: float = 30.0,
+    timeout: float = 120.0,
 ) -> List[Tuple[int, float]]:
     """POST to the SGLang ``/rerank`` endpoint and return ``[(index, score), ...]``."""
     if not texts:
@@ -118,8 +138,26 @@ async def call_sglang_reranker(
     headers = {"Authorization": f"Bearer {cfg.api_key or 'EMPTY'}"}
     endpoint = f"{cfg.url.rstrip('/')}/rerank"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(endpoint, json=payload, headers=headers)
+    # Generous read budget for large/queued batches (up to ~100 candidates on a
+    # busy reranker), but keep connect short so a dead endpoint fails fast.
+    client_timeout = httpx.Timeout(timeout, connect=10.0)
+    async with _RERANK_SEM, httpx.AsyncClient(timeout=client_timeout) as client:
+        try:
+            resp = await client.post(endpoint, json=payload, headers=headers)
+        except httpx.TransportError as exc:
+            # Transient connectivity (ConnectTimeout/ReadTimeout/ConnectError):
+            # degrade to identity order instead of losing the whole question.
+            # Quality-only drop — candidates arrive already relevance-ordered
+            # from FAISS / KG. HTTP-status and parse errors below still raise
+            # (they signal a real bug, not a flaky endpoint). Warn, not silent.
+            logger.warning(
+                "[reranker] %s contacting %s; falling back to identity order "
+                "for %d candidates",
+                type(exc).__name__,
+                endpoint,
+                len(texts),
+            )
+            return [(i, 0.0) for i in range(len(texts))]
 
     if resp.status_code >= 400:
         body_preview = resp.text[:2000]
@@ -174,6 +212,10 @@ async def _rerank_documents(
     """Rerank ``Document`` objects via SGLang and return top-``cfg.top_k``."""
     if not documents:
         return []
+    # When the candidate set already fits within top_k, reranking only reorders
+    # (it filters nothing) — skip the network call and return as-is.
+    if cfg.top_k and len(documents) <= cfg.top_k:
+        return list(documents)
     texts = [doc.page_content for doc in documents]
     ranked = await call_sglang_reranker(query, texts, cfg)
     top = ranked[: cfg.top_k]
@@ -424,7 +466,16 @@ async def corpus_search(query: str, top_k: Optional[int] = None) -> List[str]:
             "Retriever pipeline not initialized. Call init_retrieval_pipeline first."
         )
 
-    docs = await _retriever_instance.ainvoke(query)
+    # An empty/whitespace query yields an effectively-empty embedding request,
+    # which the SGLang embedding endpoint rejects with a 400 (ValueError). This
+    # happens when an upstream role's output was truncated/blank, so short-circuit
+    # here rather than failing the whole retrieval step. Warn — never silent.
+    if not query or not query.strip():
+        logger.warning("corpus_search received an empty query; returning no passages.")
+        return []
+
+    async with _CORPUS_SEM:
+        docs = await _retriever_instance.ainvoke(query)
 
     if _reranker_config and _reranker_config.enabled:
         docs = await _rerank_documents(docs, query, _reranker_config)

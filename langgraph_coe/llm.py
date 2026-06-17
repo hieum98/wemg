@@ -1,6 +1,7 @@
 """LangGraph-CoE: LLM Execution Layer with tier-based model selection."""
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -26,6 +27,15 @@ _ROLE_ITEM_CONCURRENCY = max(
     1, int(os.environ.get("LANGGRAPH_ROLE_ITEM_CONCURRENCY", "16"))
 )
 
+# Legacy parity: when an item produces no parseable structured output, retry the
+# whole batch with "shaken" sampling params (new seed + nudged temperature/top_p)
+# up to this many attempts before giving up. The fixed per-tier ``seed`` makes a
+# naive resample deterministic, so varying the seed is what actually yields a
+# different sample. Override via ``LANGGRAPH_STRUCT_PARSE_RETRIES``.
+_STRUCT_PARSE_RETRIES = max(
+    1, int(os.environ.get("LANGGRAPH_STRUCT_PARSE_RETRIES", "3"))
+)
+
 
 def format_messages(role: Role, item: BaseModel) -> List[Any]:
     """Format prompt messages for a given role and input item."""
@@ -35,6 +45,93 @@ def format_messages(role: Role, item: BaseModel) -> List[Any]:
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
     ]
+
+
+# Conservative chars-per-token used to estimate prompt size for the input guard.
+# KG triples, entity IDs and JSON tokenize densely (often <3.5 chars/token), so
+# we deliberately under-assume to trim a little early rather than risk slipping
+# over the server's context window. A rough estimate is fine here — this guards
+# against catastrophic context-length 400s, not exact token accounting.
+_CHARS_PER_TOKEN = 3.0
+_TRUNCATION_NOTICE = "\n\n…[input truncated to fit the model context budget]…\n\n"
+
+
+def _truncate_messages_to_budget(
+    messages: List[Any], max_input_tokens: Optional[int], role_name: str
+) -> List[Any]:
+    """Cap the estimated prompt size at ``max_input_tokens`` (best-effort).
+
+    Only the final (user) message is trimmed — earlier messages (the role's
+    system prompt) are preserved whole. The user payload is trimmed by keeping
+    its head and tail and dropping the middle, so the question and any trailing
+    instructions survive while the bulky accumulated memory/retrieval in the
+    middle is dropped. Emits a WARNING when it fires — never a silent drop.
+    """
+    if not max_input_tokens or max_input_tokens <= 0 or not messages:
+        return messages
+    budget_chars = int(max_input_tokens * _CHARS_PER_TOKEN)
+    sizes = [len(_content_to_text(m.content)) for m in messages]
+    total = sum(sizes)
+    if total <= budget_chars:
+        return messages
+    # Everything except the last message (the system prompt) is kept whole; the
+    # last message is the trimmable user payload.
+    fixed = sum(sizes[:-1])
+    user_budget = budget_chars - fixed - len(_TRUNCATION_NOTICE)
+    last = messages[-1]
+    user_text = _content_to_text(last.content)
+    if user_budget <= 0:
+        logger.warning(
+            "[input_guard] role=%s: non-user messages (%d chars) already exceed "
+            "the budget (max_input_tokens=%d ≈ %d chars); sending unmodified — "
+            "expect a context-length error.",
+            role_name,
+            fixed,
+            max_input_tokens,
+            budget_chars,
+        )
+        return messages
+    head = user_budget // 2
+    tail = user_budget - head
+    truncated = user_text[:head] + _TRUNCATION_NOTICE + user_text[-tail:]
+    logger.warning(
+        "[input_guard] role=%s prompt ≈%d tok > max_input_tokens=%d; trimmed "
+        "user payload %d→%d chars (head=%d, tail=%d).",
+        role_name,
+        int(total / _CHARS_PER_TOKEN),
+        max_input_tokens,
+        len(user_text),
+        len(truncated),
+        head,
+        tail,
+    )
+    new_messages = list(messages[:-1])
+    new_messages.append(type(last)(content=truncated))
+    return new_messages
+
+
+def _unwrap_serialized_generation(text: str) -> str:
+    """Recover the real model output when ``content`` is a serialized generation.
+
+    Reasoning models under SGLang/litellm sometimes serialize the entire
+    ``ChatGeneration`` (a ``{"lc": 1, ..., "kwargs": {"text": "<real output>",
+    "message": {...thinking...}}}`` blob) into the message ``content`` string.
+    The user-facing output then lives, JSON-escaped, in ``kwargs.text`` while the
+    message content holds only the thinking trace — so structured parsing and the
+    regex fallback both fail on the wrapper. Unwrap to ``kwargs.text`` (which
+    ``json.loads`` returns already-unescaped) so downstream parsing sees the
+    clean output. Returns *text* unchanged when it isn't such a wrapper.
+    """
+    if not text.lstrip().startswith('{"lc"'):
+        return text
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+    kwargs = obj.get("kwargs") if isinstance(obj, dict) else None
+    if isinstance(kwargs, dict) and isinstance(kwargs.get("text"), str) and kwargs["text"].strip():
+        return kwargs["text"]
+    return text
 
 
 def _content_to_text(content: Any) -> str:
@@ -48,7 +145,7 @@ def _content_to_text(content: Any) -> str:
     silently lose information.
     """
     if isinstance(content, str):
-        return content
+        return _unwrap_serialized_generation(content)
     if isinstance(content, (bytes, bytearray)):
         return content.decode("utf-8", errors="replace")
     if isinstance(content, list):
@@ -110,6 +207,42 @@ def parse_fallback(role: Role, raw_text: Any) -> Optional[BaseModel]:
     return role.output_model(**parsed_dict)
 
 
+def build_safe_default_output(role: Role) -> BaseModel:
+    """Construct a neutral, valid instance of a role's output model.
+
+    Used as a last resort when no completion parses after all shake retries: we
+    return this empty/neutral structure (warning loudly) instead of raising, so a
+    single un-parseable LLM response never breaks the surrounding graph loop. The
+    caller treats it as a no-result for that node. Required scalar fields get a
+    type-appropriate zero value; lists get ``[]``; optional/defaulted fields are
+    left to pydantic. Falls back to ``model_construct`` if a constrained field
+    (e.g. a regex-validated literal) rejects the zero value.
+    """
+    defaults: Dict[str, Any] = {}
+    zero_by_type = {
+        "str": "",
+        "Literal": "",
+        "int": 0,
+        "float": 0.0,
+        "bool": False,
+        "list": [],
+        "List": [],
+    }
+    for name, field in role.output_model.model_fields.items():
+        vtype, _opt = extraction_type_from_annotation(field.annotation)
+        if vtype in ("list", "List"):
+            # Always [] (never None) — even for optional list fields — so callers
+            # that iterate the result can't trip over a None and break the loop.
+            defaults[name] = []
+        elif field.is_required():
+            defaults[name] = zero_by_type.get(vtype, None)
+        # else: optional scalar — leave pydantic's configured default
+    try:
+        return role.output_model(**defaults)
+    except Exception:  # noqa: BLE001 — constrained field; skip validation
+        return role.output_model.model_construct(**defaults)
+
+
 class RoleModelRegistry:
     """Maps role names → ChatLiteLLM instances via tier indirection.
 
@@ -124,6 +257,14 @@ class RoleModelRegistry:
 
     def _get_tier(self, role_name: str) -> str:
         return self._role_tiers.get(role_name, "heavy")
+
+    def get_max_input_tokens(
+        self, role_name: str, tier_override: Optional[str] = None
+    ) -> int:
+        """Prompt-token ceiling for a role's tier (enforced by the input guard)."""
+        tier = tier_override or self._get_tier(role_name)
+        cfg = self._tiers.get(tier) or self._tiers.get("heavy")
+        return cfg.max_input_tokens if cfg else 0
 
     def get_model_by_tier(self, tier: str) -> ChatLiteLLM:
         """Get or create the ChatLiteLLM for a specific tier."""
@@ -222,38 +363,104 @@ async def execute_role_lc(
         model = registry.get_model(role.name)
 
     chain = model.with_structured_output(role.output_model, include_raw=True)
+    max_input_tokens = registry.get_max_input_tokens(role.name, tier_override)
+
+    def _shaken_chain(attempt: int) -> Runnable:
+        """Rebuild the structured chain with perturbed sampling for a retry.
+
+        ``attempt == 0`` uses the configured params. Later attempts vary the
+        ``seed`` (the tiers pin a fixed seed, so resampling otherwise reproduces
+        the same failure) and nudge ``temperature``/``top_p`` upward (capped),
+        mirroring legacy's failure-escalation. ``model_copy`` keeps the cached
+        client; the overridden knobs ride through to SGLang per call.
+        """
+        if attempt == 0:
+            return chain
+        base_kwargs = dict(getattr(model, "model_kwargs", None) or {})
+        base_seed = base_kwargs.get("seed")
+        base_kwargs["seed"] = (base_seed if isinstance(base_seed, int) else 0) + 1000 * attempt
+        base_top_p = base_kwargs.get("top_p", 0.95) or 0.95
+        base_kwargs["top_p"] = min(1.0, base_top_p + 0.05 * attempt)
+        base_temp = getattr(model, "temperature", 1.0)
+        new_temp = min(1.0, (base_temp if base_temp is not None else 1.0) + 0.1 * attempt)
+        perturbed = model.model_copy(
+            update={"temperature": new_temp, "model_kwargs": base_kwargs}
+        )
+        return perturbed.with_structured_output(role.output_model, include_raw=True)
+
+    def _collect(results: List[Any]) -> Tuple[List[BaseModel], List[Exception]]:
+        """Pull parsed models out of a gather() batch, catching per-completion
+        parse failures so one bad completion can't abort an otherwise good batch."""
+        parsed: List[BaseModel] = []
+        errors: List[Exception] = []
+        for r in results:
+            if isinstance(r, Exception):
+                errors.append(r)
+                continue
+            try:
+                if isinstance(r, dict):
+                    if isinstance(r.get("parsed"), role.output_model):
+                        parsed.append(r["parsed"])
+                        continue
+                    raw = r.get("raw")
+                    if raw is not None and hasattr(raw, "content"):
+                        fallback = parse_fallback(role, raw.content)
+                        if fallback:
+                            parsed.append(fallback)
+                elif isinstance(r, role.output_model):
+                    parsed.append(r)
+            except Exception as e:  # noqa: BLE001 — keep other completions alive
+                errors.append(e)
+        return parsed, errors
 
     async def _run_item(item: BaseModel) -> List[BaseModel]:
-        """Execute one input item (n completions, gathered) → its parsed outputs."""
+        """Execute one input item (n completions, gathered) → its parsed outputs.
+
+        Retries the whole batch with shaken sampling params up to
+        ``_STRUCT_PARSE_RETRIES`` times when nothing parses (legacy parity)."""
         messages = format_messages(role, item)  # system + user only
+        messages = _truncate_messages_to_budget(
+            messages, max_input_tokens, role.name
+        )
 
-        # Parallel execution for N completions of this one item.
-        tasks = [chain.ainvoke(messages) for _ in range(n)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        last_errors: List[Exception] = []
+        for attempt in range(_STRUCT_PARSE_RETRIES):
+            attempt_chain = _shaken_chain(attempt)
+            # Parallel execution for N completions of this one item.
+            tasks = [attempt_chain.ainvoke(messages) for _ in range(n)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            parsed, last_errors = _collect(results)
+            if parsed:
+                if attempt > 0:
+                    logger.info(
+                        "[%s] recovered structured output after %d shake retr%s",
+                        role.name,
+                        attempt,
+                        "y" if attempt == 1 else "ies",
+                    )
+                return parsed
+            if attempt < _STRUCT_PARSE_RETRIES - 1:
+                logger.warning(
+                    "[%s] no parseable structured output (attempt %d/%d); "
+                    "shaking sampling params (seed/temperature/top_p) and retrying",
+                    role.name,
+                    attempt + 1,
+                    _STRUCT_PARSE_RETRIES,
+                )
 
-        parsed: List[BaseModel] = []
-        for r in results:
-            if isinstance(r, dict):
-                # Langchain return format with include_raw=True
-                if "parsed" in r and isinstance(r["parsed"], role.output_model):
-                    parsed.append(r["parsed"])
-                elif "raw" in r and hasattr(r["raw"], "content"):
-                    fallback = parse_fallback(role, r["raw"].content)
-                    if fallback:
-                        parsed.append(fallback)
-            elif isinstance(r, role.output_model):
-                # Just in case some provider returns the object directly
-                parsed.append(r)
-
-        if not parsed:
-            # All N completions failed — raise so RetryPolicy catches it.
-            errors = [r for r in results if isinstance(r, Exception)]
-            raise (
-                errors[0]
-                if errors
-                else RuntimeError(f"No valid output for {role.name}")
-            )
-        return parsed
+        # All attempts failed. Do NOT raise — a single un-parseable response must
+        # not break the surrounding graph loop. Warn loudly (with the underlying
+        # error so outages stay observable) and return a neutral, valid default
+        # structure for the caller to treat as a no-result.
+        reason = repr(last_errors[0]) if last_errors else "no parseable completion"
+        logger.warning(
+            "[%s] no valid structured output after %d shaken attempts (%s); "
+            "returning a neutral default so the loop continues",
+            role.name,
+            _STRUCT_PARSE_RETRIES,
+            reason,
+        )
+        return [build_safe_default_output(role)]
 
     # Items in a list are independent, so run them concurrently (bounded). A
     # single item (or single-input call) takes the trivial path. Order of

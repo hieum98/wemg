@@ -149,11 +149,14 @@ async def _stage_a_prune(
     if instruction:
         payload["instruct"] = instruction
     try:
-        async with httpx.AsyncClient() as client:
+        # Generous read budget for large/queued batches (up to ~128 triples on a
+        # busy reranker), but keep connect short so a dead endpoint fails fast.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=10.0)
+        ) as client:
             resp = await client.post(
                 f"{reranker_url.rstrip('/')}/rerank",
                 json=payload,
-                timeout=30.0,
             )
             resp.raise_for_status()
             body = resp.json()
@@ -175,7 +178,11 @@ async def _stage_a_prune(
         return [triples[i] for i in kept_indices]
 
     except Exception as exc:
-        logger.warning("Stage A reranker failed (%s); returning all triples.", exc)
+        logger.warning(
+            "Stage A reranker failed (%s: %r); returning all triples.",
+            type(exc).__name__,
+            exc,
+        )
         return triples
 
 
@@ -248,7 +255,15 @@ async def link_entities(entity_names: List[str]) -> List[Dict[str, str]]:
                     if candidates:
                         entity_cache[name] = candidates[0].qid
         except Exception as exc:
-            logger.warning("Entity linking failed: %s", exc)
+            # str(exc) is empty for many failure types (timeouts, connection
+            # errors); log the type + repr + names so the cause is visible.
+            logger.warning(
+                "Entity linking failed for %s: %s: %r",
+                to_resolve[:5],
+                type(exc).__name__,
+                exc,
+            )
+            logger.debug("Entity linking traceback", exc_info=True)
 
     for name in entity_names:
         qid = entity_cache.get(name)
@@ -341,7 +356,49 @@ async def _fetch_and_prune_subgraph_core(
     if registry is not None:
         triples = await _stage_b_prune(query, triples, registry)
 
-    return triples
+    # Return readable triple strings (labels), each carrying the object QID in
+    # ``[Q…]`` so the tool-calling agent can pick which object to extend into on
+    # the next hop. Raw QIDs alone are unreadable; bare labels can't be re-seeded.
+    # Format ``subject [Qs] -- relation -- object [Qo]`` is parsed back into a
+    # graph edge downstream (memory_update._coerce_raw_triple_to_relation).
+    return [_format_triple_for_agent(t) for t in triples]
+
+
+def _format_triple_for_agent(triple: WikiTriple) -> str:
+    """Render one triple as ``subject [Qs] -- relation -- object [Qo]``.
+
+    Labels make it human/LLM readable; the bracketed object QID lets the agent
+    re-seed ``fetch_and_prune_subgraph`` to traverse the next hop. Literal
+    objects (dates, numbers) have no QID and render as plain text.
+    """
+
+    def _part(node: Any) -> str:
+        if isinstance(node, WikidataEntity):
+            # A bare QID is meaningless for the agent's reasoning, so fall back
+            # through every semantic field we have before resorting to the id:
+            # label → first alias → description → QID. The ``[QID]`` suffix is
+            # always kept as the hop handle (so the agent can re-seed) and as the
+            # id the downstream parser recovers.
+            name = (node.label or "").strip()
+            if not name:
+                name = next(
+                    (a.strip() for a in (node.aliases or []) if a and a.strip()), ""
+                )
+            if not name:
+                name = (node.description or "").strip()
+            if not name:
+                name = (node.qid or "").strip()
+                if node.qid:
+                    logger.debug(
+                        "KG triple entity %s has no label/alias/description; "
+                        "rendering bare QID (no semantics for the agent)",
+                        node.qid,
+                    )
+            return f"{name} [{node.qid}]" if node.qid else name
+        return str(node).strip()
+
+    relation = str(triple.relation).strip()
+    return f"{_part(triple.subject)} -- {relation} -- {_part(triple.object)}"
 
 
 @tool

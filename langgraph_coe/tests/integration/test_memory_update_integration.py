@@ -281,7 +281,7 @@ async def test_memory_update_raw_triples_dedup_and_non_mutation(live_wikidata):
     )
     print(final)
 
-    dup_triple = "Subject: France | Relation: has_capital | Object: Paris"
+    dup_triple = "France — has_capital — Paris"
     assert dup_triple not in final["kept_triples"], (
         "duplicate edge reached the pruner — dedup filter (_relation_already_in_graph) failed"
     )
@@ -352,10 +352,7 @@ async def test_memory_update_pruner_batching_across_chunks(live_wikidata):
         )
         for i in range(18)
     ]
-    valid_strings = {
-        f"Subject: Entity{i} | Relation: related_to | Object: Topic{i}"
-        for i in range(18)
-    }
+    valid_strings = {f"Entity{i} — related_to — Topic{i}" for i in range(18)}
 
     final = await graph.ainvoke(
         {

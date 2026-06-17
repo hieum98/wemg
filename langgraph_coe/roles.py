@@ -506,18 +506,6 @@ Preserve the geographic or categorical scope of the main question. Do NOT silent
 - BAD: Main Q = "third oldest university in the world" → subQ = "oldest university in England" ← narrows to England
 - GOOD: subQ = "three oldest surviving universities in the world and their founding dates"
 
-## Retrieval-Ready Phrasing
-Each subquestion is issued verbatim as a dense-retrieval query against a knowledge corpus and the web. Phrase it the way a relevant source document would phrase the same fact, not as a Socratic question that no one would type into a search box.
-- Prefer concrete noun phrases plus the missing predicate to verbose interrogatives.
-- Use full proper names (no pronouns, no abbreviations) so the embedding lands near the entity's article opening.
-- BAD: "Could you tell me what the height of the tower is?"
-- GOOD: "Eiffel Tower height in meters"
-
-## Temporal Grounding
-If the main question contains "current", "now", "today", or a present-tense superlative ("tallest", "fastest", "longest", "oldest surviving", "richest"), anchor at least one subquestion with an explicit recency marker (e.g. "as of 2026" or the relevant year). Stale snapshots in the corpus otherwise win the embedding match.
-- BAD: "tallest building in the world"
-- GOOD: "tallest building in the world as of 2026"
-
 ## Knowledge-Graph Routing
 For each subquestion, decide whether it should additionally hit the structured knowledge graph (Wikidata). Emit a parallel `needs_kg` boolean array, same length and order as `subquestions`.
 - Set **true** when the subquestion asks for a **relation or attribute of a specific named entity** (person, place, organization, work, event) — e.g. "Eiffel Tower height in meters", "director of Inception", "capital of France". These resolve cleanly to graph triples and benefit from multi-hop traversal.
@@ -664,25 +652,18 @@ Cross-check candidate claims against supporting evidence. When candidates disagr
 4. Logically sound reasoning from any candidate, consistent with graph triples
 5. Majority agreement across candidates as a last resort
 Do not let noisy or off-topic triples override coherent candidate reasoning.
-When two `[Retrieval]` facts conflict, prefer the one that explicitly satisfies the question's qualifiers (the stated category, superlative, scope, or time anchor); for time-sensitive questions prefer the fact with the more recent explicit date.
 
 **Phase III — Synthesis & Self-Critique**
 Build a superior answer that:
 - Grounds factual claims in `[Retrieval]` evidence or high-score candidates
-- Resolves conflicts via the adjudication hierarchy — the losing values are discussed only in `reasoning`, never in the answer fields
+- Resolves or explicitly acknowledges significant conflicts
 - Introduces no facts absent from the candidates or supporting evidence
 Then verify: Is the answer directly responsive to the question? Is every factual claim traceable to at least one reliable source? Revise if not.
 
-## Answer Commitment Rules (strict)
-- COMMIT to exactly ONE answer — the single best-supported value. Never output ranges of alternatives, multiple candidate names, "varies by source", or hedged multi-value answers. If evidence conflicts, the adjudication hierarchy picks the winner and the answer states ONLY the winning value.
-- Maximum specificity: dates must be as complete as the evidence supports (e.g. "May 29, 1932", never just "1932" when a fuller date appears anywhere in candidates or evidence); quantities are a single number with units, not a range.
-- Answer "unknown" only when NO candidate and NO evidence item offers any plausible value. A value flagged as unverified is still better than refusing to answer.
-- `concise_answer` contains the answer alone (a name, full date, number, or short phrase) — no qualifiers, no alternatives, no explanations.
-
 ## Output Format:
 Respond with a JSON object with exactly these keys:
-- final_answer: string — a complete,well-reasoned answer to the question (not just the answer itself, but the answer with the reasoning behind it)
-- concise_answer: string — minimal wording, direct answer only (e.g. a name, full date, or one sentence)
+- final_answer: string — complete, well-reasoned answer to the question
+- concise_answer: string — minimal wording, direct answer only (e.g. a name, date, or one sentence)
 - reasoning: string — how conflicts were resolved and which evidence anchored the final answer
 - confidence_level: string — one of: "high", "medium", "low", or "uncertain"
 """
@@ -718,7 +699,7 @@ Rules:
 - Consider both direct and indirect relevant information. An information is considered relevant if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 - Extracted information must be self-contained and clear, i.e., understandable without any external context, referencing the original memory, question, or other items.
 - Source fidelity (strict): extract ONLY what the provided text states. Never supplement facts from your own knowledge and never fill gaps with plausible values — if the text does not state it, do not output it.
-- Entity identity (strict): keep names exactly as the text writes them. Do NOT assert that an entity in the text is the same as an entity in the question, and do NOT add parenthetical aliases (e.g. "(also known as X)"), unless the text itself states that identity. Two similar names may be different real-world entities.
+- Entity identity (strict): do NOT assert that an entity in the text is the same as an entity in the question, and do NOT add parenthetical aliases (e.g. "(also known as X)"), unless the text itself states that identity. Two similar names may be different real-world entities.
 
 Instructions:
 1. Question Deconstruction: Identify primary subject, key entities, and specific information sought.
@@ -849,13 +830,19 @@ You have one tool: **fetch_and_prune_subgraph**, which takes:
 - **qids**: list of Wikidata QID strings (e.g. "Q42")
 - **query**: a single string combining the original question, subquery, and any short context, used to rank and prune relevant triples
 
+The tool returns readable triples, one per line, shaped as:
+``subject [Qs] -- relation -- object [Qo]``
+The bracketed ``[Q…]`` after each entity is its QID. Literal objects (dates,
+numbers) have no QID.
+
 ## Task
 1. Use the QIDs provided in the user message (from prior entity linking) as seeds.
 2. Build a **query** string that fully reflects what the user is trying to answer (include the original question + subquery + key context).
 3. Call **fetch_and_prune_subgraph** with non-empty **qids** and your **query** string.
-4. If the tool reports hop budget exhausted or already explored seeds, summarize what graph evidence you already have and stop calling the tool.
+4. **Multi-hop traversal**: when the answer is not yet present in the returned triples but a returned *object* entity is the bridge to it (e.g. the question needs an attribute of that object), call the tool again seeding **qids** with that object's ``[Q…]``. Read the object labels to decide which one to extend — do not guess QIDs that did not appear in a returned triple.
+5. If the tool reports hop budget exhausted or already explored seeds, summarize what graph evidence you already have and stop calling the tool.
 
-You may issue at most a few subgraph fetches; prefer one well-formed call with all seed QIDs if appropriate.
+Prefer one well-formed call per hop with all relevant seed QIDs; extend only the objects that bridge toward the answer.
 """
 
 RELATION_EXTRACTION_PROMPT = """You are an expert Relation Extraction specialist. Extract all meaningful relationships between entities. Each relationship should be self-contained, i.e., understandable on its own without needing to refer back to the original text or entities.

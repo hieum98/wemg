@@ -653,12 +653,19 @@ async def test_memory_update_receives_expansion_rollout_and_verifier_text(monkey
 
     assert memory.calls, "mem_update must invoke MemoryUpdateGraph after backprop"
     payload = memory.calls[0]
+    # Generated sub-answers + rollouts share the expansion hop in
+    # ``new_text_items``; verifier critiques carry the shallower hop and so are
+    # routed to ``new_critique_items`` (legacy tags self-correction assessments
+    # at ``node.depth``, one level above ``node.depth + 1``).
     joined_text = "\n".join(map(str, payload["new_text_items"]))
     assert "Expanded subanswer Paris." in joined_text
     assert "Rollout says Paris." in joined_text
-    assert "critique no context" in joined_text
-    assert "critique text" in joined_text
-    assert "critique graph" in joined_text
+    joined_critiques = "\n".join(map(str, payload["new_critique_items"]))
+    assert "critique no context" in joined_critiques
+    assert "critique text" in joined_critiques
+    assert "critique graph" in joined_critiques
+    # Critiques are tagged one hop shallower than generated/retrieved items.
+    assert payload["critique_hop_depth"] == payload["hop_depth"] - 1
     assert "France | capital | Paris" in payload["new_raw_triples"]
     assert final["text_memory"] == ["Updated MCTS memory"]
     assert final["entity_dict"] == {"Q90": "Paris"}

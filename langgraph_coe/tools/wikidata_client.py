@@ -27,6 +27,7 @@ from typing import (
     Union,
 )
 
+import httpx
 import pydantic
 
 from .wikidata_backend import (
@@ -709,6 +710,22 @@ class WikidataClient:
                     retry_after = (
                         e.retry_after if e.retry_after is not None else (2**attempt)
                     )
+                except httpx.TransportError as e:
+                    # Connect/read timeouts and dropped connections under
+                    # concurrent load (egress saturation, or Wikimedia SYN-
+                    # throttling a shared IP) are NOT 429s but are transient.
+                    # Back off and retry like a rate-limit instead of failing
+                    # the call outright (which loses the entity link / triple).
+                    if attempt >= MAX_RETRIES - 1:
+                        raise
+                    logger.warning(
+                        "Wikidata backend %s (attempt %d/%d); backing off %ds",
+                        type(e).__name__,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        2**attempt,
+                    )
+                    retry_after = 2**attempt
             await asyncio.sleep(retry_after)
         raise RuntimeError("unreachable")  # for type checkers
 

@@ -50,9 +50,20 @@ from ..roles import (
     SubquestionGenerationInput,
 )
 from ._memory_text import textualize_graph as _textualize_graph
-from .cot import Clear, append_or_clear, build_cot_graph, gather_evidence
+from .cot import (
+    Clear,
+    N_SUBQUESTIONS,
+    append_or_clear,
+    build_cot_graph,
+    gather_evidence,
+    pool_subquestions,
+)
 from .kg_search import build_kg_search_graph
-from .memory_update import build_memory_update_graph
+from .memory_update import (
+    _is_retrieval_grounded,
+    _strip_provenance_tag,
+    build_memory_update_graph,
+)
 from .web_research import build_web_research_graph
 
 logger = logging.getLogger(__name__)
@@ -139,6 +150,10 @@ class MCTSState(TypedDict, total=False):
     graph_memory: nx.DiGraph
     entity_dict: Dict[str, Any]
 
+    # Memory facts already re-verified (recheck-on-retrieval); each distinct
+    # fact is re-grounded once over the run to corroborate/gap-fill/evict it.
+    reverified_facts: List[str]
+
     # Early termination tracking
     semantic_sufficiency_signals: int
     iterations_without_improvement: int
@@ -220,6 +235,18 @@ def _answer_text(out: Any) -> str:
     return getattr(out, "concise_answer", None) or getattr(out, "answer", "") or ""
 
 
+def _merge_ev(*evs: Dict[str, Any]) -> Dict[str, Any]:
+    """Union the ``{facts, triples}`` evidence dicts from the expansion generators."""
+    facts: List[str] = []
+    triples: List[Any] = []
+    for ev in evs:
+        if not ev:
+            continue
+        facts.extend(ev.get("facts") or [])
+        triples.extend(ev.get("triples") or [])
+    return {"facts": facts, "triples": triples}
+
+
 def _leaf_depth(path: List[str]) -> int:
     """Tree depth of the selected leaf (root = 0)."""
     return max(0, len(path) - 1)
@@ -286,15 +313,15 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         a FINAL_ANSWER child instead. ``evidence`` carries the retrieval facts/
         triples for memory persistence.
         """
-        out, _ = await execute_role_lc(
+        # coe parity: sample N completions, pool their decompositions (n=3).
+        outs, _ = await execute_role_lc(
             registry,
             SUBQUESTION_GENERATOR,
             SubquestionGenerationInput(question=question, context=ctx),
+            n=N_SUBQUESTIONS,
         )
-        subqs = [
-            s for s in (getattr(out, "subquestions", None) or []) if s and s.strip()
-        ]
-        if bool(getattr(out, "is_answerable", False)) or not subqs:
+        subqs, kg_flags, should_direct = pool_subquestions(outs)
+        if should_direct or not subqs:
             return [], True, {}
 
         # Ground subanswers in retrieved evidence (corpus + gated KG fan-out →
@@ -303,7 +330,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             registry,
             question,
             subqs,
-            needs_kg=list(getattr(out, "needs_kg", None) or []),
+            needs_kg=kg_flags,
             memory_context=ctx,
             entity_dict=state.get("entity_dict"),
             kg_graph=kg_graph,
@@ -345,53 +372,172 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             "triples": list(evidence.get("raw_triples") or []),
         }
 
-    async def _gen_final(
-        question: str, parent_id: str, ctx: str, state: MCTSState
-    ) -> List[MCTSTreeNode]:
-        candidates = list(state.get("text_memory") or []) or [
-            "No prior reasoning available."
+    async def _explore_for(question: str, target_q: str, ctx: str, state: MCTSState):
+        """coe parity: one fresh retrieval pass (gather_evidence) for ``target_q``.
+
+        Returns ``(answer_ctx, evidence)`` where ``answer_ctx`` prepends the
+        distilled facts to the memory context and ``evidence`` is the
+        ``{facts, triples}`` dict for persistence.
+        """
+        evidence = await gather_evidence(
+            registry,
+            question,
+            [target_q],
+            needs_kg=[True],
+            memory_context=ctx,
+            entity_dict=state.get("entity_dict"),
+            kg_graph=kg_graph,
+            web_graph=web_graph,
+            web_enabled=web_enabled,
+            reranker_cfg=reranker_cfg,
+            rerank_top_k=rerank_top_k,
+            extractor_max_chars=extractor_max_chars,
+        )
+        facts = [
+            f
+            for f in (evidence.get("extracted_facts") or [])
+            if isinstance(f, str) and f.strip()
         ]
+        answer_ctx = ctx
+        if facts:
+            block = "Retrieved evidence:\n" + "\n".join(f"- {f}" for f in facts)
+            answer_ctx = f"{block}\n\n{ctx}" if ctx else block
+        return answer_ctx, {
+            "facts": facts,
+            "triples": list(evidence.get("raw_triples") or []),
+        }
+
+    async def _reverify_memory(
+        state: MCTSState, ctx: str
+    ) -> tuple[str, Dict[str, Any], List[str]]:
+        """Re-retrieve each unverified memory fact as its own query.
+
+        Treats every ``[System Prediction]`` memory fact (provenance stripped) as
+        a retrieval query and runs the standard ``gather_evidence`` pass (corpus +
+        KG). ``[Retrieval]`` facts are skipped — they are already grounded in
+        evidence, so re-fetching them is redundant. The fresh
+        ``[Retrieval]`` evidence flows into the next consolidation, where the
+        consolidator's conflict hierarchy can **corroborate** (b), **gap-fill**
+        with adjacent facts (c), or **evict** a wrong model-inferred fact (a) —
+        the KG re-fetch in particular returns an entity's true attributes
+        regardless of what the stale fact claimed. Each distinct fact is
+        re-verified once over the run (``reverified_facts``). Memory is tiny
+        here (≈2-4 facts/question, max 12 observed), so the added cost is
+        bounded. Returns ``(enriched_ctx, evidence, newly_reverified)``.
+        """
+        done = set(state.get("reverified_facts") or [])
+        facts_q: List[str] = []
+        for item in state.get("text_memory") or []:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            # Only re-verify [System Prediction] facts (the model's own
+            # inferences). [Retrieval] facts are already grounded in evidence,
+            # so re-retrieving them is redundant and was the main corpus+rerank
+            # fan-out amplifier.
+            if _is_retrieval_grounded(item):
+                continue
+            clean = _strip_provenance_tag(item)
+            if clean and clean not in done and clean not in facts_q:
+                facts_q.append(clean)
+        if not facts_q:
+            return ctx, {}, []
+
+        evidence = await gather_evidence(
+            registry,
+            state.get("question", ""),
+            facts_q,
+            # Gate KG fan-out: don't force it on every fact. ``gather_evidence``
+            # still fires KG when a fact mentions an already-linked entity
+            # (``_subq_hits_known_entity``) — exactly where a re-fetch can
+            # corroborate/evict — but skips Wikidata for facts with no
+            # resolvable entity, cutting the public-API burst that caused the
+            # ConnectTimeouts. Corpus re-verification (local FAISS) still runs.
+            needs_kg=[False] * len(facts_q),
+            memory_context=ctx,
+            entity_dict=state.get("entity_dict"),
+            kg_graph=kg_graph,
+            web_graph=web_graph,
+            web_enabled=web_enabled,
+            reranker_cfg=reranker_cfg,
+            rerank_top_k=rerank_top_k,
+            extractor_max_chars=extractor_max_chars,
+        )
+        new_facts = [
+            f
+            for f in (evidence.get("extracted_facts") or [])
+            if isinstance(f, str) and f.strip()
+        ]
+        enriched = ctx
+        if new_facts:
+            block = "Re-verification of prior memory (fresh evidence):\n" + "\n".join(
+                f"- {f}" for f in new_facts
+            )
+            enriched = f"{block}\n\n{ctx}" if ctx and ctx != "Not provided" else block
+        return (
+            enriched,
+            {"facts": new_facts, "triples": list(evidence.get("raw_triples") or [])},
+            facts_q,
+        )
+
+    async def _gen_final(
+        question: str,
+        parent_id: str,
+        ctx: str,
+        state: MCTSState,
+        *,
+        should_explore: bool,
+    ) -> tuple[List[MCTSTreeNode], Dict[str, Any]]:
+        # coe parity (_generate_final_answer_nodes → generate_answer): the
+        # terminal answer is a fresh retrieve-and-answer via ANSWER_GENERATOR,
+        # not a synthesis over memory. Shallow expansions (depth < 2) retrieve;
+        # deeper ones answer from the accumulated context.
+        answer_ctx, evidence = ctx, {}
+        if should_explore:
+            answer_ctx, evidence = await _explore_for(question, question, ctx, state)
         out, _ = await execute_role_lc(
             registry,
-            FINAL_ANSWER_SYNTHESIZER,
-            FinalAnswerSynthesisInput(
-                question=question, candidate_answers=candidates, context=ctx
-            ),
+            ANSWER_GENERATOR,
+            AnswerGenerationInput(question=question, context=answer_ctx),
         )
-        final_text = getattr(out, "final_answer", "") or ""
+        final_text = getattr(out, "answer", "") or ""
         concise = getattr(out, "concise_answer", "") or final_text
         reasoning = getattr(out, "reasoning", "") or ""
-        return [
-            _make_node(
-                MCTSNodeType.FINAL_ANSWER,
-                parent_id,
-                {
-                    "final_answer": final_text,
-                    "concise_answer": concise,
-                    "reasoning": reasoning,
-                },
-            )
-        ]
+        node = _make_node(
+            MCTSNodeType.FINAL_ANSWER,
+            parent_id,
+            {
+                "final_answer": final_text,
+                "concise_answer": concise,
+                "reasoning": reasoning,
+            },
+        )
+        return [node], evidence
 
-    async def _gen_self_correct(leaf: MCTSTreeNode, ctx: str) -> List[MCTSTreeNode]:
+    async def _gen_self_correct(
+        leaf: MCTSTreeNode, ctx: str, question: str, state: MCTSState
+    ) -> tuple[List[MCTSTreeNode], Dict[str, Any]]:
         content = leaf.get("content", {})
         sub_q = content.get("sub_question")
         sub_a = content.get("sub_answer")
         if not sub_q or not sub_a:
-            return []
+            return [], {}
+        # coe parity (generate_self_correction → _explore): re-retrieve fresh
+        # evidence for the sub-question before refining, not memory alone.
+        correct_ctx, evidence = await _explore_for(question, sub_q, ctx, state)
         out, _ = await execute_role_lc(
             registry,
             SELF_CORRECTOR,
-            SelfCorrectionInput(question=sub_q, proposed_answer=sub_a, context=ctx),
+            SelfCorrectionInput(
+                question=sub_q, proposed_answer=sub_a, context=correct_ctx
+            ),
         )
         refined = getattr(out, "refined_answer", "") or sub_a
-        return [
-            _make_node(
-                MCTSNodeType.SELF_CORRECTED,
-                leaf["node_id"],
-                {"sub_question": sub_q, "sub_answer": refined},
-            )
-        ]
+        node = _make_node(
+            MCTSNodeType.SELF_CORRECTED,
+            leaf["node_id"],
+            {"sub_question": sub_q, "sub_answer": refined},
+        )
+        return [node], evidence
 
     # ── Nodes ────────────────────────────────────────────────────────────────
 
@@ -462,30 +608,58 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         ctx = _join_memory_context(state)
         question = state.get("question", "")
 
+        # Re-verify current memory facts (recheck-on-retrieval): fresh evidence
+        # is prepended to the context all generators see this iteration, and
+        # folded into ``evidence`` so consolidation can corroborate/gap-fill/evict.
+        ctx, reverify_ev, reverified_now = await _reverify_memory(state, ctx)
+
         signal = False
         evidence: Dict[str, Any] = {}
+        # coe parity: terminal answers from a shallow node (depth < 2) retrieve
+        # fresh evidence; deeper ones answer from accumulated context.
+        should_explore_final = _leaf_depth(target_path) < 2
         if ntype == MCTSNodeType.USER_QUESTION.value:
             subqa, signal, evidence = await _gen_subqa(question, pid, ctx, state)
             children = list(subqa)
             if signal or _should_gen_final(target_path, min_depth=final_min_depth):
-                children.extend(await _gen_final(question, pid, ctx, state))
+                fin, ev_f = await _gen_final(
+                    question, pid, ctx, state, should_explore=should_explore_final
+                )
+                children.extend(fin)
+                evidence = _merge_ev(evidence, ev_f)
         elif ntype == MCTSNodeType.SUB_QA.value:
-            (subqa, signal, evidence), sc = await asyncio.gather(
+            (subqa, signal, ev_s), (sc, ev_c) = await asyncio.gather(
                 _gen_subqa(question, pid, ctx, state),
-                _gen_self_correct(target, ctx),
+                _gen_self_correct(target, ctx, question, state),
             )
             children = subqa + sc
+            evidence = _merge_ev(ev_s, ev_c)
             if signal:
-                children.extend(await _gen_final(question, pid, ctx, state))
+                fin, ev_f = await _gen_final(
+                    question, pid, ctx, state, should_explore=should_explore_final
+                )
+                children.extend(fin)
+                evidence = _merge_ev(evidence, ev_f)
         elif ntype == MCTSNodeType.SELF_CORRECTED.value:
             subqa, signal, evidence = await _gen_subqa(question, pid, ctx, state)
             children = list(subqa)
             if signal:
-                children.extend(await _gen_final(question, pid, ctx, state))
+                fin, ev_f = await _gen_final(
+                    question, pid, ctx, state, should_explore=should_explore_final
+                )
+                children.extend(fin)
+                evidence = _merge_ev(evidence, ev_f)
         else:
             children = []
 
+        # Fold the memory re-verification evidence into this iteration's facts
+        # so it reaches consolidation, and record which facts were re-verified.
+        evidence = _merge_ev(evidence, reverify_ev)
         out: Dict[str, Any] = {"expand_semantic_signal": signal}
+        if reverified_now:
+            out["reverified_facts"] = list(
+                set(state.get("reverified_facts") or []) | set(reverified_now)
+            )
         if evidence.get("facts"):
             out["new_retrieval_texts"] = list(evidence["facts"])
         if evidence.get("triples"):
@@ -742,15 +916,31 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         rollout_texts = list(sr.get("rollout_texts") or [])
         critiques = list(sr.get("verifier_critiques") or [])
 
+        # Generated sub-answers + rollouts share the expansion depth; verifier
+        # critiques are tracked separately so they get the shallower hop below.
         new_text_items = [
             t
-            for t in (expanded_texts + rollout_texts + critiques)
+            for t in (expanded_texts + rollout_texts)
             if isinstance(t, str) and t.strip()
         ]
+        new_critique_items = [
+            t for t in critiques if isinstance(t, str) and t.strip()
+        ]
+
+        # Reasoning depth of this iteration's expansion. The new sub-answers and
+        # retrieval facts were produced one level below the path tip, so
+        # ``len(current_path)`` is their hop (legacy ``node.depth + 1``). Verifier
+        # critiques assess the tip itself, so legacy tags them one level
+        # shallower at ``node.depth`` (``mcts.py`` ``_self_correct_nodes``); we
+        # mirror that with ``len(current_path) - 1``. ``None`` if no path.
+        path_len = len(state.get("current_path") or [])
+        gen_hop = path_len or None
+        critique_hop = (path_len - 1) if path_len else None
 
         payload = {
             "question": state.get("question", ""),
             "new_text_items": new_text_items,
+            "new_critique_items": new_critique_items,
             # Expansion-time retrieval facts carry [Retrieval] provenance so
             # consolidation can prefer them over generated answers/critiques.
             "new_retrieval_items": list(state.get("new_retrieval_texts") or []),
@@ -758,6 +948,9 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             "current_text_memory": list(state.get("text_memory") or []),
             "current_graph": state.get("graph_memory") or nx.DiGraph(),
             "entity_dict": dict(state.get("entity_dict") or {}),
+            # Annotates [hop=N] for the consolidator's Hop Depth Filtering (RC-C).
+            "hop_depth": gen_hop,
+            "critique_hop_depth": critique_hop,
         }
         result = await memory_graph.ainvoke(payload)
         return {

@@ -148,6 +148,13 @@ class HTTPWikidataBackend:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout, connect=10.0),
             headers={"User-Agent": user_agent, "Accept-Language": "en"},
+            # Force IPv4. www.wikidata.org / en.wikipedia.org resolve to an IPv6
+            # address that this (IPv4-only-egress) compute node cannot route, and
+            # the async client otherwise stalls on the dead IPv6 path until the
+            # connect timeout (the ConnectTimeouts seen in eval). Binding the
+            # source to the IPv4 wildcard pins the socket family to AF_INET, so
+            # only IPv4 destinations are attempted — matching the working curl -4.
+            transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
         )
 
     async def aclose(self) -> None:

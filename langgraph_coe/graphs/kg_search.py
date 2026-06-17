@@ -19,8 +19,8 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
-from ..llm import RoleModelRegistry
-from ..roles import KG_TRIPLE_AGENT_SYSTEM, NEROutput
+from ..llm import RoleModelRegistry, _truncate_messages_to_budget, parse_fallback
+from ..roles import KG_TRIPLE_AGENT_SYSTEM, NER, NEROutput
 from ..tools.wikidata import (
     create_fetch_and_prune_tool,
     enrich_entities,
@@ -58,6 +58,23 @@ def _build_ner_user_message(state: KGSearchState) -> str:
     if state.get("known_entities_summary"):
         parts.append(f"known_entities_from_memory:\n{state['known_entities_summary']}")
     return "\n\n".join(parts)
+
+
+def _parse_ner_result(result: Any) -> NEROutput | None:
+    """Recover an ``NEROutput`` from a ``with_structured_output(include_raw=True)``
+    result, falling back to ``parse_fallback`` (unwrap + regex) when the parser
+    couldn't extract it. Returns ``None`` only when nothing is recoverable."""
+    if isinstance(result, NEROutput):
+        return result
+    if isinstance(result, dict):
+        if isinstance(result.get("parsed"), NEROutput):
+            return result["parsed"]
+        raw = result.get("raw")
+        if raw is not None and hasattr(raw, "content"):
+            fallback = parse_fallback(NER, raw.content)
+            if isinstance(fallback, NEROutput):
+                return fallback
+    return None
 
 
 def _extract_entity_names(parsed: NEROutput) -> List[str]:
@@ -119,13 +136,29 @@ def build_kg_search_graph(registry: RoleModelRegistry):
         errs = list(state.get("errors") or [])
         try:
             model = registry.get_model("kg_ner_agent")
-            chain = model.with_structured_output(NEROutput)
-            parsed = await chain.ainvoke(
+            # include_raw so we can recover when structured parsing fails on a
+            # reasoning model whose JSON arrives wrapped/escaped (serialized
+            # ChatGeneration or a thinking+text block list). parse_fallback runs
+            # the same _content_to_text unwrap + regex recovery used elsewhere,
+            # so a parse hiccup no longer silently disables KG retrieval.
+            chain = model.with_structured_output(NEROutput, include_raw=True)
+            msgs = _truncate_messages_to_budget(
                 [HumanMessage(content=user)],
+                registry.get_max_input_tokens("kg_ner_agent"),
+                "kg_ner_agent",
             )
+            result = await chain.ainvoke(msgs)
+            parsed = _parse_ner_result(result)
         except Exception as exc:
             logger.exception("KG NER extraction failed")
             errs.append(f"ner_extraction: {exc}")
+            return {"linked_entities": [], "qids_for_triples": [], "errors": errs}
+
+        if parsed is None:
+            logger.warning(
+                "KG NER produced no parseable entities; skipping KG retrieval "
+                "for this node"
+            )
             return {"linked_entities": [], "qids_for_triples": [], "errors": errs}
 
         names = _extract_entity_names(parsed)

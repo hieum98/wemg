@@ -25,7 +25,7 @@ llm:
   tiers:
     heavy:
       model_name: openai/Qwen/Qwen3.5-4B
-      api_base: http://n0152:30000/v1
+      api_base: http://n0998:30000/v1
       temperature: 1.0
       max_tokens: 65536
       enable_thinking: true
@@ -39,7 +39,7 @@ llm:
       seed: 8888
     medium:
       model_name: openai/Qwen/Qwen3.5-4B
-      api_base: http://n0152:30000/v1
+      api_base: http://n0998:30000/v1
       temperature: 1.0
       max_tokens: 65536
       enable_thinking: true
@@ -53,7 +53,7 @@ llm:
       seed: 8888
     light:
       model_name: openai/Qwen/Qwen3.5-4B
-      api_base: http://n0152:30000/v1
+      api_base: http://n0998:30000/v1
       temperature: 1.0
       max_tokens: 65536
       enable_thinking: true
@@ -73,7 +73,7 @@ llm:
     # Bounded-output classification roles (§3b): tiny fixed-shape outputs, no thinking.
     classify:
       model_name: openai/Qwen/Qwen3.5-4B
-      api_base: http://n0152:30000/v1
+      api_base: http://n0998:30000/v1
       temperature: 0.1
       max_tokens: 65536
       enable_thinking: true
@@ -95,7 +95,7 @@ llm:
     reasoning_synthesizer: heavy
     memory_consolidation: heavy
     relation_extraction: medium
-    open_ie: medium
+    open_ie: heavy
     verifier: medium
     evaluator: medium
     triple_pruner: classify
@@ -104,7 +104,7 @@ llm:
     web_researcher: medium
     extractor: heavy
     kg_ner_agent: light
-    kg_triple_search_agent: medium
+    kg_triple_search_agent: heavy
 
 # Working-memory limits (MemoryUpdateGraph + CoT extractor batching).
 memory:
@@ -117,20 +117,20 @@ wikidata:
   # Local QEndpoint on n0162:1234 — use SSH tunnel, then set e.g.:
   #   ssh -fN -L 30162:n0162:1234 t2
   #   sparql_endpoint: http://127.0.0.1:30162/api/endpoint/sparql
-  sparql_endpoint: http://n0162:1234/api/endpoint/sparql
-  max_sparql_rps: 10.0
-  max_wikipedia_rps: 10.0
+  sparql_endpoint: http://n0998:1234/api/endpoint/sparql
+  max_sparql_rps: 50.0
+  max_wikipedia_rps: 2.0
   triple_cache_max_entries: 5000
-  max_hops: 1
+  max_hops: 2
   # Leave null so integration tests exercise Wikidata-only paths (Stage A rerank skipped).
-  reranker_url: http://n0164:30000/v1
+  reranker_url: http://n0998:30001/v1
   reranker_model: Qwen3-Reranker-4B
   # Task instruction (Qwen3-Reranker ``instruct`` field) for Stage-A triple
   # pruning. Without it the reranker saturates (~0.998 flat scores) on short,
   # near-identical triple strings. Symmetric with reranker.instruction below.
   reranker_instruction: "Given a question, retrieve the knowledge-graph triples whose relation and object are needed to answer it."
-  pruning_top_k: 64
-  pruning_delta: 0.05
+  pruning_top_k: 128
+  pruning_delta: 0.07
 
 # Web tool (``init_web_search`` / ``web_search``): Serper key optional; DDG fallback if null.
 web_search:
@@ -150,13 +150,13 @@ retriever:
     text_column: contents
     embedder:
       model_name: Qwen/Qwen3-Embedding-4B
-      url: http://n0152:30001/v1
+      url: http://n0164:30000/v1
       api_key: null
 
 reranker:
   enabled: true
   model_name: Qwen3-Reranker-4B
-  url: http://n0164:30000/v1
+  url: http://n0998:30001/v1
   api_key: EMPTY
   top_k: 10
   instruction: "Given a web search query, retrieve relevant passages that answer the query."
@@ -170,9 +170,9 @@ search:
   mcts:
     num_iterations: 20      # hard cap on MCTS iterations
     min_iterations: 5       # floor before any early-termination condition may fire
-    exploration_weight: 2.0
+    exploration_weight: 2.5
     max_tree_depth: 10
-    max_simulation_depth: 3 # per-rollout CoTGraph depth
+    max_simulation_depth: 5 # per-rollout CoTGraph depth
     final_answer_min_depth: 2
     high_confidence_threshold: 0.9
     convergence_patience: 5

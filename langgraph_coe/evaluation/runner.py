@@ -223,13 +223,22 @@ class DatasetEvaluator:
                 result.metadata["_raw_state"] = final or {}
                 return result
             except Exception as e:  # noqa: BLE001 — captured as an error row (coe parity)
-                logger.error("Error answering question %r: %s", question[:60], e)
+                # Many failing exceptions (timeouts, connection errors) have an
+                # empty str(), so log the type + repr and a traceback to make the
+                # cause visible instead of a bare "Error answering question: ".
+                logger.error(
+                    "Error answering question %r: %s: %r",
+                    question[:60],
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
                 return AnswerResult(
                     question=question,
                     answer="",
                     concise_answer="",
                     reasoning="",
-                    metadata={"error": str(e)},
+                    metadata={"error": f"{type(e).__name__}: {e}"},
                 )
 
     async def _generate_and_log(
