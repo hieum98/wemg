@@ -1,4 +1,4 @@
-"""Phase 0 integration smoke test — live ``WebResearchGraph`` (LLM + web search).
+"""Integration smoke test — live ``WebResearchGraph`` (LLM + web search).
 
 Exercises ``build_web_research_graph`` end-to-end against the configured light-tier
 LLM (default ``config.yaml``: ``openai/Qwen/Qwen3.5-4B`` @ ``http://n0152:30000/v1``)
@@ -11,11 +11,11 @@ Run manually (from repo root)::
 
 Optional env overrides::
 
-    API_KEY / OPENAI_API_KEY     LLM auth (loaded from repo-root ``.env``)
-    SERPER_API_KEY               web search provider
-    LANGGRAPH_TEST_LLM_URL       override light-tier ``api_base``
-    LANGGRAPH_TEST_LLM_MODEL     override light-tier ``model_name``
-    LANGGRAPH_WEB_SEARCH_TOP_K   override ``web_search.top_k`` for the smoke query
+    API_KEY / OPENAI_API_KEY LLM auth (loaded from repo-root ``.env``)
+    SERPER_API_KEY web search provider
+    LANGGRAPH_TEST_LLM_URL override light-tier ``api_base``
+    LANGGRAPH_TEST_LLM_MODEL override light-tier ``model_name``
+    LANGGRAPH_WEB_SEARCH_TOP_K override ``web_search.top_k`` for the smoke query
 """
 
 from __future__ import annotations

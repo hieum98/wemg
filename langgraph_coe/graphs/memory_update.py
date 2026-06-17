@@ -1,7 +1,7 @@
-"""MemoryUpdateGraph (Phase 1).
+"""Memory-update graph.
 
-Port of legacy ``WorkingMemory.synchronize_memory`` (``coe/reasoning/working_memory.py``)
-into an explicit ``StateGraph`` with a single OpenIE extraction pass, batched
+Synchronizes text↔graph working memory as an explicit ``StateGraph`` with a
+single OpenIE extraction pass, batched
 ``triple_pruner`` (size 16) on **newly proposed edges only**, and an optional
 post-merge consolidation pass that folds newly-textualised graph triples back into
 prose memory.
@@ -543,7 +543,7 @@ def build_memory_update_graph(
         new_graph: nx.DiGraph = source_graph.copy()
 
         # Filter to **newly proposed** relations only — pruner is expensive and
-        # should never re-examine edges already in the graph (§4.2).
+        # should never re-examine edges already in the graph.
         relations = [
             rel
             for rel in relations

@@ -1,4 +1,4 @@
-"""Phase 0 integration — ``web_search`` cache against a live Redis server (db=1).
+"""Integration — ``web_search`` cache against a live Redis server (db=1).
 
 Mirrors ``test_redis_cache_web.py`` but uses a real ``redis.Redis`` client from
 ``config.yaml`` (``cache.redis``). Keys are namespaced and deleted in teardown.
@@ -6,7 +6,7 @@ Mirrors ``test_redis_cache_web.py`` but uses a real ``redis.Redis`` client from
 Run (from repo root). Full setup: ``docs/setup_redis_cache.md``::
 
     conda activate coe
-    redis-server --daemonize yes   # if not already listening on cache.redis.host:port
+    redis-server --daemonize yes # if not already listening on cache.redis.host:port
     uv run pytest langgraph_coe/tests/phase0/test_redis_cache_web_integration.py -v -s
 
 Optional env overrides::

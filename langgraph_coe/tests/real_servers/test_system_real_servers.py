@@ -5,22 +5,22 @@ drive the compiled CoT / MCTS graphs directly, this module exercises the public
 entrypoint :func:`langgraph_coe.system.answer` — the true top of the stack:
 
     answer(question, cfg)
-      → _init_runtime         (cache / wikidata / web / retrieval init)
-      → reset_*_session       (per-question ContextVar resets)
+      → _init_runtime (cache / wikidata / web / retrieval init)
+      → reset_*_session (per-question ContextVar resets)
       → build_<strategy>_graph + _initial_<strategy>_state
       → graph.ainvoke(...)
-      → AnswerResult.from_state(...)   (public envelope)
+      → AnswerResult.from_state(...) (public envelope)
 
 It runs with **no stubs** against the production endpoints in
 ``langgraph_coe/config.yaml`` and verifies the system works correctly through
 **both** strategies (``cot`` and ``mcts``), proving the orchestrator's strategy
 dispatch, runtime wiring, and result adaptation all hold against live models:
 
-  - LLM            SGLang ``Qwen`` @ ``n0152:30000`` (all role tiers)
-  - Embedder       SGLang ``Qwen3-Embedding`` @ ``n0152:30001`` (corpus queries)
-  - Reranker       SGLang ``Qwen3-Reranker`` @ ``n0997:30000``
-  - Wikidata       QEndpoint SPARQL @ ``n0162:1234``
-  - Corpus         local 99 GB FAISS index (``retriever.corpus.index_path``)
+  - LLM SGLang ``Qwen`` @ ``n0152:30000`` (all role tiers)
+  - Embedder SGLang ``Qwen3-Embedding`` @ ``n0152:30001`` (corpus queries)
+  - Reranker SGLang ``Qwen3-Reranker`` @ ``n0997:30000``
+  - Wikidata QEndpoint SPARQL @ ``n0162:1234``
+  - Corpus local 99 GB FAISS index (``retriever.corpus.index_path``)
 
 The ~99 GB FAISS index is loaded **once** by a module-scoped fixture; the
 fixture then neutralises the in-``answer()`` retrieval/wikidata re-init so each
@@ -38,15 +38,15 @@ The whole module skips cleanly when any endpoint or the corpus is unreachable.
 
 Optional env overrides (default to config.yaml; point at SSH tunnels for CI)::
 
-    LANGGRAPH_TEST_LLM_URL        default config.yaml heavy-tier api_base
-    LANGGRAPH_TEST_EMBED_URL      default config.yaml retriever embedder url
-    LANGGRAPH_TEST_RERANKER_URL   default config.yaml reranker url
+    LANGGRAPH_TEST_LLM_URL default config.yaml heavy-tier api_base
+    LANGGRAPH_TEST_EMBED_URL default config.yaml retriever embedder url
+    LANGGRAPH_TEST_RERANKER_URL default config.yaml reranker url
     LANGGRAPH_TEST_RERANKER_MODEL default config.yaml reranker model_name
-    LANGGRAPH_TEST_SPARQL_URL     default config.yaml wikidata sparql_endpoint
-    LANGGRAPH_TEST_COT_DEPTH      max CoT depth for the cot run (default 2)
-    LANGGRAPH_TEST_MCTS_ITERS     hard cap on MCTS iterations (default 2)
+    LANGGRAPH_TEST_SPARQL_URL default config.yaml wikidata sparql_endpoint
+    LANGGRAPH_TEST_COT_DEPTH max CoT depth for the cot run (default 2)
+    LANGGRAPH_TEST_MCTS_ITERS hard cap on MCTS iterations (default 2)
     LANGGRAPH_TEST_MCTS_SIM_DEPTH per-rollout CoT depth for mcts (default 1)
-    API_KEY / OPENAI_API_KEY      LLM/embedder/reranker auth (repo-root .env)
+    API_KEY / OPENAI_API_KEY LLM/embedder/reranker auth (repo-root .env)
 """
 
 from __future__ import annotations
@@ -303,19 +303,19 @@ async def _system_runtime():
     # singletons loaded above (the index must NOT be read a second time).
     orig_init_retrieval = system_mod.init_retrieval_pipeline
     orig_init_wikidata = system_mod.init_wikidata
-    system_mod.init_retrieval_pipeline = lambda *a, **k: None  # type: ignore[assignment]
-    system_mod.init_wikidata = lambda *a, **k: None  # type: ignore[assignment]
+    system_mod.init_retrieval_pipeline = lambda *a, **k: None # type: ignore[assignment]
+    system_mod.init_wikidata = lambda *a, **k: None # type: ignore[assignment]
 
     try:
         yield cfg
     finally:
-        system_mod.init_retrieval_pipeline = orig_init_retrieval  # type: ignore[assignment]
-        system_mod.init_wikidata = orig_init_wikidata  # type: ignore[assignment]
+        system_mod.init_retrieval_pipeline = orig_init_retrieval # type: ignore[assignment]
+        system_mod.init_wikidata = orig_init_wikidata # type: ignore[assignment]
         client = wd_mod._wikidata_client
         if client is not None:
             try:
                 await client.aclose()
-            except Exception:  # noqa: BLE001 — teardown is best-effort
+            except Exception: # noqa: BLE001 — teardown is best-effort
                 pass
         wd_mod._wikidata_client = None
         wd_mod._wikidata_config = None

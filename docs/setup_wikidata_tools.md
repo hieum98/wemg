@@ -395,4 +395,3 @@ Do not extend `coe/retrieval/wikidata.py` (sync legacy stack). New behavior belo
 | [setup_redis_cache.md](setup_redis_cache.md) | Redis for `wd:*`, LLM db 0, `web:*` |
 | [deploy_local_wikidata-v2.md](deploy_local_wikidata-v2.md) | Offline QEndpoint SPARQL |
 | [deploy_reranker_server.md](deploy_reranker_server.md) | Stage A reranker endpoint |
-| `langgraph_coe/implementation_plan.md` §3.4 | Cache design rationale |

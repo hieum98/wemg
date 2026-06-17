@@ -165,7 +165,7 @@ async def test_client_khop_q64_bidirectional(local_client: WikidataClient) -> No
 
 @pytest.mark.asyncio
 async def test_client_fetch_outgoing_uoregon(local_client: WikidataClient) -> None:
-    edges = await local_client._fetch_outgoing(["Q766145"])  # noqa: SLF001
+    edges = await local_client._fetch_outgoing(["Q766145"]) # noqa: SLF001
     assert "Q766145" in edges and len(edges["Q766145"]) > 0
 
 

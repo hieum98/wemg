@@ -1,8 +1,8 @@
-"""MCTSGraph (Phase 3).
+"""MCTS strategy graph.
 
-Monte Carlo Tree Search with CoT rollouts and shared text↔graph memory. Ports
-``coe/reasoning/mcts.py`` onto LangGraph, storing the search tree as a dict in
-state (``Annotated[Dict, dict_merge]``). See ``implementation_plan.md`` §8.
+Monte Carlo Tree Search with CoT rollouts and shared text↔graph memory. The
+search tree is stored as a dict in the graph state
+(``Annotated[Dict, dict_merge]``).
 
 Flow (one iteration = one superstep cycle)::
 
@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §8.1 Node types and priors
+# Node types and priors
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -81,7 +81,7 @@ class MCTSNodeType(str, Enum):
     FINAL_ANSWER = "final_answer"  # terminal
 
 
-# Ports legacy ``_NODE_TYPE_PRIOR`` (coe/reasoning/mcts.py:27). USER_QUESTION
+# Per-node-type prior used by pUCT selection. USER_QUESTION
 # (root) has no prior — it is never a UCB candidate.
 NODE_TYPE_PRIOR: Dict[MCTSNodeType, float] = {
     MCTSNodeType.SUB_QA: 0.60,
@@ -103,7 +103,7 @@ def dict_merge(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §8.2 State
+# State
 # ──────────────────────────────────────────────────────────────────────────────
 
 

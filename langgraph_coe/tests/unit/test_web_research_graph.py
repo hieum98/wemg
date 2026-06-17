@@ -1,4 +1,4 @@
-"""Phase 0 §3.5 — WebResearchGraph target specs.
+"""WebResearchGraph behavior.
 
 The subgraph lives at ``langgraph_coe.graphs.web_research``. It is a ReAct
 agent wired to ``web_search`` with three-layer loop prevention, parity with
@@ -8,7 +8,7 @@ agent wired to ``web_search`` with three-layer loop prevention, parity with
   2. In-state ``queries_issued`` counter against ``config.web_search.max_queries_per_agent``.
   3. ContextVar ``_cv_visited_urls`` populated by the ``web_search`` tool.
 
-State (implementation_plan.md §3.5):
+State:
 
     class WebResearchState(TypedDict):
         subquery: str
@@ -16,7 +16,7 @@ State (implementation_plan.md §3.5):
         context: str
         messages: Annotated[List[BaseMessage], add_messages]
         queries_issued: int
-        results: List[Dict[str, Any]]   # {title, url, snippet, full_text}
+        results: List[Dict[str, Any]] # {title, url, snippet, full_text}
         errors: List[str]
 """
 
@@ -34,13 +34,13 @@ from .._fixtures import URL_A, URL_B, URL_C, make_fake_react_agent, tool_message
 
 
 def _import_module():
-    """Phase 0 introduces ``langgraph_coe.graphs.web_research``. Skip cleanly if absent."""
+    """Introduces ``langgraph_coe.graphs.web_research``. Skip cleanly if absent."""
     try:
-        from langgraph_coe.graphs import web_research as wr_mod  # type: ignore
+        from langgraph_coe.graphs import web_research as wr_mod # type: ignore
     except ImportError:
-        pytest.skip("Phase 0 §3.5 introduces langgraph_coe.graphs.web_research")
+        pytest.skip("Introduces langgraph_coe.graphs.web_research")
     if not hasattr(wr_mod, "build_web_research_graph"):
-        pytest.skip("build_web_research_graph not implemented yet (§3.5 target)")
+        pytest.skip("build_web_research_graph unavailable")
     return wr_mod
 
 
@@ -49,7 +49,7 @@ def _registry_with_light_model(model: Any):
     from langgraph_coe.llm import RoleModelRegistry
 
     registry = RoleModelRegistry(LangGraphCoeConfig.from_yaml().llm)
-    registry.get_model = lambda role_name: model  # type: ignore[assignment]
+    registry.get_model = lambda role_name: model # type: ignore[assignment]
     return registry
 
 
@@ -60,13 +60,13 @@ def _result_payload(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.5 — graph wiring + state shape
+# — graph wiring + state shape
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 async def test_graph_compiles_with_expected_state_keys(monkeypatch):
     """``build_web_research_graph(registry)`` produces a compiled graph whose
-    output state surfaces the §3.5 keys."""
+    output state surfaces the keys."""
     wr_mod = _import_module()
     model = MagicMock()
     registry = _registry_with_light_model(model)
@@ -94,7 +94,7 @@ async def test_graph_compiles_with_expected_state_keys(monkeypatch):
     )
 
     for key in ("results", "queries_issued", "errors"):
-        assert key in final, f"WebResearchState must surface '{key}' (§3.5)"
+        assert key in final, f"WebResearchState must surface '{key}'"
     assert isinstance(final["results"], list)
 
 
@@ -117,7 +117,7 @@ async def test_agent_uses_light_tier_and_web_search_tool(monkeypatch):
     from langgraph_coe.llm import RoleModelRegistry
 
     registry = RoleModelRegistry(LangGraphCoeConfig.from_yaml().llm)
-    registry.get_model = lambda role_name: light_sentinel  # type: ignore[assignment]
+    registry.get_model = lambda role_name: light_sentinel # type: ignore[assignment]
 
     graph = wr_mod.build_web_research_graph(registry)
     await graph.ainvoke(
@@ -157,7 +157,7 @@ async def test_agent_uses_light_tier_and_web_search_tool(monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.5 — finalize: dedup by URL, top_k cap
+# — finalize: dedup by URL, top_k cap
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -253,7 +253,7 @@ async def test_finalize_returns_top_n_from_config(monkeypatch, config):
     )
 
     if hasattr(wr_mod, "set_web_research_config"):
-        wr_mod.set_web_research_config(config.web_search)  # type: ignore[attr-defined]
+        wr_mod.set_web_research_config(config.web_search) # type: ignore[attr-defined]
 
     graph = wr_mod.build_web_research_graph(registry)
     final = await graph.ainvoke(
@@ -270,7 +270,7 @@ async def test_finalize_returns_top_n_from_config(monkeypatch, config):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.5 — three-layer loop prevention
+# — three-layer loop prevention
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -300,7 +300,7 @@ async def test_agent_invoked_with_recursion_limit(monkeypatch):
     await graph.ainvoke({"subquery": "x", "original_query": "x", "context": ""})
 
     assert "recursion_limit" in captured_config["config"], (
-        "WebResearchGraph must pass recursion_limit to agent.astream (§3.5 layer 1)"
+        "WebResearchGraph must pass recursion_limit to agent.astream (layer 1)"
     )
     assert captured_config["config"]["recursion_limit"] > 0
 
@@ -310,7 +310,7 @@ async def test_queries_issued_counter_caps_agent(monkeypatch, config):
     ``web_search`` calls are short-circuited and an error is recorded."""
     wr_mod = _import_module()
     if not hasattr(config.web_search, "max_queries_per_agent"):
-        pytest.skip("max_queries_per_agent is a Phase 0 §3.5 config addition")
+        pytest.skip("max_queries_per_agent is a config addition")
 
     config.web_search.max_queries_per_agent = 2
     registry = _registry_with_light_model(MagicMock())
@@ -323,7 +323,7 @@ async def test_queries_issued_counter_caps_agent(monkeypatch, config):
             [
                 tool_message("web_search", [_result_payload(URL_A)]),
                 tool_message("web_search", [_result_payload(URL_B)]),
-                tool_message("web_search", [_result_payload(URL_C)]),  # over budget
+                tool_message("web_search", [_result_payload(URL_C)]), # over budget
                 AIMessage(content="done"),
             ]
         ),
@@ -356,7 +356,7 @@ async def test_visited_urls_contextvar_dedupes_across_tool_calls(monkeypatch):
     if not hasattr(wr_mod, "_cv_visited_urls") and not hasattr(
         wr_mod, "reset_web_research_session"
     ):
-        pytest.skip("ContextVar visited-URL session is a Phase 0 §3.5 addition")
+        pytest.skip("ContextVar visited-URL session is a addition")
 
     registry = _registry_with_light_model(MagicMock())
     # Two search calls returning the same URL.
@@ -393,7 +393,7 @@ async def test_reset_web_research_session_clears_visited_urls():
     from langgraph_coe.tools import web as web_mod
 
     if not hasattr(web_mod, "reset_web_research_session"):
-        pytest.skip("reset_web_research_session is a Phase 0 §3.5 addition")
+        pytest.skip("reset_web_research_session is a addition")
 
     sess = getattr(web_mod, "_get_web_session", None) or getattr(
         web_mod, "_get_session", None
@@ -424,7 +424,7 @@ async def test_concurrent_graph_runs_have_isolated_visited_urls(monkeypatch):
         from langgraph_coe.tools import web as web_mod
 
         if not hasattr(web_mod, "reset_web_research_session"):
-            pytest.skip("Phase 0 §3.5 session reset not yet present")
+            pytest.skip("session reset not yet present")
 
     registry = _registry_with_light_model(MagicMock())
 
@@ -459,7 +459,7 @@ async def test_concurrent_graph_runs_have_isolated_visited_urls(monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.5 — error containment
+# — error containment
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -472,7 +472,7 @@ async def test_provider_failure_recorded_in_errors_not_raised(monkeypatch):
     class _BrokenAgent:
         async def astream(self, _inp, config=None, *, stream_mode=None, **_kw):
             raise RuntimeError("network down")
-            yield  # pragma: no cover - makes this an async generator
+            yield # pragma: no cover - makes this an async generator
 
     monkeypatch.setattr(
         wr_mod, "create_agent", lambda *a, **kw: _BrokenAgent(), raising=False

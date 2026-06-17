@@ -1,11 +1,11 @@
-"""Phase 3 §8 — MCTSGraph target specs.
+"""MCTSGraph behavior.
 
 ``MCTSGraph`` stores search state as a dict-backed tree, expands only the node
 types used by legacy MCTS, rolls out through ``CoTGraph``, evaluates terminal
 answers with three verifier views, and synchronizes memory after each search
 iteration.
 
-These tests are target specs: they skip cleanly only while the Phase 3 graph
+These tests are behavior: they skip cleanly only while the graph
 module itself is absent, then fail on contract drift once implemented.
 """
 
@@ -22,13 +22,13 @@ from langgraph_coe import roles as roles_mod
 
 
 def _import_module():
-    """Phase 3 introduces ``langgraph_coe.graphs.mcts``."""
+    """Introduces ``langgraph_coe.graphs.mcts``."""
     try:
-        from langgraph_coe.graphs import mcts as mcts_mod  # type: ignore
+        from langgraph_coe.graphs import mcts as mcts_mod # type: ignore
     except ImportError:
-        pytest.skip("Phase 3 §8 introduces langgraph_coe.graphs.mcts")
+        pytest.skip("Introduces langgraph_coe.graphs.mcts")
     if not hasattr(mcts_mod, "build_mcts_graph"):
-        pytest.skip("build_mcts_graph not implemented yet (§8 target)")
+        pytest.skip("build_mcts_graph unavailable")
     return mcts_mod
 
 
@@ -37,7 +37,7 @@ def _registry():
     from langgraph_coe.llm import RoleModelRegistry
 
     registry = RoleModelRegistry(LangGraphCoeConfig.from_yaml().llm)
-    registry.get_model = lambda _role_name: MagicMock()  # type: ignore[assignment]
+    registry.get_model = lambda _role_name: MagicMock() # type: ignore[assignment]
     return registry
 
 
@@ -366,7 +366,7 @@ def _nodes_of_type(
 
 
 def test_node_types_priors_and_dict_merge_contracts():
-    """§8.1/§8.2 expose only the planned node types, priors, and rightward merge."""
+    """/expose only the planned node types, priors, and rightward merge."""
     mcts_mod = _import_module()
 
     assert hasattr(mcts_mod, "MCTSNodeType")
@@ -461,7 +461,7 @@ async def test_root_expansion_calls_gen_final_when_min_depth_met(monkeypatch):
 async def test_simulate_invokes_cot_graph_with_shared_memory_and_configured_depth(
     monkeypatch,
 ):
-    """Rollout calls ``CoTGraph`` with shared memory refs and configured max depth (§8.3)."""
+    """Rollout calls ``CoTGraph`` with shared memory refs and configured max depth."""
     mcts_mod = _import_module()
     text_memory = ["Shared text memory"]
     graph_memory = nx.DiGraph()
@@ -550,7 +550,7 @@ async def test_cot_iteration_history_is_adapted_to_linear_subqa_chain(monkeypatc
 
 
 async def test_evaluate_uses_three_verifier_views_and_normalizes_reward(monkeypatch):
-    """Evaluation calls verifier for no-context/text-memory/graph-memory views (§8.3)."""
+    """Evaluation calls verifier for no-context/text-memory/graph-memory views."""
     mcts_mod = _import_module()
     graph_memory = nx.DiGraph()
     graph_memory.add_edge("France", "Paris", relation="capital")
@@ -599,7 +599,7 @@ async def test_evaluate_uses_three_verifier_views_and_normalizes_reward(monkeypa
 
 
 async def test_backprop_updates_visits_and_values_for_current_path(monkeypatch):
-    """Backprop increments visits and adds reward along ``current_path`` (§8.3)."""
+    """Backprop increments visits and adds reward along ``current_path``."""
     mcts_mod = _import_module()
     executor = RoleExecutorSpy(verifier_ratings=[10.0, 10.0, 10.0])
     _install_graph_spies(monkeypatch, mcts_mod, executor=executor)
@@ -835,12 +835,12 @@ async def test_answerable_signal_counts_toward_semantic_sufficiency(monkeypatch)
 
 
 def test_search_mcts_config_exposes_termination_knobs():
-    """§8.3 route conditions require ``config.search.mcts`` knobs."""
+    """route conditions require ``config.search.mcts`` knobs."""
     from langgraph_coe.config import LangGraphCoeConfig
 
     cfg = LangGraphCoeConfig.from_yaml()
-    assert hasattr(cfg, "search"), "Phase 3 must add LangGraphCoeConfig.search"
-    assert hasattr(cfg.search, "mcts"), "Phase 3 must add search.mcts"
+    assert hasattr(cfg, "search"), "must add LangGraphCoeConfig.search"
+    assert hasattr(cfg.search, "mcts"), "must add search.mcts"
     assert cfg.search.mcts.high_confidence_threshold == 0.9
     assert cfg.search.mcts.semantic_sufficiency_count >= 1
     assert cfg.search.mcts.convergence_patience >= 1

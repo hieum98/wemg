@@ -1,4 +1,4 @@
-"""LangGraph Chain-of-Evidence (CoE) package (import as ``langgraph_coe``)."""
+"""COE (Co-Evolving Memory and Graph) on LangGraph — import as ``langgraph_coe``."""
 
 from .logging_config import configure_logging
 

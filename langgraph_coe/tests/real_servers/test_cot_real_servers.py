@@ -1,15 +1,15 @@
 """Full-stack CoTGraph integration — every retrieval subsystem is **real**.
 
 Unlike ``test_cot_integration.py`` (which stubs KG/web/corpus to isolate the
-Phase 2 control flow against a lone Qwen3-8B deployment), this test wires the
+control flow against a lone Qwen3-8B deployment), this test wires the
 CoT loop to the *production* endpoints declared in ``langgraph_coe/config.yaml``
 and runs with **no stubs**:
 
-  - LLM            SGLang ``Qwen/Qwen3.5-4B`` @ ``n0152:30000``  (all tiers)
-  - Embedder       SGLang ``Qwen3-Embedding-4B`` @ ``n0152:30001`` (corpus queries)
-  - Reranker       SGLang ``Qwen3-Reranker-4B`` @ ``n0997:30000``
-  - Wikidata       QEndpoint SPARQL @ ``n0162:1234``
-  - Corpus         local 99 GB FAISS index (``retriever.corpus.index_path``)
+  - LLM SGLang ``Qwen/Qwen3.5-4B`` @ ``n0152:30000`` (all tiers)
+  - Embedder SGLang ``Qwen3-Embedding-4B`` @ ``n0152:30001`` (corpus queries)
+  - Reranker SGLang ``Qwen3-Reranker-4B`` @ ``n0997:30000``
+  - Wikidata QEndpoint SPARQL @ ``n0162:1234``
+  - Corpus local 99 GB FAISS index (``retriever.corpus.index_path``)
 
 It is the only test that exercises the real ``gen_subq → kg_one + corpus_join →
 rerank → extract_relevant → gen_subanswers → mem_update → increment → gen_subq``
@@ -31,12 +31,12 @@ The whole module skips cleanly when any endpoint or the corpus is unreachable.
 
 Optional env overrides (default to config.yaml; point at SSH tunnels for CI)::
 
-    LANGGRAPH_TEST_LLM_URL        default ``http://n0152:30000/v1``
-    LANGGRAPH_TEST_EMBED_URL      default config.yaml retriever embedder url
-    LANGGRAPH_TEST_RERANKER_URL   default config.yaml reranker url
-    LANGGRAPH_TEST_SPARQL_URL     default config.yaml wikidata sparql_endpoint
-    LANGGRAPH_TEST_COT_DEPTH      max CoT depth for the run (default 2)
-    API_KEY / OPENAI_API_KEY      LLM/embedder/reranker auth (repo-root .env)
+    LANGGRAPH_TEST_LLM_URL default ``http://n0152:30000/v1``
+    LANGGRAPH_TEST_EMBED_URL default config.yaml retriever embedder url
+    LANGGRAPH_TEST_RERANKER_URL default config.yaml reranker url
+    LANGGRAPH_TEST_SPARQL_URL default config.yaml wikidata sparql_endpoint
+    LANGGRAPH_TEST_COT_DEPTH max CoT depth for the run (default 2)
+    API_KEY / OPENAI_API_KEY LLM/embedder/reranker auth (repo-root .env)
 """
 
 from __future__ import annotations

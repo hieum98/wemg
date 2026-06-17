@@ -1,4 +1,4 @@
-"""Phase 2 §7 — CoTGraph target specs.
+"""CoTGraph behavior.
 
 ``CoTGraph`` replaces the legacy ``cot_search`` while-loop with explicit
 LangGraph nodes:
@@ -11,7 +11,7 @@ LangGraph nodes:
   6. ``MemoryUpdateGraph``
   7. increment/clear scratch and loop
 
-These tests are target specs: they skip cleanly only while the Phase 2 graph
+These tests are behavior: they skip cleanly only while the graph
 module itself is absent, then fail on contract drift once implemented.
 """
 
@@ -27,13 +27,13 @@ from langgraph_coe import roles as roles_mod
 
 
 def _import_module():
-    """Phase 2 introduces ``langgraph_coe.graphs.cot``."""
+    """Introduces ``langgraph_coe.graphs.cot``."""
     try:
-        from langgraph_coe.graphs import cot as cot_mod  # type: ignore
+        from langgraph_coe.graphs import cot as cot_mod # type: ignore
     except ImportError:
-        pytest.skip("Phase 2 §7 introduces langgraph_coe.graphs.cot")
+        pytest.skip("Introduces langgraph_coe.graphs.cot")
     if not hasattr(cot_mod, "build_cot_graph"):
-        pytest.skip("build_cot_graph not implemented yet (§7 target)")
+        pytest.skip("build_cot_graph unavailable")
     return cot_mod
 
 
@@ -51,7 +51,7 @@ def _registry():
     from langgraph_coe.llm import RoleModelRegistry
 
     registry = RoleModelRegistry(_config().llm)
-    registry.get_model = lambda _role_name: MagicMock()  # type: ignore[assignment]
+    registry.get_model = lambda _role_name: MagicMock() # type: ignore[assignment]
     return registry
 
 
@@ -299,11 +299,11 @@ def _build_graph(cot_mod: Any, cfg: Any | None = None):
 
 
 def test_clear_reducer_uses_typed_sentinel_not_string():
-    """§7.1 requires a ``Clear`` sentinel and ``append_or_clear`` reducer."""
+    """requires a ``Clear`` sentinel and ``append_or_clear`` reducer."""
     cot_mod = _import_module()
-    assert hasattr(cot_mod, "Clear"), "CoTGraph must export Clear (§7.1)"
+    assert hasattr(cot_mod, "Clear"), "CoTGraph must export Clear"
     assert hasattr(cot_mod, "append_or_clear"), (
-        "CoTGraph must export append_or_clear (§7.1)"
+        "CoTGraph must export append_or_clear"
     )
 
     assert cot_mod.append_or_clear(["a"], ["b"]) == ["a", "b"]
@@ -341,7 +341,7 @@ async def test_answerable_route_skips_retrieval_and_memory_update(monkeypatch):
 
 
 async def test_gen_subq_uses_text_and_graph_memory_context(monkeypatch):
-    """``gen_subq`` should reason over text memory plus textualized graph memory (§7.3)."""
+    """``gen_subq`` should reason over text memory plus textualized graph memory."""
     cot_mod = _import_module()
     graph_memory = nx.DiGraph()
     graph_memory.add_edge("France", "Paris", relation="capital")
@@ -366,7 +366,7 @@ async def test_gen_subq_uses_text_and_graph_memory_context(monkeypatch):
 
 
 async def test_retrieval_fanout_invokes_kg_web_and_corpus_per_subquestion(monkeypatch):
-    """§7.3 fan-out is symmetric across *active* surfaces: one invocation per subq.
+    """fan-out is symmetric across *active* surfaces: one invocation per subq.
 
     The earlier draft routed corpus through a ``query_generator`` LLM call that
     rewrote subquestions into queries. That step turned out to be largely
@@ -375,7 +375,7 @@ async def test_retrieval_fanout_invokes_kg_web_and_corpus_per_subquestion(monkey
     call per iteration with no measurable recall loss on a phrasing-robust
     dense embedder. Corpus now fans out per subquestion like KG / web.
 
-    Web is gated off by default (§1a, paper parity), so this test enables it and
+    Web is gated off by default (, paper parity), so this test enables it and
     tags both subquestions ``needs_kg=True`` to exercise the full three-surface
     symmetric fan-out.
     """
@@ -417,7 +417,7 @@ async def test_retrieval_fanout_invokes_kg_web_and_corpus_per_subquestion(monkey
 
 
 async def test_web_fanout_disabled_by_default(monkeypatch):
-    """§1a: web fan-out is gated off by default (paper parity).
+    """: web fan-out is gated off by default (paper parity).
 
     With the default config (``web_search.enabled is False``), the web branch
     never fires, while KG (default-tagged) and corpus still fan out per subq.
@@ -428,7 +428,7 @@ async def test_web_fanout_disabled_by_default(monkeypatch):
         subq_outputs=[
             _subq_out(
                 answerable=False, subquestions=subquestions
-            ),  # needs_kg absent → default KG-on
+            ), # needs_kg absent → default KG-on
             _subq_out(answerable=True),
         ],
         answers=["France is in Europe.", "Paris is the capital."],
@@ -438,7 +438,7 @@ async def test_web_fanout_disabled_by_default(monkeypatch):
         monkeypatch, cot_mod, executor=executor
     )
 
-    graph = _build_graph(cot_mod)  # default config: web disabled
+    graph = _build_graph(cot_mod) # default config: web disabled
     final = await graph.ainvoke(_state(max_depth=2))
 
     assert web_graph.calls == [], (
@@ -451,7 +451,7 @@ async def test_web_fanout_disabled_by_default(monkeypatch):
 
 
 async def test_needs_kg_false_skips_kg_for_that_subquestion(monkeypatch):
-    """§1a: a subquestion tagged ``needs_kg=False`` skips the KG branch.
+    """: a subquestion tagged ``needs_kg=False`` skips the KG branch.
 
     Corpus still covers it (the unconditional recall floor), so no evidence
     surface is fully starved.
@@ -488,7 +488,7 @@ async def test_needs_kg_false_skips_kg_for_that_subquestion(monkeypatch):
 
 
 async def test_known_entity_overrides_needs_kg_false(monkeypatch):
-    """§1a override: a subquestion mentioning an already-linked entity fires KG.
+    """override: a subquestion mentioning an already-linked entity fires KG.
 
     Even when the generator tags ``needs_kg=False``, holding a resolved QID for
     an entity named in the subquestion forces the KG branch on (highest-yield
@@ -638,7 +638,7 @@ async def test_rerank_node_forwards_configured_reranker(monkeypatch):
     cfg.reranker.enabled = True
     cfg.reranker.top_k = 2
     registry = RoleModelRegistry(cfg.llm)
-    registry.get_model = lambda _role_name: MagicMock()  # type: ignore[assignment]
+    registry.get_model = lambda _role_name: MagicMock() # type: ignore[assignment]
 
     seen: List[Dict[str, Any]] = []
 
@@ -671,7 +671,7 @@ async def test_rerank_node_forwards_configured_reranker(monkeypatch):
 
 
 async def test_memory_update_receives_subanswers_and_kg_triples(monkeypatch):
-    """``mem_update`` maps subanswers/triples into ``MemoryUpdateState`` (§7.3)."""
+    """``mem_update`` maps subanswers/triples into ``MemoryUpdateState``."""
     cot_mod = _import_module()
     memory_graph = CompiledGraphSpy(
         {
@@ -707,7 +707,7 @@ async def test_memory_update_receives_subanswers_and_kg_triples(monkeypatch):
 
 
 async def test_increment_records_iteration_history_and_clears_scratch(monkeypatch):
-    """``increment`` records trajectory before clearing per-iteration scratch (§7.3)."""
+    """``increment`` records trajectory before clearing per-iteration scratch."""
     cot_mod = _import_module()
     executor = RoleExecutorSpy(
         subq_outputs=[
@@ -763,7 +763,7 @@ async def test_depth_limit_routes_to_final_without_retrieval(monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §7.3 EXTRACTOR step — distills reranked passages into atomic facts
+# EXTRACTOR step — distills reranked passages into atomic facts
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -849,14 +849,14 @@ async def test_extractor_splits_oversized_contexts_into_multiple_batches(monkeyp
     cfg = LangGraphCoeConfig.from_yaml()
     cfg.reranker.enabled = False
     cfg.reranker.top_k = 5
-    cfg.memory.extractor_max_input_chars = 6_000  # forces 1 ctx per batch
+    cfg.memory.extractor_max_input_chars = 6_000 # forces 1 ctx per batch
 
     from unittest.mock import MagicMock
 
     from langgraph_coe.llm import RoleModelRegistry
 
     registry = RoleModelRegistry(cfg.llm)
-    registry.get_model = lambda _role_name: MagicMock()  # type: ignore[assignment]
+    registry.get_model = lambda _role_name: MagicMock() # type: ignore[assignment]
     graph = cot_mod.build_cot_graph(registry, cfg)
 
     await graph.ainvoke(_state(max_depth=2))
@@ -891,7 +891,7 @@ async def test_extractor_falls_back_to_reranked_when_empty(monkeypatch):
             _subq_out(answerable=True),
         ],
         answers=["Paris is the capital."],
-        extractor_outputs=[[]],  # extractor yields nothing
+        extractor_outputs=[[]], # extractor yields nothing
     )
     kg_graph = CompiledGraphSpy(
         {"kg_articles": ["Paris is the capital of France."], "triples": []}

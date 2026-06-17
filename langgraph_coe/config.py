@@ -62,7 +62,7 @@ class LLMConfig(BaseModel):
             max_tokens=2048,
             enable_thinking=False,
         ),
-        # §3b: minimal tier for roles whose output is small and bounded
+        # Minimal tier for roles whose output is small and bounded
         # (e.g. a list of ≤16 indices, a short entity list). Thinking off, tight
         # token ceiling — these cannot need more, so the cap only trims worst-case
         # decode and lets the server schedule tighter. Never put a reasoning or
@@ -89,7 +89,7 @@ class LLMConfig(BaseModel):
         # MCTS reward; do not shrink its budget until measured).
         "verifier": "medium",
         "evaluator": "medium",
-        # Bounded-output classification roles (§3b): tiny, fixed-shape outputs.
+        # Bounded-output classification roles: tiny, fixed-shape outputs.
         "triple_pruner": "classify",  # keep_indices: ≤16 ints
         "named_entity_recognition": "classify",  # short entity list
         "question_rephraser": "classify",  # single rephrased query
@@ -140,7 +140,7 @@ class CacheConfig(BaseModel):
 
 
 class MCTSConfig(BaseModel):
-    """Knobs for the MCTSGraph (Phase 3). Ports legacy ``coe/reasoning/mcts.py``."""
+    """Knobs for the MCTS strategy graph."""
 
     num_iterations: int = 15
     exploration_weight: float = 2.0
@@ -167,7 +167,7 @@ class MCTSConfig(BaseModel):
 
 
 class CoTConfig(BaseModel):
-    """Knobs for the standalone CoTGraph strategy (Phase 2)."""
+    """Knobs for the standalone CoT strategy graph."""
 
     # Maximum decomposition depth (CoT loop iterations) before forced synthesis.
     # Drives ``route_after_subq``; without it the loop finalizes immediately.

@@ -15,9 +15,9 @@ Run manually (from repo root)::
 
 Optional env overrides::
 
-    LANGGRAPH_TEST_SPARQL_URL   default ``http://n0162:1234/api/endpoint/sparql``
-    LANGGRAPH_TEST_LLM_URL      default ``http://n0152:30000/v1``
-    API_KEY / OPENAI_API_KEY    LLM auth (loaded from repo-root ``.env``)
+    LANGGRAPH_TEST_SPARQL_URL default ``http://n0162:1234/api/endpoint/sparql``
+    LANGGRAPH_TEST_LLM_URL default ``http://n0152:30000/v1``
+    API_KEY / OPENAI_API_KEY LLM auth (loaded from repo-root ``.env``)
 """
 
 from __future__ import annotations

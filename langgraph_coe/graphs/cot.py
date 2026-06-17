@@ -1,7 +1,7 @@
-"""CoTGraph (Phase 2).
+"""CoT strategy graph.
 
-Replaces the legacy ``coe/reasoning/cot.py`` while-loop with explicit LangGraph
-nodes and native fan-out. See `implementation_plan.md` §7 for the full design.
+Chain-of-thought reasoning expressed as explicit LangGraph nodes with native
+fan-out (one superstep per decomposition round).
 
 Flow::
 
@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §7.1 Clear marker + append_or_clear reducer
+# Clear marker + append_or_clear reducer
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -399,16 +399,15 @@ async def extract_facts(
     return facts
 
 
-# coe parity: SUBQUESTION_GENERATOR is sampled with n completions and their
-# decompositions are pooled (coe/reasoning/generator.py:148 ``n_subquestions``).
+# SUBQUESTION_GENERATOR is sampled with n completions and their decompositions
+# are pooled (see ``pool_subquestions``).
 N_SUBQUESTIONS = 3
 
 
 def pool_subquestions(outputs: Any) -> tuple[List[str], List[bool], bool]:
     """Pool ``n`` SUBQUESTION_GENERATOR completions into one decomposition.
 
-    Ports ``generate_subquestion`` (coe/reasoning/generator.py:144-163): only
-    completions that judged the question *not* answerable contribute their
+    Only completions that judged the question *not* answerable contribute their
     subquestions; ``should_direct`` is the majority ``is_answerable`` vote.
     Dedups ``(subquestion, needs_kg)`` pairs by text, preserving first-seen
     order. Returns ``(subquestions, needs_kg_flags, should_direct)``.
@@ -821,7 +820,7 @@ def build_cot_graph(
             # No new gaps and not flagged answerable — degenerate; finalize.
             return "gen_final"
 
-        # Adaptive retrieval gate (§1a). Corpus always fans out (embedding-only,
+        # Adaptive retrieval gate. Corpus always fans out (embedding-only,
         # ~free) as the recall floor. KG fires per-subquestion when the generator
         # tagged it entity-centric (``needs_kg``) OR the subquestion mentions an
         # already-linked entity. Web fires only when explicitly enabled.

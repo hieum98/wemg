@@ -287,4 +287,3 @@ Optional env overrides:
 | `langgraph_coe/tools/cache.py` | `RedisDictCache` |
 | `langgraph_coe/tools/wikidata_client.py` | `wd:*` keys |
 | `langgraph_coe/tools/web.py` | `web:*` keys |
-| `langgraph_coe/implementation_plan.md` §3.4 | Design rationale |

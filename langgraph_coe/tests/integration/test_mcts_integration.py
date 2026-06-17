@@ -1,4 +1,4 @@
-"""Phase 3 integration smoke test against real Qwen endpoints.
+"""Integration smoke test against real Qwen endpoints.
 
 End-to-end exercises ``MCTSGraph`` through the live ``Qwen/Qwen3-8B`` LLM
 (SGLang via the SSH-tunneled ``localhost:30172`` → ``n0172:30000``). The full
@@ -8,7 +8,7 @@ evaluate → backprop → mem_update → synthesize``.
 The rollout subgraph (``CoTGraph``) and ``MemoryUpdateGraph`` are the **real**
 compiled graphs driven by the live LLM — only their external retrieval surfaces
 (KG / Web / corpus) and the Wikidata ``link_entities`` tool are replaced with
-deterministic stubs, so the test isolates Phase 3 control flow + role-driven
+deterministic stubs, so the test isolates control flow + role-driven
 reasoning without depending on Wikidata / Serper / a FAISS index.
 
 What this verifies against a real model:
@@ -22,8 +22,8 @@ What this verifies against a real model:
 - ``FINAL_ANSWER`` leaves are terminal: a pre-seeded final-answer node is
   evaluated without re-running expansion generators.
 
-Skipped when the LLM/embedder endpoints are unreachable, mirroring the Phase 1
-and Phase 2 integration tests exactly. Open the tunnels with::
+Skipped when the LLM/embedder endpoints are unreachable, mirroring the 
+and integration tests exactly. Open the tunnels with::
 
     ssh -fN -L 30172:n0172:30000 -L 30164:n0164:30000 t2
 """
@@ -56,7 +56,7 @@ pytestmark = pytest.mark.skipif(
     not _real_endpoints_available(),
     reason=(
         "Real model endpoints unreachable. Open SSH tunnels:\n"
-        "  ssh -fN -L 30172:n0172:30000 -L 30164:n0164:30000 t2"
+        " ssh -fN -L 30172:n0172:30000 -L 30164:n0164:30000 t2"
     ),
 )
 
@@ -103,7 +103,7 @@ def _build_real_registry(cfg: LangGraphCoeConfig) -> RoleModelRegistry:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Deterministic stubs for the rollout's retrieval surfaces (reused from the
-# Phase 2 integration shape so the rollout sees real-looking evidence).
+# integration shape so the rollout sees real-looking evidence).
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -380,7 +380,7 @@ async def test_mcts_terminal_final_answer_is_evaluated_without_expansion(monkeyp
     assert -1.0 <= float(final["reward"]) <= 1.0
     tree = final["tree"]
     assert tree[final_id]["visits"] >= 1
-    assert tree[root_id]["visits"] >= 6  # 5 seeded + 1 from this iteration
+    assert tree[root_id]["visits"] >= 6 # 5 seeded + 1 from this iteration
 
     # A synthesized answer is still produced.
     assert final.get("final_answer")

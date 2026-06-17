@@ -1,6 +1,6 @@
-"""Phase 0 §3.2 — KGSearchGraph refactor target specs.
+"""KGSearchGraph refactor behavior.
 
-Goal of the refactor (implementation_plan.md §3.2):
+Goal of the refactor:
   1. Replace the NER ``create_agent`` loop with a one-shot
      ``model.with_structured_output(NEROutput)`` call.
   2. After NER, call the ``link_entities`` tool directly (no LLM mediation).
@@ -35,7 +35,7 @@ from .._fixtures import (
 
 def _ner_output(*names: str):
     """Build a NEROutput-shape value the spy will return from with_structured_output."""
-    NEROutput = roles_mod.NEROutput  # exists today
+    NEROutput = roles_mod.NEROutput # exists today
     # Accommodate either ``entities: List[str]`` or richer item shapes.
     fields = NEROutput.model_fields
     if "entities" in fields:
@@ -57,7 +57,7 @@ def _ner_output(*names: str):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.2.1 — NER becomes one-shot structured output
+# — NER becomes one-shot structured output
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -67,7 +67,7 @@ async def test_ner_node_uses_with_structured_output_exactly_once(
     """The refactored NER node must call ``with_structured_output(NEROutput)`` once.
 
     No ``create_agent`` invocation may participate in the NER path — that
-    recursion was the legacy behavior being removed (§3.2).
+    recursion was the legacy behavior being removed.
     """
     NEROutput = roles_mod.NEROutput
     spy = StructuredOutputSpy(return_value=_ner_output("Berlin", "Germany"))
@@ -121,7 +121,7 @@ async def test_ner_node_uses_with_structured_output_exactly_once(
     for c in create_agent_calls:
         tool_names = [getattr(t, "name", str(t)) for t in (c["tools"] or [])]
         assert "link_entities" not in tool_names, (
-            "create_agent must not be wired to the link_entities tool (NER is one-shot per §3.2)"
+            "create_agent must not be wired to the link_entities tool (NER is one-shot per )"
         )
 
 
@@ -157,12 +157,12 @@ async def test_ner_node_calls_link_entities_tool_directly(
     )
 
     assert link_spy.invocations, (
-        "Refactored NER node must invoke link_entities directly (§3.2); no invocations observed"
+        "Refactored NER node must invoke link_entities directly; no invocations observed"
     )
 
 
 async def test_ner_node_does_not_call_reset_session(monkeypatch, init_wikidata_tools):
-    """§3.3 cross-check: the NER node must not call ``reset_wikidata_session`` anymore.
+    """cross-check: the NER node must not call ``reset_wikidata_session`` anymore.
 
     Under MCTS, KGSearchGraph runs many times per question; a per-invocation
     reset would wipe the visited-QID set the loop-prevention depends on.
@@ -199,13 +199,13 @@ async def test_ner_node_does_not_call_reset_session(monkeypatch, init_wikidata_t
     )
 
     assert reset_count["n"] == 0, (
-        "Refactored NER node must NOT call reset_wikidata_session (§3.3); "
+        "Refactored NER node must NOT call reset_wikidata_session; "
         f"reset was called {reset_count['n']} time(s)"
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.2.2 — triple_search_agent unchanged (still a tool-calling agent)
+# — triple_search_agent unchanged (still a tool-calling agent)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -259,12 +259,12 @@ async def test_triple_search_agent_still_uses_react_agent_with_fetch_tool(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.2.3 — enrich node unchanged, state shape preserved
+# — enrich node unchanged, state shape preserved
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 async def test_state_shape_includes_phase0_keys(monkeypatch, init_wikidata_tools):
-    """Compiled KGSearchGraph still populates the keys listed in plan §5 (post-refactor)."""
+    """Compiled KGSearchGraph still populates the keys listed in plan (post-refactor)."""
     spy = StructuredOutputSpy(return_value=_ner_output("Berlin"))
     monkeypatch.setattr(
         kg_mod,
@@ -311,7 +311,7 @@ async def test_ner_empty_extraction_skips_link_entities(
     monkeypatch, init_wikidata_tools
 ):
     """If structured output returns no entities, ``link_entities`` must not be called."""
-    spy = StructuredOutputSpy(return_value=_ner_output())  # zero entities
+    spy = StructuredOutputSpy(return_value=_ner_output()) # zero entities
 
     link_spy = ToolSpy(wd_mod.link_entities)
     monkeypatch.setattr(kg_mod, "link_entities", link_spy, raising=True)

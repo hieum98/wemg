@@ -1,6 +1,6 @@
-"""Phase 0 §3.1 — ``web_researcher`` role target specs.
+"""``web_researcher`` role behavior.
 
-The role does not exist on `main`. These tests describe the shape Phase 0 must
+The role does not exist on `main`. These tests describe the shape must
 ship: a new ``Role`` with medium-tier I/O models, registered in
 ``LLMConfig.role_tiers``, and resolvable through ``RoleModelRegistry``.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import get_args, get_origin
 
-# Phase 0 introduces these symbols; tests will fail to collect until they exist.
+# Introduces these symbols; tests will fail to collect until they exist.
 # Import at module top-level so collection failure pinpoints the gap.
 from langgraph_coe import roles as roles_mod
 from langgraph_coe.config import LangGraphCoeConfig
@@ -28,7 +28,7 @@ def test_web_researcher_role_exported():
 def test_web_researcher_input_model_shape():
     """``WebResearcherInput`` exposes ``subquery: str`` + ``research_budget: int``.
 
-    Per implementation_plan.md §3.1: "Input: subquery + research_budget".
+    Per the design: "Input: subquery + research_budget".
     """
     inp_cls = getattr(roles_mod, "WebResearcherInput", None)
     assert inp_cls is not None, "WebResearcherInput must be defined"
@@ -42,7 +42,7 @@ def test_web_researcher_input_model_shape():
 
 
 def test_web_researcher_output_model_shape():
-    """Output is a list of ``{title, url, snippet, full_text}`` items (§3.1)."""
+    """Output is a list of ``{title, url, snippet, full_text}`` items."""
     out_cls = getattr(roles_mod, "WebResearcherOutput", None)
     assert out_cls is not None, "WebResearcherOutput must be defined"
     fields = out_cls.model_fields
@@ -62,12 +62,12 @@ def test_web_researcher_output_model_shape():
     )
     for key in ("title", "url", "snippet", "full_text"):
         assert key in inner_fields, (
-            f"WebResearcherOutput item missing required key '{key}' (plan §3.1)"
+            f"WebResearcherOutput item missing required key '{key}' (plan )"
         )
 
 
 def test_web_researcher_system_prompt_present_and_substantive():
-    """System prompt covers the §3.1 design points (research goal, output shape, stopping criterion)."""
+    """System prompt covers the design points (research goal, output shape, stopping criterion)."""
     web_researcher = roles_mod.WEB_RESEARCHER
     prompt = web_researcher.system_prompt
     assert isinstance(prompt, str) and len(prompt) > 100, (
@@ -82,10 +82,10 @@ def test_web_researcher_system_prompt_present_and_substantive():
 
 
 def test_web_researcher_registered_in_medium_tier():
-    """§3.1: web_researcher is a *medium tier* role."""
+    """: web_researcher is a *medium tier* role."""
     cfg = LangGraphCoeConfig.from_yaml()
     assert cfg.llm.role_tiers.get("web_researcher") == "medium", (
-        "LLMConfig.role_tiers['web_researcher'] must be 'medium' per plan §3.1"
+        "LLMConfig.role_tiers['web_researcher'] must be 'medium' per plan "
     )
 
 

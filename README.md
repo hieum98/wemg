@@ -1,4 +1,4 @@
-# COE: Co-Evolving Memory and Graph for RAG reasoning
+# Co-Evolving Graph and Text Memory for Training-Free Multi-Hop Question Answering
 
 COE is a research-oriented question-answering system that combines graph retrieval, dense retrieval, and LLM reasoning.
 
@@ -191,6 +191,8 @@ conda run -n coe pytest tests/retrieval/test_wikidata.py
 
 `langgraph_coe` is the faster, more optimized rebuild of COE on top of LangGraph. It implements the same MCTS and CoT strategies and emits the same evaluation artifacts as the legacy package, but with tiered LLM roles, improved batching/caching, and reasoning-aware middleware.
 
+For the full package guide (architecture, public API, configuration, and infrastructure setup) see [`langgraph_coe/README.md`](langgraph_coe/README.md). For the LangGraph system design (state, reducers, CoT/MCTS graph topologies, subgraphs) see [`docs/design_langgraph_coe.md`](docs/design_langgraph_coe.md).
+
 Key modules:
 
 - `langgraph_coe/system.py`: top-level `answer()` / `answer_batch()` entry points and runtime init.
@@ -281,12 +283,15 @@ coe/                  # legacy implementation
   evaluation/
   utils/
 langgraph_coe/        # recommended LangGraph implementation
+  README.md           # package guide (architecture, API, config, setup)
   config.py
   config.yaml
   system.py
   graphs/
   tools/
-  evaluation/
+  evaluation/         # evaluation CLI + README
+  tests/              # unit / integration / real_servers + README
+docs/                 # infrastructure setup guides
 tests/
 examples/
 retriever_corpora/

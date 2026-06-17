@@ -86,7 +86,7 @@ def _reset_sessions():
     """Reset per-question ContextVars between tests so cross-test bleed cannot occur.
 
     ``reset_wikidata_session`` exists today. ``reset_web_research_session`` is a
-    Phase 0 addition (§3.3) — import lazily and skip if absent so collection
+    addition — import lazily and skip if absent so collection
     still works pre-implementation.
     """
     from langgraph_coe.tools.wikidata import reset_wikidata_session
@@ -95,7 +95,7 @@ def _reset_sessions():
     try:
         from langgraph_coe.tools.web import reset_web_research_session
     except ImportError:
-        reset_web_research_session = None  # type: ignore[assignment]
+        reset_web_research_session = None # type: ignore[assignment]
     if reset_web_research_session is not None:
         reset_web_research_session()
     yield

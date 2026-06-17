@@ -1,4 +1,4 @@
-"""Phase 0 integration smoke tests — live ``web_search`` (Serper or DuckDuckGo).
+"""Integration smoke tests — live ``web_search`` (Serper or DuckDuckGo).
 
 Exercises ``init_web_search`` + ``web_search`` against the configured provider.
 Skipped when the provider is unreachable or credentials are missing.
@@ -10,8 +10,8 @@ Run manually (from repo root). Redis cache setup: ``docs/setup_redis_cache.md``:
 Defaults come from ``langgraph_coe/config.yaml`` (``web_search``).
 Optional env overrides::
 
-    SERPER_API_KEY              Serper when set (else DuckDuckGo fallback)
-    LANGGRAPH_WEB_SEARCH_TOP_K  override top_k for the smoke query
+    SERPER_API_KEY Serper when set (else DuckDuckGo fallback)
+    LANGGRAPH_WEB_SEARCH_TOP_K override top_k for the smoke query
 """
 
 from __future__ import annotations

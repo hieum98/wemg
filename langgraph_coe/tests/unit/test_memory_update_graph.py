@@ -1,4 +1,4 @@
-"""Phase 1 §4 — MemoryUpdateGraph target specs.
+"""MemoryUpdateGraph behavior.
 
 The graph lives at ``langgraph_coe.graphs.memory_update`` and decomposes legacy
 ``synchronize_memory`` into deterministic LangGraph nodes:
@@ -9,7 +9,7 @@ The graph lives at ``langgraph_coe.graphs.memory_update`` and decomposes legacy
   4. ``textualize_graph``
   5. ``consolidate_post`` or ``finalize_memory`` (when no kept triples)
 
-These tests are target specs: they describe the behavior Phase 1 must reach.
+These tests are behavior: they describe the behavior must reach.
 They skip cleanly only while the new graph module itself is absent.
 """
 
@@ -25,13 +25,13 @@ from langgraph_coe import roles as roles_mod
 
 
 def _import_module():
-    """Phase 1 introduces ``langgraph_coe.graphs.memory_update``."""
+    """Introduces ``langgraph_coe.graphs.memory_update``."""
     try:
-        from langgraph_coe.graphs import memory_update as mem_mod  # type: ignore
+        from langgraph_coe.graphs import memory_update as mem_mod # type: ignore
     except ImportError:
-        pytest.skip("Phase 1 §4 introduces langgraph_coe.graphs.memory_update")
+        pytest.skip("Introduces langgraph_coe.graphs.memory_update")
     if not hasattr(mem_mod, "build_memory_update_graph"):
-        pytest.skip("build_memory_update_graph not implemented yet (§4 target)")
+        pytest.skip("build_memory_update_graph unavailable")
     return mem_mod
 
 
@@ -40,7 +40,7 @@ def _registry():
     from langgraph_coe.llm import RoleModelRegistry
 
     registry = RoleModelRegistry(LangGraphCoeConfig.from_yaml().llm)
-    registry.get_model = lambda _role_name: MagicMock()  # type: ignore[assignment]
+    registry.get_model = lambda _role_name: MagicMock() # type: ignore[assignment]
     return registry
 
 
@@ -245,7 +245,7 @@ def _install_spies(
 
 
 async def test_graph_compiles_with_expected_state_keys(monkeypatch):
-    """``build_memory_update_graph(registry)`` surfaces the §4.1 state fields."""
+    """``build_memory_update_graph(registry)`` surfaces the state fields."""
     mem_mod = _import_module()
     executor = RoleExecutorSpy(
         consolidation_outputs=[
@@ -273,7 +273,7 @@ async def test_graph_compiles_with_expected_state_keys(monkeypatch):
         "updated_graph",
         "updated_entity_dict",
     ):
-        assert key in final, f"MemoryUpdateState must surface '{key}' (§4.1)"
+        assert key in final, f"MemoryUpdateState must surface '{key}'"
 
     assert isinstance(final["updated_text_memory"], list)
     assert isinstance(final["updated_graph"], nx.DiGraph)
@@ -281,7 +281,7 @@ async def test_graph_compiles_with_expected_state_keys(monkeypatch):
 
 
 async def test_pre_and_post_consolidation_use_memory_consolidation_role(monkeypatch):
-    """The graph performs the two consolidation passes specified in §4.2."""
+    """The graph performs the two consolidation passes specified in """
     mem_mod = _import_module()
     executor = RoleExecutorSpy(
         consolidation_outputs=[
@@ -309,7 +309,7 @@ async def test_pre_and_post_consolidation_use_memory_consolidation_role(monkeypa
     consolidation_inputs = executor.role_inputs("memory_consolidation")
     assert len(consolidation_inputs) == 2, (
         "MemoryUpdateGraph must call memory_consolidation before extraction "
-        "and again after textualizing graph triples (§4.2)"
+        "and again after textualizing graph triples"
     )
     assert "Current memory fact." in _input_text(consolidation_inputs[0])
     assert "New answer fact." in _input_text(consolidation_inputs[0])
@@ -380,7 +380,7 @@ async def test_open_ie_consumes_consolidated_memory(monkeypatch):
 
 
 async def test_link_entities_skips_entities_already_in_entity_dict(monkeypatch):
-    """The entity-linking branch should not re-resolve known QIDs (§4.2)."""
+    """The entity-linking branch should not re-resolve known QIDs."""
     mem_mod = _import_module()
     known_france = roles_mod.WikidataEntity(
         qid="Q142",
@@ -416,7 +416,7 @@ async def test_link_entities_skips_entities_already_in_entity_dict(monkeypatch):
 
 
 async def test_merge_prunes_only_new_edges_and_does_not_mutate_input_graph(monkeypatch):
-    """``merge_and_prune`` runs the pruner on newly proposed edges only (§4.2)."""
+    """``merge_and_prune`` runs the pruner on newly proposed edges only."""
     mem_mod = _import_module()
     current_graph = nx.DiGraph()
     current_graph.add_edge("France", "Paris", relation="capital")
@@ -454,7 +454,7 @@ async def test_merge_prunes_only_new_edges_and_does_not_mutate_input_graph(monke
 
 
 async def test_merge_collapses_duplicate_nodes_by_qid(monkeypatch):
-    """Nodes representing the same Wikidata QID collapse to one graph node (§4.2)."""
+    """Nodes representing the same Wikidata QID collapse to one graph node."""
     mem_mod = _import_module()
     current_graph = nx.DiGraph()
     current_graph.add_node("French Republic", qid="Q142", name="French Republic")
@@ -496,7 +496,7 @@ async def test_merge_collapses_duplicate_nodes_by_qid(monkeypatch):
 
 
 async def test_triple_pruner_batches_new_edges_at_sixteen(monkeypatch):
-    """Newly proposed edges are pruned in batches of 16 (§4.2)."""
+    """Newly proposed edges are pruned in batches of 16."""
     mem_mod = _import_module()
     relations = [
         _relation(f"Subject {i}", f"relation_{i}", f"Object {i}") for i in range(17)
@@ -601,12 +601,12 @@ async def test_retrieval_items_are_tagged_and_provenance_survives(monkeypatch):
 
 
 def test_memory_config_exposes_textual_memory_token_budget():
-    """§4.2 requires ``config.memory.max_textual_memory_tokens`` — whatever
+    """requires ``config.memory.max_textual_memory_tokens`` — whatever
     value ``config.yaml`` configures, exposed as a positive int budget."""
     from langgraph_coe.config import LangGraphCoeConfig
 
     cfg = LangGraphCoeConfig.from_yaml()
-    assert hasattr(cfg, "memory"), "Phase 1 must add LangGraphCoeConfig.memory"
+    assert hasattr(cfg, "memory"), "must add LangGraphCoeConfig.memory"
     budget = cfg.memory.max_textual_memory_tokens
     assert isinstance(budget, int) and budget > 0, (
         f"max_textual_memory_tokens must be a positive int budget; got {budget!r}"

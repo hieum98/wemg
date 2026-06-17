@@ -7,11 +7,11 @@ run against a lone Qwen deployment. This module is the MCTS analog of
 production endpoints declared in ``langgraph_coe/config.yaml`` and runs with
 **no stubs at all**:
 
-  - LLM            SGLang ``Qwen`` @ ``n0152:30000`` (all role tiers)
-  - Embedder       SGLang ``Qwen3-Embedding`` @ ``n0152:30001`` (corpus queries)
-  - Reranker       SGLang ``Qwen3-Reranker`` @ ``n0997:30000``
-  - Wikidata       QEndpoint SPARQL @ ``n0162:1234``
-  - Corpus         local 99 GB FAISS index (``retriever.corpus.index_path``)
+  - LLM SGLang ``Qwen`` @ ``n0152:30000`` (all role tiers)
+  - Embedder SGLang ``Qwen3-Embedding`` @ ``n0152:30001`` (corpus queries)
+  - Reranker SGLang ``Qwen3-Reranker`` @ ``n0997:30000``
+  - Wikidata QEndpoint SPARQL @ ``n0162:1234``
+  - Corpus local 99 GB FAISS index (``retriever.corpus.index_path``)
 
 It is the only test that drives the real ``select → expand → simulate (CoT
 rollout) → evaluate (3 verifier views) → backprop → mem_update → route →
@@ -26,7 +26,7 @@ synthesize`` cycle against live models, so it is the one that catches:
 
 It exercises every distinct MCTS node path:
 
-  * ``test_mcts_full_stack_real_servers``   — multi-iteration loop with a real CoT
+  * ``test_mcts_full_stack_real_servers`` — multi-iteration loop with a real CoT
     rollout (root expansion + ``_gen_final`` + rollout + 3-view verifier).
   * ``test_mcts_self_correction_real_servers`` — a seeded ``SUB_QA`` leaf so
     ``expand`` dispatches the ``_gen_self_correct`` branch against the live model.
@@ -45,14 +45,14 @@ The whole module skips cleanly when any endpoint or the corpus is unreachable.
 
 Optional env overrides (default to config.yaml; point at SSH tunnels for CI)::
 
-    LANGGRAPH_TEST_LLM_URL        default config.yaml heavy-tier api_base
-    LANGGRAPH_TEST_EMBED_URL      default config.yaml retriever embedder url
-    LANGGRAPH_TEST_RERANKER_URL   default config.yaml reranker url
+    LANGGRAPH_TEST_LLM_URL default config.yaml heavy-tier api_base
+    LANGGRAPH_TEST_EMBED_URL default config.yaml retriever embedder url
+    LANGGRAPH_TEST_RERANKER_URL default config.yaml reranker url
     LANGGRAPH_TEST_RERANKER_MODEL default config.yaml reranker model_name
-    LANGGRAPH_TEST_SPARQL_URL     default config.yaml wikidata sparql_endpoint
-    LANGGRAPH_TEST_MCTS_ITERS     hard cap on MCTS iterations (default 2)
+    LANGGRAPH_TEST_SPARQL_URL default config.yaml wikidata sparql_endpoint
+    LANGGRAPH_TEST_MCTS_ITERS hard cap on MCTS iterations (default 2)
     LANGGRAPH_TEST_MCTS_SIM_DEPTH per-rollout CoT depth (default 1)
-    API_KEY / OPENAI_API_KEY      LLM/embedder/reranker auth (repo-root .env)
+    API_KEY / OPENAI_API_KEY LLM/embedder/reranker auth (repo-root .env)
 """
 
 from __future__ import annotations
@@ -319,7 +319,7 @@ async def _wire_runtime():
     if client is not None:
         try:
             await client.aclose()
-        except Exception:  # noqa: BLE001 — teardown is best-effort
+        except Exception: # noqa: BLE001 — teardown is best-effort
             pass
     wd_mod._wikidata_client = None
     wd_mod._wikidata_config = None
@@ -705,7 +705,7 @@ async def test_mcts_terminal_final_answer_real_servers(_wire_runtime):
     assert -1.0 <= float(final["reward"]) <= 1.0
     tree = final.get("tree") or {}
     assert tree[final_id]["visits"] >= 1
-    assert tree[root_id]["visits"] >= 6  # 5 seeded + 1 from this iteration
+    assert tree[root_id]["visits"] >= 6 # 5 seeded + 1 from this iteration
 
     # A synthesized answer is still produced and grounds on the seeded facts.
     answer = str(final.get("final_answer") or "")

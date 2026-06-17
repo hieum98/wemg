@@ -1,6 +1,6 @@
-"""Phase 4 §9 — top-level ``system.py`` orchestration target specs.
+"""Top-level ``system.py`` orchestration behavior.
 
-Phase 4 wires the already-compiled strategy graphs into a public answer API:
+Wires the already-compiled strategy graphs into a public answer API:
 
   1. initialize tools/cache/runtime once per question,
   2. reset per-question ContextVars,
@@ -25,10 +25,10 @@ import pytest
 def _system_or_skip():
     system = pytest.importorskip(
         "langgraph_coe.system",
-        reason="Phase 4 wires the top-level system orchestrator",
+        reason="Wires the top-level system orchestrator",
     )
     if not hasattr(system, "answer"):
-        pytest.skip("system.answer not implemented yet (§9 target)")
+        pytest.skip("system.answer unavailable")
     return system
 
 
@@ -113,9 +113,9 @@ class AwaitableResult:
 
 
 def test_answer_result_from_state_contract():
-    """``AnswerResult.from_state`` is the public adapter from graph state (§9)."""
+    """``AnswerResult.from_state`` is the public adapter from graph state."""
     system = _system_or_skip()
-    assert hasattr(system, "AnswerResult"), "Phase 4 must define system.AnswerResult"
+    assert hasattr(system, "AnswerResult"), "must define system.AnswerResult"
     assert hasattr(system.AnswerResult, "from_state"), (
         "AnswerResult must expose from_state(result_state)"
     )
@@ -140,7 +140,7 @@ def test_answer_result_from_state_contract():
 async def test_answer_initializes_runtime_before_resets_and_graph_invocation(
     monkeypatch,
 ):
-    """Tool/cache init happens before per-question reset and strategy invocation (§9)."""
+    """Tool/cache init happens before per-question reset and strategy invocation."""
     system = _system_or_skip()
     calls: List[str] = []
     cache_sentinel = object()
@@ -268,7 +268,7 @@ async def test_strategy_builders_receive_role_registry(monkeypatch):
 
 
 async def test_cot_strategy_receives_complete_initial_state(monkeypatch):
-    """``answer`` must invoke CoTGraph with a full ``CoTState`` shape (§7/§9)."""
+    """``answer`` must invoke CoTGraph with a full ``CoTState`` shape (/)."""
     system = _system_or_skip()
     _patch_noop_runtime(monkeypatch, system)
     cot_graph = StrategyGraphSpy()
@@ -301,7 +301,7 @@ async def test_cot_strategy_receives_complete_initial_state(monkeypatch):
 
 
 async def test_mcts_strategy_receives_complete_initial_state(monkeypatch):
-    """``answer`` must invoke MCTSGraph with a full ``MCTSState`` shape (§8/§9)."""
+    """``answer`` must invoke MCTSGraph with a full ``MCTSState`` shape (/)."""
     system = _system_or_skip()
     _patch_noop_runtime(monkeypatch, system)
     mcts_graph = StrategyGraphSpy()
@@ -341,7 +341,7 @@ async def test_mcts_strategy_receives_complete_initial_state(monkeypatch):
 async def test_answer_returns_answer_result_not_raw_state(monkeypatch):
     """Public ``answer`` returns ``AnswerResult.from_state(result)``, not graph dict."""
     system = _system_or_skip()
-    assert hasattr(system, "AnswerResult"), "Phase 4 must define system.AnswerResult"
+    assert hasattr(system, "AnswerResult"), "must define system.AnswerResult"
     _patch_noop_runtime(monkeypatch, system)
     graph = StrategyGraphSpy(
         {
@@ -379,9 +379,9 @@ async def test_invalid_strategy_raises_value_error_without_building_graph(monkey
 async def test_answer_batch_exists_preserves_order_and_calls_answer_per_question(
     monkeypatch,
 ):
-    """``answer_batch`` preserves input order over independent ``answer`` calls (§9)."""
+    """``answer_batch`` preserves input order over independent ``answer`` calls."""
     system = _system_or_skip()
-    assert hasattr(system, "answer_batch"), "Phase 4 must expose system.answer_batch"
+    assert hasattr(system, "answer_batch"), "must expose system.answer_batch"
 
     calls: List[str] = []
 

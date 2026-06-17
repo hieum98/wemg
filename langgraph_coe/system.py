@@ -47,7 +47,7 @@ class AnswerResult:
     """Public, strategy-agnostic answer envelope returned by :func:`answer`.
 
     ``from_state`` is the single adapter from a compiled strategy graph's final
-    state dict to this shape (§9). It reads ``final_answer`` as the headline
+    state dict to this shape. It reads ``final_answer`` as the headline
     answer and lifts any non-answer bookkeeping (``strategy`` and friends) into
     ``metadata`` so callers never reach into raw graph state.
     """
@@ -133,7 +133,7 @@ def _init_runtime(cfg: LangGraphCoeConfig) -> None:
 
 
 def _initial_cot_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any]:
-    """Complete ``CoTState`` for a fresh question (§7.2)."""
+    """Complete ``CoTState`` for a fresh question."""
     return {
         "question": question,
         "max_depth": int(cfg.search.cot.max_depth),
@@ -157,7 +157,7 @@ def _initial_cot_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any]
 
 
 def _initial_mcts_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any]:
-    """Complete ``MCTSState`` with a pre-seeded ``USER_QUESTION`` root (§8.2)."""
+    """Complete ``MCTSState`` with a pre-seeded ``USER_QUESTION`` root."""
     root_id = "root"
     root = {
         "node_id": root_id,
@@ -204,7 +204,7 @@ async def _maybe_await(value: Any) -> Any:
 async def answer(
     question: str, config: LangGraphCoeConfig | None = None
 ) -> AnswerResult:
-    """Answer one ``question`` end-to-end via the configured strategy graph (§9)."""
+    """Answer one ``question`` end-to-end via the configured strategy graph."""
     cfg = config or LangGraphCoeConfig.from_yaml()
 
     strategy = getattr(getattr(cfg, "search", None), "strategy", "cot")
@@ -245,7 +245,7 @@ async def answer_batch(
     *,
     max_workers: int = 4,
 ) -> List[AnswerResult]:
-    """Answer ``questions`` concurrently, preserving input order (§9).
+    """Answer ``questions`` concurrently, preserving input order.
 
     Each question is an independent :func:`answer` call; ``max_workers`` bounds
     concurrency via a semaphore. Results are returned in the same order as the

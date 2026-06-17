@@ -1,6 +1,6 @@
-"""Phase 0 §3.3 — ContextVar reset relocation target specs.
+"""ContextVar reset relocation behavior.
 
-Why this matters (implementation_plan.md §3.3):
+Why this matters:
 
   Under MCTS, KGSearchGraph runs many times per question (every CoT iteration
   × every rollout). Per-invocation reset would wipe the ``_cv_visited_qids``
@@ -22,7 +22,7 @@ import pytest
 from langgraph_coe.tools import wikidata as wd_mod
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.3.A — reset semantics
+# A — reset semantics
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -50,7 +50,7 @@ def test_reset_does_not_clear_global_entity_cache():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.3.B — system.answer() orchestrates reset exactly once per question
+# B — system.answer() orchestrates reset exactly once per question
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -65,10 +65,10 @@ async def test_system_answer_calls_resets_once_per_question(monkeypatch):
     """``answer()`` resets both ContextVar sessions exactly once before invoking the graph."""
     system = pytest.importorskip(
         "langgraph_coe.system",
-        reason="Phase 0 §4 wires resets into system.answer; module must exist post-refactor.",
+        reason="Wires resets into system.answer; module must exist post-refactor.",
     )
     if not hasattr(system, "answer"):
-        pytest.skip("system.answer not implemented yet (Phase 0 §4 target)")
+        pytest.skip("system.answer unavailable")
 
     reset_wd_calls = {"n": 0}
     reset_web_calls = {"n": 0}
@@ -107,7 +107,7 @@ async def test_two_sequential_answers_reset_twice(monkeypatch):
     """Each question gets its own pair of resets — exactly N resets for N questions."""
     system = pytest.importorskip("langgraph_coe.system")
     if not hasattr(system, "answer"):
-        pytest.skip("system.answer not implemented yet")
+        pytest.skip("system.answer unavailable")
 
     reset_wd_calls = {"n": 0}
     monkeypatch.setattr(
@@ -139,7 +139,7 @@ async def test_two_sequential_answers_reset_twice(monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# §3.3.C — KGSearchGraph runs do NOT reset
+# C — KGSearchGraph runs do NOT reset
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -160,7 +160,7 @@ async def test_kg_search_runs_dont_clobber_visited_qids(
 
     # Pre-seed visited QIDs for the question.
     wd_mod.reset_wikidata_session()
-    seeded = {"Q64", "Q183"}  # Berlin, Germany
+    seeded = {"Q64", "Q183"} # Berlin, Germany
     wd_mod._get_session().visited.update(seeded)
 
     # Stub NER to return an entity name; stub create_agent to no-op so triple_search exits.

@@ -12,6 +12,8 @@ MCTS_PROFILING_ANALYSIS.md
 .env
 results/
 logs/
+*.log
+_*_pane.log
 results-v0/*
 .vscode/
 .cursor/

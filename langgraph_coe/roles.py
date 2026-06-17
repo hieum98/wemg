@@ -4,13 +4,11 @@ Each ``Role`` bundles a name, system prompt, Pydantic input model, and Pydantic
 output model. ``langgraph_coe/llm.py:RoleModelRegistry`` maps the role's name
 to a tier (``heavy`` / ``medium`` / ``light``); see ``config.py:LLMConfig``.
 
-Active callers today live in Phase 1–3 subgraphs. A handful of roles
-(``QUESTION_REPHRASER``, ``REASONING_SYNTHESIZER``, ``EVALUATOR``,
-``EXTRACTOR``) are kept without a current caller — their prompts are tuned
-and they fit planned use cases (alternative MCTS expansion strategies,
-offline answer evaluation harness, standalone information extraction). Roles
-fully dropped from the port (``QUERY_GENERATOR``, ``MAJORITY_VOTER``,
-``CONSENSUS_EVALUATOR``) are listed in ``implementation_plan.md`` §3.6.
+Most roles are called by the CoT, MCTS, KG-search, and memory-update graphs. A
+handful (``QUESTION_REPHRASER``, ``REASONING_SYNTHESIZER``, ``EVALUATOR``,
+``EXTRACTOR``) are kept without a current caller — their prompts are tuned and
+they fit planned use cases (alternative MCTS expansion strategies, the offline
+answer-evaluation harness, and standalone information extraction).
 """
 
 import logging
@@ -131,8 +129,8 @@ class AnswerGenerationInput(pydantic.BaseModel):
         # Context-first ordering: in every batched call site (CoT ``gen_subanswers``,
         # MCTS ``_gen_subqa``) the same ``context`` is reused across all S subquestions
         # while ``question`` varies. Emitting the shared context block first lets
-        # SGLang RadixAttention serve it from the prefix cache on S-1 of the S calls
-        # (§3a). Reordering is prompt-shape only; the model sees the same fields.
+        # SGLang RadixAttention serve it from the prefix cache on S-1 of the S calls.
+        # Reordering is prompt-shape only; the model sees the same fields.
         return f"context:\n{self.context}\n\nquestion:\n{self.question}"
 
 
@@ -996,7 +994,7 @@ Respond with a JSON object with exactly these keys:
 # =============================================================================
 
 
-# Active callers in Phase 1–3 subgraphs.
+# Roles actively called by the reasoning and memory-update graphs.
 SUBQUESTION_GENERATOR = Role(
     "subquestion_generator",
     GENERATE_SUBQUESTION_PROMPT,
@@ -1039,7 +1037,7 @@ TRIPLE_PRUNER = Role(
     "triple_pruner", TRIPLE_PRUNE_PROMPT, TriplePruneInput, TriplePruneOutput
 )
 
-# Kept without a current caller — planned use cases listed in implementation_plan.md §3.6.
+# Kept without a current caller — see the module docstring for planned use cases.
 QUESTION_REPHRASER = Role(
     "question_rephraser",
     REPHRASE_QUESTION_PROMPT,

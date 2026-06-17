@@ -1,4 +1,4 @@
-"""Phase 0 integration smoke tests — live corpus retrieval and SGLang reranker.
+"""Integration smoke tests — live corpus retrieval and SGLang reranker.
 
 Exercises ``corpus_search`` and ``call_sglang_reranker`` against real deployed
 endpoints (embedder + optional reranker) and a local FAISS corpus bundle or
@@ -17,7 +17,7 @@ Optional env overrides for CI or SSH tunnels::
     LANGGRAPH_TEST_EMBED_URL / LANGGRAPH_TEST_EMBED_MODEL
     LANGGRAPH_TEST_RERANK_URL / LANGGRAPH_TEST_RERANK_MODEL
     LANGGRAPH_CORPUS_INDEX_PATH / LANGGRAPH_CORPUS_PATH (or LANGGRAPH_CORPUS_DATASET)
-    API_KEY / OPENAI_API_KEY       forwarded to embedder/reranker when set in .env
+    API_KEY / OPENAI_API_KEY forwarded to embedder/reranker when set in .env
 """
 
 from __future__ import annotations
@@ -170,7 +170,7 @@ def _format_ranking(
     lines = []
     for rank, (idx, score) in enumerate(ranked, start=1):
         snippet = documents[idx].replace("\n", " ")[:120]
-        lines.append(f"  #{rank} index={idx} score={score:.6f} text={snippet!r}")
+        lines.append(f" #{rank} index={idx} score={score:.6f} text={snippet!r}")
     return "\n".join(lines)
 
 

@@ -70,7 +70,7 @@ llm:
       # Setup: docs/setup_thinking_budget.md. Example:
       #   enable_thinking: true
       #   thinking_budget: 512
-    # Bounded-output classification roles (§3b): tiny fixed-shape outputs, no thinking.
+    # Bounded-output classification roles: tiny, fixed-shape outputs.
     classify:
       model_name: openai/Qwen/Qwen3.5-4B
       api_base: http://n0998:30000/v1

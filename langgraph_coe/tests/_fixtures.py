@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from langgraph_coe.llm import RoleModelRegistry
 
 
-# Stable test URLs / strings reused across §3.5 tests.
+# Stable test URLs / strings reused across tests.
 URL_A = "https://example.com/a"
 URL_B = "https://example.com/b"
 URL_C = "https://example.com/c"
@@ -119,7 +119,7 @@ def make_structured_runnable(value: pydantic.BaseModel) -> Runnable:
     """Return a ``Runnable`` whose ``ainvoke`` always yields *value*.
 
     Used by ``RoleModelRegistry.get_structured`` stubs in tests that exercise
-    the §3.2 refactored NER node (which must call
+    the refactored NER node (which must call
     ``model.with_structured_output(NEROutput)`` exactly once).
     """
 
@@ -166,7 +166,7 @@ def make_fake_react_agent(
     ``langgraph.prebuilt.create_react_agent``: a final state dict with a
     ``messages`` key. The graph nodes filter that trace for ``ToolMessage``
     entries (see ``kg_search._parse_triple_tool_payloads`` for the
-    pattern Phase 0 tests verify).
+    pattern tests verify).
 
     Exposes both ``ainvoke`` and ``astream(stream_mode="values")``. The graph
     nodes stream the agent so they can salvage partial messages when the
@@ -191,8 +191,8 @@ def make_fake_react_agent(
     runnable = RunnableLambda(_coro)
     # Expose .ainvoke / .astream directly so spies can assert on the
     # (input, config=...) call shape and graphs can stream values-mode chunks.
-    runnable.ainvoke = _coro  # type: ignore[assignment]
-    runnable.astream = _astream  # type: ignore[assignment]
+    runnable.ainvoke = _coro # type: ignore[assignment]
+    runnable.astream = _astream # type: ignore[assignment]
     return runnable
 
 
@@ -260,6 +260,6 @@ def build_registry_with_models(
             return model.with_structured_output(role.output_model)
         return make_structured_runnable(MagicMock())
 
-    registry.get_model = _get_model  # type: ignore[assignment]
-    registry.get_structured = _get_structured  # type: ignore[assignment]
+    registry.get_model = _get_model # type: ignore[assignment]
+    registry.get_structured = _get_structured # type: ignore[assignment]
     return registry

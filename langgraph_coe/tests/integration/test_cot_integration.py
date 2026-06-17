@@ -1,19 +1,19 @@
-"""Phase 2 integration smoke test against real Qwen endpoints.
+"""Integration smoke test against real Qwen endpoints.
 
 End-to-end exercises ``CoTGraph`` through the live ``Qwen/Qwen3-8B`` LLM
 (SGLang via the SSH-tunneled ``localhost:30172`` → ``n0172:30000``). Retrieval
 subgraphs (KG, Web, corpus) are replaced with deterministic stubs so the test
-isolates the Phase 2 control flow + role-driven reasoning, without depending on
+isolates the control flow + role-driven reasoning, without depending on
 Wikidata / Serper / a FAISS index.
 
 What this test verifies:
 - The CoT loop completes end-to-end against a real model, including the parallel
   fan-out → barrier → rerank → subanswer → memory-update → increment cycle.
 - ``iteration_history`` accumulates one entry per non-terminal iteration.
-- ``text_memory`` is mutated by ``MemoryUpdateGraph`` (Phase 1 already covered).
+- ``text_memory`` is mutated by ``MemoryUpdateGraph``.
 - A final answer is produced and mentions the seeded retrieval facts.
 
-Skipped when the LLM/embedder endpoints are unreachable, mirroring the Phase 1
+Skipped when the LLM/embedder endpoints are unreachable, mirroring the 
 integration test exactly.
 """
 
@@ -45,7 +45,7 @@ pytestmark = pytest.mark.skipif(
     not _real_endpoints_available(),
     reason=(
         "Real model endpoints unreachable. Open SSH tunnels:\n"
-        "  ssh -fN -L 30172:n0172:30000 -L 30164:n0164:30000 t2"
+        " ssh -fN -L 30172:n0172:30000 -L 30164:n0164:30000 t2"
     ),
 )
 
@@ -143,7 +143,7 @@ class _StubLinkEntities:
     """Stand-in for the Wikidata ``link_entities`` tool used by MemoryUpdateGraph.
 
     The CoT loop invokes ``MemoryUpdateGraph`` which would otherwise reach the
-    real Wikidata SPARQL endpoint via ``link_entities``. Mirroring the Phase 1
+    real Wikidata SPARQL endpoint via ``link_entities``. Mirroring the 
     integration test, we mock it with a deterministic surface-form → QID map.
     """
 

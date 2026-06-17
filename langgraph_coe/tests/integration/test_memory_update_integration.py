@@ -1,4 +1,4 @@
-"""Phase 1 integration smoke test — live ``MemoryUpdateGraph`` (LLM + Wikidata).
+"""Integration smoke test — live ``MemoryUpdateGraph`` (LLM + Wikidata).
 
 Exercises ``build_memory_update_graph`` end-to-end against:
   - SGLang LLM at ``n0152:30000`` (all tiers; defaults from ``config.yaml``)
@@ -10,9 +10,9 @@ Run manually (from repo root)::
 
 Optional env overrides::
 
-    LANGGRAPH_TEST_LLM_URL       override tier ``api_base`` (default: config.yaml)
-    LANGGRAPH_TEST_SPARQL_URL    override ``wikidata.sparql_endpoint``
-    API_KEY / OPENAI_API_KEY     LLM auth (loaded from repo-root ``.env``)
+    LANGGRAPH_TEST_LLM_URL override tier ``api_base`` (default: config.yaml)
+    LANGGRAPH_TEST_SPARQL_URL override ``wikidata.sparql_endpoint``
+    API_KEY / OPENAI_API_KEY LLM auth (loaded from repo-root ``.env``)
 """
 
 from __future__ import annotations
@@ -239,7 +239,7 @@ async def test_memory_update_raw_triples_dedup_and_non_mutation(live_wikidata):
     Covers branches the happy-path tests never reach:
       - ``_coerce_raw_triple_to_relation`` on a raw dict and a ``Relation``
       - ``_relation_already_in_graph`` filtering an edge already in the graph
-        so the (expensive) pruner never re-examines it (§4.2)
+        so the (expensive) pruner never re-examines it
       - ``merge_and_prune`` working on a *copy* — the caller's graph is untouched
     """
     from langgraph_coe.graphs import memory_update as mem_mod

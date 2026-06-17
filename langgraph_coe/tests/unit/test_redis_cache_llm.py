@@ -1,6 +1,6 @@
-"""Phase 0 §3.4 (db=0) — LangChain LLM cache wiring target specs.
+"""LangChain LLM cache wiring behavior (db=0).
 
-Plan §3.4 wiring:
+Plan wiring:
 
     LLM cache (db=0): LangChain ``RedisCache`` over ``ChatLiteLLM`` invocations.
 
@@ -28,20 +28,20 @@ from langchain_core.globals import get_llm_cache, set_llm_cache
 def _system_or_skip():
     sys_mod = pytest.importorskip(
         "langgraph_coe.system",
-        reason="Phase 0 §3.4 wires the LLM cache into system.py",
+        reason="Wires the LLM cache into system.py",
     )
     if not hasattr(sys_mod, "answer"):
-        pytest.skip("system.answer not implemented yet (Phase 0 §4 target)")
+        pytest.skip("system.answer unavailable")
     return sys_mod
 
 
 def _ensure_cache_config(cfg):
-    """Phase 0 adds ``cfg.cache``. Skip if it's missing instead of failing.
+    """Adds ``cfg.cache``. Skip if it's missing instead of failing.
 
-    Once Phase 0 lands the attribute exists and the test runs.
+    Once lands the attribute exists and the test runs.
     """
     if not hasattr(cfg, "cache"):
-        pytest.skip("LangGraphCoeConfig.cache field is a Phase 0 §3.4 addition")
+        pytest.skip("LangGraphCoeConfig.cache field is a addition")
     return cfg
 
 
@@ -120,7 +120,7 @@ async def test_llm_cache_disabled_leaves_global_cache_unset(
 async def test_llm_and_wikidata_use_separate_db_indices(
     monkeypatch, fresh_global_cache
 ):
-    """Plan §3.4 table: db=0 → LLM, db=1 → Wikidata + web."""
+    """Cache routing: db=0 → LLM, db=1 → Wikidata + web."""
     system = _system_or_skip()
     from langgraph_coe.config import LangGraphCoeConfig
 

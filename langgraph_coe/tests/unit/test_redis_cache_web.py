@@ -1,7 +1,6 @@
-"""Phase 0 §3.4 (db=1, prefix ``web:``) — Web-search cache target specs.
+"""Web-search cache behavior (db=1, prefix ``web:``).
 
-Plan §3.4:
-  Web search cache (also db=1, prefix `web:`): keyed by ``(query, top_k)``,
+Web search cache (also db=1, prefix `web:`): keyed by ``(query, top_k)``,
   TTL 24h. Cuts agent-driven re-queries within ``WebResearchGraph`` to near-free.
 
 Tests:
@@ -45,18 +44,18 @@ def _init_web_search_with_cache(
         raising=False,
     )
 
-    # Phase 0 introduces a cache attribute on the web module — patch it in.
+    # Introduces a cache attribute on the web module — patch it in.
     if not hasattr(web_mod, "_web_cache"):
         pytest.skip(
-            "Phase 0 §3.4 introduces a cache hook on langgraph_coe.tools.web; "
+            "Introduces a cache hook on langgraph_coe.tools.web; "
             "module attribute _web_cache not present yet."
         )
 
-    # Build the cache wrapper used by Phase 0.
+    # Build the cache wrapper used by .
     try:
-        from langgraph_coe.tools.cache import RedisDictCache  # type: ignore
+        from langgraph_coe.tools.cache import RedisDictCache # type: ignore
     except ImportError:
-        pytest.skip("RedisDictCache (Phase 0 §3.4) not yet implemented")
+        pytest.skip("RedisDictCache unavailable")
     cache = RedisDictCache(client=fake_redis, ttls={"web": TTL_24H})
     monkeypatch.setattr(web_mod, "_web_cache", cache, raising=False)
 
@@ -75,7 +74,7 @@ async def test_web_search_miss_writes_24h_ttl(monkeypatch, fake_redis):
     await web_mod.web_search.ainvoke({"query": "berlin"})
 
     keys = list(fake_redis.scan_iter(match="web:*"))
-    assert keys, "first web_search must populate a `web:*` key (§3.4)"
+    assert keys, "first web_search must populate a `web:*` key"
     ttl = fake_redis.ttl(keys[0])
     assert TTL_24H - 2 <= ttl <= TTL_24H, f"expected 24h TTL, got {ttl}s"
 
