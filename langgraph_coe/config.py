@@ -12,11 +12,20 @@ class TierConfig(BaseModel):
     """LLM configuration for one tier."""
 
     model_name: str = "Qwen3-Next-80B-A3B-Thinking-FP8"
-    api_base: str = "http://n0142:4000/v1"
+    # None for managed providers that route by model name rather than URL
+    # (e.g. ``bedrock/qwen.qwen3-32b-v1:0``): passing an api_base there makes
+    # LiteLLM try to reach that host instead of the provider endpoint.
+    api_base: Optional[str] = "http://n0142:4000/v1"
     api_key: Optional[str] = None  # inherits from top-level llm.api_key
     temperature: float = 0.7
     max_tokens: int = 8192
     max_input_tokens: int = 100000
+    # Chars-per-token used by the input guard to estimate prompt size. Lower is
+    # more conservative (trims earlier). 3.0 suits the SGLang/Qwen setup, but
+    # KG-heavy prompts (QIDs, triples, JSON) tokenize closer to ~2.1 chars/token,
+    # so a model whose real window is tight needs this lowered or the guard
+    # under-trims and the provider rejects the request outright.
+    chars_per_token: float = 3.0
     top_p: float = 0.95
     # Extra sampling controls. None = omit from the request so SGLang's own
     # default applies (don't send a neutral value you don't intend). top_k,
@@ -164,6 +173,17 @@ class MCTSConfig(BaseModel):
     # (select→expand→simulate→evaluate→backprop→mem_update→route); size with
     # headroom over ``num_iterations × 7``.
     recursion_limit: int = 150
+    # Snapshot ``text_memory`` / ``graph_memory`` / ``entity_dict`` per tree node so
+    # a branch's retrieval writes stay inside its own subtree.
+    #
+    # Default False preserves documented coe parity: memory is a single shared
+    # channel that rollouts mutate directly (see the module docstring). That
+    # sharing is what makes a rejected branch's evidence permanent — its writes
+    # survive even though its value is discarded, and ``evaluate``'s
+    # memory-grounded verifier views then score later candidates against them. Any
+    # design that treats a subtree as cheap to explore (e.g. replan-as-action)
+    # needs this on, so the flag is what makes the two regimes comparable.
+    branch_local_memory: bool = False
 
 
 class CoTConfig(BaseModel):
@@ -178,12 +198,42 @@ class CoTConfig(BaseModel):
     recursion_limit: int = 75
 
 
+class PlanConfig(BaseModel):
+    """Knobs for the explicit plan channel (planning/reasoning separation).
+
+    A *plan* is prose stating what to find out. It conditions
+    ``SUBQUESTION_GENERATOR`` and ``SELF_CORRECTOR`` via a dedicated prompt field
+    and never enters ``text_memory`` — an interrogative in memory becomes a
+    retrieval query, then verifier grounding, then a synthesis candidate.
+
+    Two operations act on it. **UPDATE** is a deterministic, LLM-free write that
+    closes a plan intent and surfaces its resolved binding through the
+    ``intermediate_answer`` slot. **REPLAN** is one PLANNER call, fired by
+    ``plan_gate`` on *contested discharge* (two or more distinct-QID referents
+    survive for one intent) or *falsified discharge* (a fact the plan cited was
+    evicted by retrieval).
+
+    Off by default: the A0 baseline must stay byte-identical to the pre-plan
+    behaviour so the ablation is meaningful.
+    """
+
+    enabled: bool = False
+    # 0 keeps ``plan_gate`` in log-only mode: ``plan_action`` is computed and
+    # recorded, but the router never takes the replan edge. The trigger's fire
+    # rate is unmeasured, so measure before spending a heavy PLANNER call on it.
+    replan_max: int = 0
+    # Refuse to replan within this many iterations of ``max_depth`` — a plan
+    # rewritten on the last hop cannot be acted on.
+    replan_min_depth_headroom: int = 2
+
+
 class SearchConfig(BaseModel):
     """Top-level strategy selection (``system.py`` reads ``strategy``)."""
 
     strategy: str = "mcts"  # "mcts" | "cot"
     cot: CoTConfig = Field(default_factory=CoTConfig)
     mcts: MCTSConfig = Field(default_factory=MCTSConfig)
+    plan: PlanConfig = Field(default_factory=PlanConfig)
 
 
 class MemoryConfig(BaseModel):
@@ -242,6 +292,12 @@ class CorpusConfig(BaseModel):
 
 
 class RetrieverConfig(BaseModel):
+    # Corpus retrieval is the recall floor for every subquestion, so it is on by
+    # default. Set False when no local FAISS index / embedding server is available:
+    # ``corpus_search`` raises when the pipeline is uninitialised, and
+    # ``_init_runtime`` deliberately swallows the init failure, so without this
+    # flag the graphs would fan out into a guaranteed RuntimeError on every hop.
+    enabled: bool = True
     corpus: CorpusConfig = Field(default_factory=CorpusConfig)
 
 

@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import Runnable
@@ -47,29 +47,77 @@ def format_messages(role: Role, item: BaseModel) -> List[Any]:
     ]
 
 
-# Conservative chars-per-token used to estimate prompt size for the input guard.
-# KG triples, entity IDs and JSON tokenize densely (often <3.5 chars/token), so
-# we deliberately under-assume to trim a little early rather than risk slipping
-# over the server's context window. A rough estimate is fine here — this guards
-# against catastrophic context-length 400s, not exact token accounting.
+# Fallback chars-per-token used to estimate prompt size when the tokenizer is
+# unavailable. Only a fallback: the ratio is content-dependent in a way no single
+# constant survives — natural English runs ~4, KG triples and entity IDs ~2, and
+# crawled pages containing CJK or minified script measured ~1.1 chars/token in
+# practice, i.e. a 32k-char payload the heuristic scored as 10k tokens was really
+# 29k. Prefer :func:`count_prompt_tokens`, which asks the tokenizer.
 _CHARS_PER_TOKEN = 3.0
 _TRUNCATION_NOTICE = "\n\n…[input truncated to fit the model context budget]…\n\n"
 
 
+def count_prompt_tokens(messages: Sequence[Any], model: Optional[str]) -> Optional[int]:
+    """Exact prompt token count via the model's tokenizer, or None if unavailable.
+
+    ``litellm.token_counter`` resolves the right tokenizer per provider, so this
+    is the only measure that holds across the SGLang and Bedrock paths and across
+    content types. Returns None (rather than raising) when the model is unknown or
+    litellm cannot tokenize it, so callers fall back to the char heuristic.
+    """
+    if not model or not messages:
+        return None
+    try:
+        import litellm
+
+        payload = [
+            {
+                "role": getattr(m, "type", None) == "system" and "system" or "user",
+                "content": _content_to_text(getattr(m, "content", "")),
+            }
+            for m in messages
+        ]
+        return int(litellm.token_counter(model=model, messages=payload))
+    except Exception:  # noqa: BLE001 — estimation must never break a graph node
+        logger.debug("token_counter unavailable for model=%r", model, exc_info=True)
+        return None
+
+
 def _truncate_messages_to_budget(
-    messages: List[Any], max_input_tokens: Optional[int], role_name: str
+    messages: List[Any],
+    max_input_tokens: Optional[int],
+    role_name: str,
+    chars_per_token: float = _CHARS_PER_TOKEN,
+    model: Optional[str] = None,
 ) -> List[Any]:
-    """Cap the estimated prompt size at ``max_input_tokens`` (best-effort).
+    """Cap the prompt size at ``max_input_tokens``.
 
     Only the final (user) message is trimmed — earlier messages (the role's
     system prompt) are preserved whole. The user payload is trimmed by keeping
     its head and tail and dropping the middle, so the question and any trailing
     instructions survive while the bulky accumulated memory/retrieval in the
     middle is dropped. Emits a WARNING when it fires — never a silent drop.
+
+    When ``model`` is given, the char budget is derived from an **exact** token
+    count for the current payload rather than a fixed chars-per-token guess. The
+    guess cannot be made safe with one constant: the same 32k-char payload is 10k
+    tokens of English and 29k tokens of CJK-bearing crawled markup, so a heuristic
+    tuned for one silently under-trims the other.
     """
     if not max_input_tokens or max_input_tokens <= 0 or not messages:
         return messages
-    budget_chars = int(max_input_tokens * _CHARS_PER_TOKEN)
+
+    actual_tokens = count_prompt_tokens(messages, model)
+    if actual_tokens is not None and actual_tokens > 0:
+        total_chars = sum(len(_content_to_text(m.content)) for m in messages)
+        if actual_tokens <= max_input_tokens:
+            return messages
+        # Measured ratio for *this* payload, floored so a pathological ratio still
+        # produces a positive budget.
+        measured = max(0.5, total_chars / actual_tokens)
+        budget_chars = int(max_input_tokens * measured)
+    else:
+        budget_chars = int(max_input_tokens * chars_per_token)
     sizes = [len(_content_to_text(m.content)) for m in messages]
     total = sum(sizes)
     if total <= budget_chars:
@@ -98,7 +146,7 @@ def _truncate_messages_to_budget(
         "[input_guard] role=%s prompt ≈%d tok > max_input_tokens=%d; trimmed "
         "user payload %d→%d chars (head=%d, tail=%d).",
         role_name,
-        int(total / _CHARS_PER_TOKEN),
+        int(total / chars_per_token),
         max_input_tokens,
         len(user_text),
         len(truncated),
@@ -207,6 +255,28 @@ def parse_fallback(role: Role, raw_text: Any) -> Optional[BaseModel]:
     return role.output_model(**parsed_dict)
 
 
+# Attribute stamped on the neutral structures returned by
+# :func:`build_safe_default_output`. Callers use :func:`is_safe_default` to tell a
+# retry-exhausted parse failure apart from a genuine completion whose zero value
+# happens to be meaningful — the two are otherwise indistinguishable, and
+# conflating them turns an outage into a confident signal (a VERIFIER rating of
+# 0.0 reads as "worst possible answer"; an empty ``subquestions`` list reads as
+# "nothing left to ask"). Set via ``object.__setattr__`` so it lives outside the
+# pydantic field set and never appears in ``model_dump()``.
+_SAFE_DEFAULT_ATTR = "__coe_safe_default__"
+
+
+def mark_safe_default(obj: BaseModel) -> BaseModel:
+    """Stamp ``obj`` as a neutral default (see :data:`_SAFE_DEFAULT_ATTR`)."""
+    object.__setattr__(obj, _SAFE_DEFAULT_ATTR, True)
+    return obj
+
+
+def is_safe_default(obj: Any) -> bool:
+    """True when ``obj`` is a neutral default, not a parsed model completion."""
+    return bool(getattr(obj, _SAFE_DEFAULT_ATTR, False))
+
+
 def build_safe_default_output(role: Role) -> BaseModel:
     """Construct a neutral, valid instance of a role's output model.
 
@@ -217,6 +287,10 @@ def build_safe_default_output(role: Role) -> BaseModel:
     type-appropriate zero value; lists get ``[]``; optional/defaulted fields are
     left to pydantic. Falls back to ``model_construct`` if a constrained field
     (e.g. a regex-validated literal) rejects the zero value.
+
+    The result is stamped by :func:`mark_safe_default` so callers can distinguish
+    it from a real completion — ``is_safe_default(out)`` is the only reliable way
+    to detect "the model never answered" downstream.
     """
     defaults: Dict[str, Any] = {}
     zero_by_type = {
@@ -238,9 +312,9 @@ def build_safe_default_output(role: Role) -> BaseModel:
             defaults[name] = zero_by_type.get(vtype, None)
         # else: optional scalar — leave pydantic's configured default
     try:
-        return role.output_model(**defaults)
+        return mark_safe_default(role.output_model(**defaults))
     except Exception:  # noqa: BLE001 — constrained field; skip validation
-        return role.output_model.model_construct(**defaults)
+        return mark_safe_default(role.output_model.model_construct(**defaults))
 
 
 class RoleModelRegistry:
@@ -265,6 +339,22 @@ class RoleModelRegistry:
         tier = tier_override or self._get_tier(role_name)
         cfg = self._tiers.get(tier) or self._tiers.get("heavy")
         return cfg.max_input_tokens if cfg else 0
+
+    def get_chars_per_token(
+        self, role_name: str, tier_override: Optional[str] = None
+    ) -> float:
+        """Chars-per-token estimate for a role's tier (input-guard conversion)."""
+        tier = tier_override or self._get_tier(role_name)
+        cfg = self._tiers.get(tier) or self._tiers.get("heavy")
+        return float(getattr(cfg, "chars_per_token", _CHARS_PER_TOKEN) or _CHARS_PER_TOKEN)
+
+    def get_model_name(
+        self, role_name: str, tier_override: Optional[str] = None
+    ) -> Optional[str]:
+        """LiteLLM model id for a role's tier — the tokenizer needs it by name."""
+        tier = tier_override or self._get_tier(role_name)
+        cfg = self._tiers.get(tier) or self._tiers.get("heavy")
+        return getattr(cfg, "model_name", None) if cfg else None
 
     def get_model_by_tier(self, tier: str) -> ChatLiteLLM:
         """Get or create the ChatLiteLLM for a specific tier."""
@@ -364,6 +454,13 @@ async def execute_role_lc(
 
     chain = model.with_structured_output(role.output_model, include_raw=True)
     max_input_tokens = registry.get_max_input_tokens(role.name, tier_override)
+    # Tolerate registry stand-ins in tests that predate this accessor.
+    chars_per_token = getattr(
+        registry, "get_chars_per_token", lambda *_a, **_k: _CHARS_PER_TOKEN
+    )(role.name, tier_override)
+    guard_model = getattr(registry, "get_model_name", lambda *_a, **_k: None)(
+        role.name, tier_override
+    )
 
     def _shaken_chain(attempt: int) -> Runnable:
         """Rebuild the structured chain with perturbed sampling for a retry.
@@ -420,7 +517,7 @@ async def execute_role_lc(
         ``_STRUCT_PARSE_RETRIES`` times when nothing parses (legacy parity)."""
         messages = format_messages(role, item)  # system + user only
         messages = _truncate_messages_to_budget(
-            messages, max_input_tokens, role.name
+            messages, max_input_tokens, role.name, chars_per_token, guard_model
         )
 
         last_errors: List[Exception] = []

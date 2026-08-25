@@ -16,6 +16,7 @@ from ..config import WebSearchConfig
 from ..llm import RoleModelRegistry
 from ..roles import WEB_RESEARCHER
 from ..tools.web import web_search
+from ._budget_middleware import make_budget_middleware
 from ._reasoning_middleware import strip_reasoning_middleware
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,12 @@ def build_web_research_graph(registry: RoleModelRegistry):
             model,
             tools=[web_search],
             system_prompt=WEB_RESEARCHER.system_prompt,
-            middleware=[strip_reasoning_middleware],
+            # Crawled page bodies are the largest thing in this loop, so without
+            # a budget guard the prompt outgrows the window after a few searches.
+            middleware=[
+                strip_reasoning_middleware,
+                make_budget_middleware(registry, "web_researcher"),
+            ],
             name="web_research_agent",
         )
         errs = list(state.get("errors") or [])

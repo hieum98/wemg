@@ -116,6 +116,7 @@ def _save_question_artifacts(
         "search_tree_path": None,
         "textual_memory_path": None,
         "graph_memory_path": None,
+        "plan_path": None,
     }
 
     raw_state = (getattr(result, "metadata", None) or {}).get("_raw_state") or {}
@@ -129,11 +130,29 @@ def _save_question_artifacts(
     has_graph = (
         isinstance(graph, (nx.Graph, nx.DiGraph)) and graph.number_of_nodes() > 0
     )
+    # Plan trajectory. ``iteration_history`` was never persisted before, and it is
+    # the only record of what was asked per hop — required to measure the
+    # cross-iteration re-ask rate that the UPDATE write is meant to remove.
+    plan_payload: Optional[Dict[str, Any]] = None
+    if raw_state.get("plan"):
+        plan_payload = {
+            "plan": raw_state.get("plan"),
+            "plan_version": raw_state.get("plan_version"),
+            "plan_ledger": raw_state.get("plan_ledger") or [],
+            "plan_action_log": raw_state.get("plan_action_log") or [],
+            "iteration_history": raw_state.get("iteration_history") or [],
+        }
 
-    if not (tree_payload or textual_items or has_graph):
+    if not (tree_payload or textual_items or has_graph or plan_payload):
         return out
 
     q_dir.mkdir(parents=True, exist_ok=True)
+
+    if plan_payload is not None:
+        plan_path = q_dir / "plan.json"
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(plan_payload, f, indent=2, ensure_ascii=False, default=str)
+        out["plan_path"] = str(plan_path)
 
     if tree_payload is not None:
         tree_path = q_dir / "search_tree.json"

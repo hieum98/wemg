@@ -62,6 +62,7 @@ coe/utils/text.py
 langgraph_coe/__init__.py
 langgraph_coe/config.py
 langgraph_coe/llm.py
+langgraph_coe/logging_config.py
 langgraph_coe/parsing.py
 langgraph_coe/roles.py
 langgraph_coe/system.py

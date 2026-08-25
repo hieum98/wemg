@@ -29,6 +29,7 @@ from ..tools.wikidata import (
     # node never calls it (session reset lives in system.py, not here).
     reset_wikidata_session,  # noqa: F401
 )
+from ._budget_middleware import make_budget_middleware
 from ._reasoning_middleware import strip_reasoning_middleware
 
 logger = logging.getLogger(__name__)
@@ -142,10 +143,15 @@ def build_kg_search_graph(registry: RoleModelRegistry):
             # the same _content_to_text unwrap + regex recovery used elsewhere,
             # so a parse hiccup no longer silently disables KG retrieval.
             chain = model.with_structured_output(NEROutput, include_raw=True)
+            # Pass the tier's ``chars_per_token`` explicitly: the default 3.0
+            # over-estimates how much text fits, and this prompt is exactly the
+            # dense kind (entity names, QIDs, triples) that tokenizes closer to
+            # ~2.1 — so a tier configured for a small window would still overflow.
             msgs = _truncate_messages_to_budget(
                 [HumanMessage(content=user)],
                 registry.get_max_input_tokens("kg_ner_agent"),
                 "kg_ner_agent",
+                registry.get_chars_per_token("kg_ner_agent"),
             )
             result = await chain.ainvoke(msgs)
             parsed = _parse_ner_result(result)
@@ -182,7 +188,14 @@ def build_kg_search_graph(registry: RoleModelRegistry):
             model,
             tools=[fetch_tool],
             system_prompt=KG_TRIPLE_AGENT_SYSTEM,
-            middleware=[strip_reasoning_middleware],
+            # The budget guard is required, not defensive: each fetch appends a
+            # tool result and the model is called again, so nothing else bounds
+            # this prompt across loop iterations (unlike the single-shot roles,
+            # which ``execute_role_lc`` guards).
+            middleware=[
+                strip_reasoning_middleware,
+                make_budget_middleware(registry, "kg_triple_search_agent"),
+            ],
             name="kg_triple",
         )
         user = _build_triple_user_message(state)

@@ -95,6 +95,15 @@ class MemoryUpdateState(TypedDict, total=False):
     updated_text_memory: List[str]
     updated_graph: nx.DiGraph
     updated_entity_dict: Dict[str, Any]
+    # Retractions from the pre-merge consolidation pass, resolved from the
+    # consolidator's line numbers back to the original tagged strings. Each entry
+    # is ``{"content": <untagged text>, "tagged": <original line>, "reason": str}``.
+    # ``reason == "contradicted"`` is the retraction signal proper: a claim we
+    # held was overturned by retrieved evidence.
+    retractions: List[Dict[str, Any]]
+    # Groups of conflicting items the consolidator kept rather than adjudicating
+    # (two [Retrieval] items disagreeing), as untagged text.
+    unresolved_conflicts: List[List[str]]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -106,20 +115,42 @@ def _format_memory_item(content: str, provenance: SourceType) -> str:
     tag = {
         SourceType.SYSTEM_PREDICTION: "[System Prediction]",
         SourceType.RETRIEVAL: "[Retrieval]",
+        SourceType.ASSESSMENT: "[Assessment]",
     }.get(provenance, "")
     normalized = (content or "").strip()
     # Pass through items that already carry a provenance tag or a leading
     # ``[hop=N]`` reasoning-depth annotation (see RC-C / hop-depth filtering).
-    if normalized.startswith(("[System Prediction]", "[Retrieval]", "[hop=")):
+    if normalized.startswith(
+        ("[System Prediction]", "[Retrieval]", "[Assessment]", "[hop=")
+    ):
         return normalized
     return f"{tag}: {normalized}" if tag else normalized
 
 
 def _format_lines(items: Sequence[str]) -> str:
-    return "\n".join(f"- {i.strip()}" for i in items if i and i.strip())
+    """Render memory items as a numbered list.
+
+    Numbering exists so ``MEMORY_CONSOLIDATOR`` can report evictions by line
+    index instead of echoing content back (the evicted set is the complement of
+    the kept set, so verbatim echoes would be several times larger than
+    ``consolidated_memory`` on a call that already runs with a large thinking
+    budget). :func:`enumerate_memory_lines` is the matching decoder.
+    """
+    kept = [i.strip() for i in items if i and i.strip()]
+    return "\n".join(f"{n}. {line}" for n, line in enumerate(kept, start=1))
 
 
-_PROVENANCE_TAGS = ("[System Prediction]", "[Retrieval]")
+def enumerate_memory_lines(items: Sequence[str]) -> Dict[int, str]:
+    """1-based line number → original tagged string, matching :func:`_format_lines`.
+
+    Kept in lockstep with ``_format_lines``' filtering so a consolidator-reported
+    ``evicted`` line number resolves back to the exact item that went in.
+    """
+    kept = [i.strip() for i in items if i and i.strip()]
+    return {n: line for n, line in enumerate(kept, start=1)}
+
+
+_PROVENANCE_TAGS = ("[System Prediction]", "[Retrieval]", "[Assessment]")
 
 
 def _strip_provenance_tag(text: str) -> str:
@@ -153,6 +184,78 @@ def _is_retrieval_grounded(text: str) -> bool:
     return stripped.startswith("[Retrieval]")
 
 
+def _is_assessment(text: str) -> bool:
+    """True if a memory line carries the ``[Assessment]`` provenance tag.
+
+    Assessments are verifier / self-correction commentary about a *candidate
+    answer*, not claims about the world, so re-verification must never re-issue
+    them as retrieval queries (see :class:`SourceType.ASSESSMENT`).
+    """
+    stripped = (text or "").strip()
+    if stripped.startswith("[hop="):
+        end = stripped.find("]")
+        if end != -1:
+            stripped = stripped[end + 1 :].lstrip()
+    return stripped.startswith("[Assessment]")
+
+
+_PROVENANCE_BY_LABEL = {
+    "retrieval": SourceType.RETRIEVAL,
+    "assessment": SourceType.ASSESSMENT,
+    "system prediction": SourceType.SYSTEM_PREDICTION,
+}
+
+_EVICTION_REASONS = frozenset(
+    {"contradicted", "superseded", "irrelevant", "duplicate", "hop_filtered"}
+)
+
+
+def _resolve_retractions(
+    output: MemoryConsolidationOutput, line_map: Dict[int, str]
+) -> Dict[str, Any]:
+    """Resolve consolidator line numbers back to the strings that went in.
+
+    Out-of-range or unparseable line numbers are dropped with a warning rather
+    than raising — a hallucinated index must not break consolidation, and
+    ``evicted`` is a diagnostic/trigger channel, not a correctness dependency.
+    An unrecognised ``reason`` is kept verbatim so a prompt/schema drift stays
+    visible instead of being silently reclassified.
+    """
+    retractions: List[Dict[str, Any]] = []
+    for item in getattr(output, "evicted", None) or []:
+        line = getattr(item, "line", None)
+        tagged = line_map.get(line) if isinstance(line, int) else None
+        if tagged is None:
+            logger.warning(
+                "[consolidate] evicted line %r not in the input (1..%d); dropping",
+                line,
+                len(line_map),
+            )
+            continue
+        reason = str(getattr(item, "reason", "") or "").strip().lower()
+        if reason not in _EVICTION_REASONS:
+            logger.warning("[consolidate] unrecognised eviction reason %r", reason)
+        retractions.append(
+            {
+                "content": _strip_provenance_tag(tagged),
+                "tagged": tagged,
+                "reason": reason,
+            }
+        )
+
+    conflicts: List[List[str]] = []
+    for group in getattr(output, "unresolved_conflicts", None) or []:
+        resolved = [
+            _strip_provenance_tag(line_map[n])
+            for n in (group or [])
+            if isinstance(n, int) and n in line_map
+        ]
+        if len(resolved) >= 2:
+            conflicts.append(resolved)
+
+    return {"retractions": retractions, "unresolved_conflicts": conflicts}
+
+
 def _consolidated_to_text(output: MemoryConsolidationOutput) -> List[str]:
     """Render consolidated items as provenance-tagged strings.
 
@@ -163,10 +266,8 @@ def _consolidated_to_text(output: MemoryConsolidationOutput) -> List[str]:
     """
     items: List[str] = []
     for item in output.consolidated_memory:
-        prov = (
-            SourceType.RETRIEVAL
-            if (item.provenance or "").strip().lower() == "retrieval"
-            else SourceType.SYSTEM_PREDICTION
+        prov = _PROVENANCE_BY_LABEL.get(
+            (item.provenance or "").strip().lower(), SourceType.SYSTEM_PREDICTION
         )
         formatted = _format_memory_item(_strip_provenance_tag(item.content), prov)
         # Re-attach the consolidator's hop_depth so it survives into text_memory
@@ -221,6 +322,39 @@ def _collect_unlinked_entity_names(
             maybe_add(rel.object)
 
     return candidates
+
+
+def _deep_copy_graph(source: nx.DiGraph) -> nx.DiGraph:
+    """Copy ``source`` including its mutable edge/node attribute containers.
+
+    ``nx.DiGraph.copy()`` shares attribute *objects* with the original, so the
+    ``relation`` sets written by :func:`_add_triple_to_graph` would be mutated in
+    both graphs at once. Rebuild each container so callers genuinely get an
+    isolated graph — this is what makes branch-local graph memory possible in
+    MCTS. Scalars and immutables are shared, which is fine.
+    """
+    out = nx.DiGraph()
+    out.graph.update(dict(source.graph or {}))
+    for node, data in source.nodes(data=True):
+        out.add_node(node, **_copy_attrs(data))
+    for u, v, data in source.edges(data=True):
+        out.add_edge(u, v, **_copy_attrs(data))
+    return out
+
+
+def _copy_attrs(data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Shallow-copy the mutable containers inside one attribute dict."""
+    out: Dict[str, Any] = {}
+    for key, value in (data or {}).items():
+        if isinstance(value, set):
+            out[key] = set(value)
+        elif isinstance(value, list):
+            out[key] = list(value)
+        elif isinstance(value, dict):
+            out[key] = dict(value)
+        else:
+            out[key] = value
+    return out
 
 
 def _add_triple_to_graph(
@@ -448,7 +582,12 @@ def build_memory_update_graph(
                 for item in new_items
             ]
             + [
-                crit_prefix + _format_memory_item(item, SourceType.SYSTEM_PREDICTION)
+                # [Assessment], not [System Prediction]: a verifier critique is a
+                # judgement about a candidate answer, not a claim about the world.
+                # While tagged [System Prediction] these strings were picked up by
+                # ``_reverify_memory`` and issued verbatim as corpus/KG retrieval
+                # queries ("Verifier (no context): the answer is plausible but …").
+                crit_prefix + _format_memory_item(item, SourceType.ASSESSMENT)
                 for item in new_critiques
             ]
             + [
@@ -458,11 +597,15 @@ def build_memory_update_graph(
         )
 
         raw_blob = _format_lines(tagged)
+        line_map = enumerate_memory_lines(tagged)
         inp = MemoryConsolidationInput(
             question=state.get("question", ""), memory=raw_blob
         )
         out, _ = await execute_role_lc(registry, MEMORY_CONSOLIDATOR, inp)
-        return {"consolidated_memory": _consolidated_to_text(out)}
+        return {
+            "consolidated_memory": _consolidated_to_text(out),
+            **_resolve_retractions(out, line_map),
+        }
 
     async def open_ie(state: MemoryUpdateState) -> Dict[str, Any]:
         consolidated = list(state.get("consolidated_memory") or [])
@@ -539,8 +682,18 @@ def build_memory_update_graph(
                 rel.object_id = linked_map.get(rel.object)
 
         # Work on a copy — never mutate the caller's graph.
+        #
+        # ``nx.DiGraph.copy()`` is a *shallow* copy of attribute containers, and
+        # the ``relation`` edge attribute is a ``set``. ``_add_triple_to_graph``
+        # mutates that set in place when the edge already exists, and
+        # ``_relation_already_in_graph`` only filters *same-label* duplicates — so
+        # a new predicate between two already-connected entities would write
+        # straight through into the caller's graph. In MCTS that means a rejected
+        # branch permanently edits the shared graph memory, and nothing ever
+        # removes graph edges. ``_deep_copy_graph`` rebuilds the mutable attribute
+        # containers so the isolation this comment promises actually holds.
         source_graph = state.get("current_graph") or nx.DiGraph()
-        new_graph: nx.DiGraph = source_graph.copy()
+        new_graph: nx.DiGraph = _deep_copy_graph(source_graph)
 
         # Filter to **newly proposed** relations only — pruner is expensive and
         # should never re-examine edges already in the graph.
@@ -622,11 +775,21 @@ def build_memory_update_graph(
             return {"updated_text_memory": []}
 
         raw_blob = _format_lines(consolidated)
+        line_map = enumerate_memory_lines(consolidated)
         inp = MemoryConsolidationInput(
             question=state.get("question", ""), memory=raw_blob
         )
         out, _ = await execute_role_lc(registry, MEMORY_CONSOLIDATOR, inp)
-        return {"updated_text_memory": _consolidated_to_text(out)}
+        # Accumulate onto ``consolidate_pre``'s retractions rather than replacing
+        # them — these channels are LastValue, and the pre-merge pass is where the
+        # [Retrieval]-contradicts-[System Prediction] eviction actually happens.
+        post = _resolve_retractions(out, line_map)
+        return {
+            "updated_text_memory": _consolidated_to_text(out),
+            "retractions": list(state.get("retractions") or []) + post["retractions"],
+            "unresolved_conflicts": list(state.get("unresolved_conflicts") or [])
+            + post["unresolved_conflicts"],
+        }
 
     async def finalize_memory(state: MemoryUpdateState) -> Dict[str, Any]:
         return {"updated_text_memory": list(state.get("consolidated_memory") or [])}

@@ -92,10 +92,21 @@ class SubquestionGenerationInput(pydantic.BaseModel):
         description="Result of the previous reasoning hop to anchor the next subquestion.",
     )
 
+    plan: Optional[str] = pydantic.Field(
+        None,
+        description="Standing research plan: what still needs to be found out.",
+    )
+
     def __str__(self):
         parts = [f"question:\n{self.question}", f"context:\n{self.context}"]
         if self.intermediate_answer:
             parts.append(f"intermediate_answer:\n{self.intermediate_answer}")
+        # ``plan`` renders LAST, deliberately. The input guard trims an oversized
+        # user payload by keeping its head and tail and dropping the middle
+        # (``llm._truncate_messages_to_budget``), so a trailing field survives
+        # while bulky accumulated memory in the middle is what gets dropped.
+        if self.plan:
+            parts.append(f"plan:\n{self.plan}")
         return "\n\n".join(parts)
 
 
@@ -115,6 +126,86 @@ class SubquestionGenerationOutput(pydantic.BaseModel):
             "attribute and should additionally query the knowledge graph; False if it "
             "is best served by document retrieval alone (no named entity, or a "
             "definitional / conceptual gap)."
+        ),
+    )
+    serves_intent: Optional[List[int]] = pydantic.Field(
+        None,
+        description=(
+            "Parallel array to `subquestions` (same length and order). "
+            "0-based index of the plan intent that subquestions[i] advances, or -1 "
+            "if it advances none. Null when no plan was provided."
+        ),
+    )
+
+
+class PlanInput(pydantic.BaseModel):
+    """Input for ``PLANNER``: initial planning and replanning share one role.
+
+    On a replan, ``current_plan`` / ``failure`` / ``attempts`` are populated and
+    the model revises rather than starting over. ``competing_bindings`` carries
+    contested referents as **surface forms only** — never as an asserted answer,
+    which would let an unverified claim in through the plan channel.
+    """
+
+    question: str = pydantic.Field(..., description="The question to be answered.")
+    context: Optional[str] = pydantic.Field(
+        "Not provided",
+        description="Verified memory available so far, with provenance tags.",
+    )
+    current_plan: Optional[str] = pydantic.Field(
+        None, description="The plan being revised. Absent on the first call."
+    )
+    failure: Optional[str] = pydantic.Field(
+        None,
+        description="Why the current plan needs revising, stated mechanically.",
+    )
+    competing_bindings: Optional[List[str]] = pydantic.Field(
+        None,
+        description=(
+            "Surface forms that each survived as a candidate referent for one "
+            "plan intent. Not answers — evidence that the intent is ambiguous."
+        ),
+    )
+    attempts: Optional[List[str]] = pydantic.Field(
+        None,
+        description="Queries already issued and what they yielded, to avoid repeats.",
+    )
+
+    def __str__(self) -> str:
+        parts = [f"question:\n{self.question}", f"context:\n{self.context}"]
+        if self.current_plan:
+            parts.append(f"current_plan:\n{self.current_plan}")
+        if self.failure:
+            parts.append(f"failure:\n{self.failure}")
+        if self.competing_bindings:
+            joined = "\n".join(f"- {b}" for b in self.competing_bindings)
+            parts.append(f"competing_bindings:\n{joined}")
+        if self.attempts:
+            joined = "\n".join(f"- {a}" for a in self.attempts)
+            parts.append(f"already_attempted:\n{joined}")
+        return "\n\n".join(parts)
+
+
+class PlanOutput(pydantic.BaseModel):
+    plan: str = pydantic.Field(
+        ...,
+        description=(
+            "Prose plan stating what must be found out, in order. Questions only "
+            "— no claims about the world."
+        ),
+    )
+    intents: List[str] = pydantic.Field(
+        ...,
+        description=(
+            "The plan's individual information needs, each phrased as a question. "
+            "Same order as the prose. These are ledger keys, not subquestions."
+        ),
+    )
+    premises: Optional[List[str]] = pydantic.Field(
+        None,
+        description=(
+            "Facts from the provided memory that this plan relies on, quoted. "
+            "Empty when the plan rests only on the question itself."
         ),
     )
 
@@ -179,6 +270,23 @@ class SelfCorrectionInput(_KeyedFieldsInput):
     context: Optional[str] = pydantic.Field(
         "Not provided", description="The context for the question."
     )
+    plan: Optional[str] = pydantic.Field(
+        None,
+        description="Standing research plan: what still needs to be found out.",
+    )
+
+    def __str__(self) -> str:
+        # Custom layout rather than ``_KeyedFieldsInput``'s dump-everything: an
+        # absent plan must not render as "plan:\nNone". Renders last for the same
+        # truncation reason as ``SubquestionGenerationInput``.
+        parts = [
+            f"question:\n{self.question}",
+            f"proposed_answer:\n{self.proposed_answer}",
+            f"context:\n{self.context}",
+        ]
+        if self.plan:
+            parts.append(f"plan:\n{self.plan}")
+        return "\n\n".join(parts)
 
 
 class SelfCorrectionOutput(pydantic.BaseModel):
@@ -322,11 +430,19 @@ class AnswerVerificationOutput(pydantic.BaseModel):
 class SourceType(Enum):
     SYSTEM_PREDICTION = "System Prediction"
     RETRIEVAL = "Retrieval"
+    # Verifier / self-correction commentary about a *candidate answer*, not a
+    # claim about the world. Kept distinct so re-verification never re-issues a
+    # critique as a retrieval query: MCTS folds verifier reasoning into memory,
+    # and while tagged [System Prediction] those strings were stripped and sent
+    # to corpus_search + rerank + the extractor as if they were facts.
+    ASSESSMENT = "Assessment"
 
 
 class MemoryItem(pydantic.BaseModel):
     content: str = pydantic.Field(..., description="Self-contained information piece.")
-    provenance: str = pydantic.Field(..., pattern=r"^(System Prediction|Retrieval)$")
+    provenance: str = pydantic.Field(
+        ..., pattern=r"^(System Prediction|Retrieval|Assessment)$"
+    )
     hop_depth: Optional[int] = pydantic.Field(
         None,
         description="Reasoning hop at which this item was retrieved. Null means pre-consolidated (always retain).",
@@ -340,9 +456,47 @@ class MemoryConsolidationInput(_KeyedFieldsInput):
     memory: str = pydantic.Field(..., description="Raw memory as list of tagged items.")
 
 
+class EvictedMemoryItem(pydantic.BaseModel):
+    """One input line the consolidator removed, reported by line number.
+
+    Line numbers (not verbatim content) because the evicted set is the complement
+    of the kept set: echoing content back would make the output several times
+    larger than ``consolidated_memory`` on a call that already runs with a large
+    thinking budget. Resolve them with
+    :func:`langgraph_coe.graphs.memory_update.enumerate_memory_lines`.
+    """
+
+    line: int = pydantic.Field(..., description="1-based input line number removed.")
+    reason: str = pydantic.Field(
+        ...,
+        description=(
+            "One of: contradicted, superseded, irrelevant, duplicate, hop_filtered."
+        ),
+    )
+
+
 class MemoryConsolidationOutput(pydantic.BaseModel):
     consolidated_memory: List[MemoryItem] = pydantic.Field(
         ..., description="Refined memory items."
+    )
+    # ``evicted`` is what makes a retraction observable: the provenance audit and
+    # conflict-resolution rules already discard contradicted claims, but the old
+    # output shape reported only survivors, so "a fact we held was overturned by
+    # evidence" was invisible to every caller.
+    #
+    # MUST stay Optional with a default. A required field the model omits makes
+    # ``parse_fallback`` raise, which drives ``build_safe_default_output`` to
+    # ``consolidated_memory=[]`` → ``updated_text_memory=[]`` → the whole of
+    # ``text_memory`` is wiped for that iteration.
+    evicted: Optional[List[EvictedMemoryItem]] = pydantic.Field(
+        None, description="Input lines removed, with the reason for each."
+    )
+    unresolved_conflicts: Optional[List[List[int]]] = pydantic.Field(
+        None,
+        description=(
+            "Groups of input line numbers that conflict and were all kept "
+            "(two [Retrieval] items disagreeing)."
+        ),
     )
 
 
@@ -475,10 +629,56 @@ class TriplePruneOutput(pydantic.BaseModel):
 # =============================================================================
 
 
+PLANNER_PROMPT = """You are a research planner for multi-hop question answering. You decide **what must be found out**. You never state what is true.
+
+## The one rule that governs everything
+Planning asks; reasoning answers. Your output must contain no claims about the world.
+- GOOD (a question, no truth value): "Establish which person is called the father of computer science."
+- BAD (a claim): "Alan Turing is the father of computer science, so find his father."
+A plan cannot be checked against evidence, so it must never smuggle in a fact that has not been through retrieval. Anything you assert enters the system with no verifier on it.
+
+## Referent discipline
+You may name a specific entity ONLY when it appears in the question, or when it appears in a memory item tagged `[Retrieval]` in the provided context. If a fact is tagged `[System Prediction]` it is the system's own unverified guess — refer to its subject descriptively instead ("the person identified as X's successor"), never by name.
+- If you rely on a `[Retrieval]` fact, quote it in `premises`. That is how the system knows to revise this plan if that fact is later overturned.
+- If the question uses a pronoun or a description whose referent you do not know ("her husband", "the film's director"), make resolving that referent its own intent. Do not guess it and build on the guess.
+
+## Hedge presuppositions
+A definite description presupposes that exactly one thing satisfies it, and that presupposition can be false. Phrase such intents conditionally so a missing or ambiguous referent is an ordinary branch rather than a dead end.
+- BAD: "Find the birthplace of her husband."  ← presupposes she has exactly one husband
+- GOOD: "Determine whether she had a spouse; if so, identify who, then find their birthplace."
+- For superlatives and ranks ("third fastest", "tallest", "oldest"), the presupposition is that the ranking is well-defined and settled. Plan to establish the ranked set and the criterion, and note if the answer could depend on a date or an authority.
+
+## Scope
+Preserve the question's geographic, temporal and categorical scope. Do NOT narrow a global question to one region, or a category to a subcategory, without the question licensing it.
+- BAD: main question about "the third oldest university in the world" → intent about "the oldest university in England"
+
+## Revising an existing plan
+When `current_plan` is provided you are revising, not restarting.
+1. Read `failure`: it states mechanically what went wrong (an intent bound two different referents, a premise was contradicted by retrieval, a route yielded nothing).
+2. Keep every intent that is still sound and already resolved. Do not re-ask what the context already answers.
+3. Rewrite only the part that failed. If two referents competed, add an intent that discriminates between them (a distinguishing attribute, a date, a defining criterion) rather than re-asking the same ambiguous question.
+4. Consult `already_attempted` and do not re-issue a framing that yielded nothing. Change the angle.
+5. If a presupposition turned out to be false, do not keep asking about the thing that does not exist — restate the intent to establish what IS the case.
+
+## Output Format
+Respond with a JSON object with exactly these keys:
+- plan: string — the prose plan; ordered, interrogative, no claims about the world
+- intents: array of strings — each information need as its own question, same order as the prose
+- premises: array of strings, or null — [Retrieval]-tagged facts from the context this plan depends on, quoted; null or [] if the plan rests only on the question
+"""
+
 GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant for multi-hop question answering and reasoning decomposition. Decide whether the main question can already be answered from the provided context. If not, generate strategic subquestions to advance the reasoning.
 
 ## Intermediate Answer
 If `intermediate_answer` is provided, it is the resolved result of the PREVIOUS hop. Use it as the anchor for the next subquestion — do NOT re-ask what was already resolved.
+
+## Plan
+If `plan` is provided, it is a standing statement of what still needs to be found out. It contains questions, never facts — treat it as direction, not as evidence, and never answer a subquestion from it.
+- Work on the earliest plan intent that the context does not already answer. Skip intents memory already covers.
+- Instantiate the plan against the context: where the plan says "her husband" and memory has resolved who "she" is, emit the concrete subquestion.
+- You may still emit a subquestion the plan did not anticipate when the context reveals a gap the plan missed. Do not force every subquestion to fit the plan.
+- Emit `serves_intent` as a parallel array to `subquestions`: the 0-based index of the plan intent each subquestion advances, or -1 for one the plan did not anticipate. If no `plan` was provided, set it to null.
+- Nothing in `plan` counts as context for judging `is_answerable`. A plan describing what to find out is not evidence that it has been found, and an unmet plan intent is not a conflict to resolve.
 
 ## Core Principles
 Each subquestion must:
@@ -516,6 +716,7 @@ Respond with a JSON object with exactly these keys:
 - is_answerable: boolean — true if the main question can be answered from the provided context alone
 - subquestions: array of strings, or null — up to 5 strategic subquestions; null or [] if is_answerable is true
 - needs_kg: array of booleans, or null — parallel to `subquestions` (same length and order); null or [] if is_answerable is true
+- serves_intent: array of integers, or null — parallel to `subquestions`; 0-based plan intent index each subquestion advances, -1 if none; null when no `plan` was provided
 """
 
 ANSWER_PROMPT = """You are an expert assistant specializing in precise, well-reasoned question answering. Deliver a direct, accurate answer with transparent, step-by-step reasoning.
@@ -744,6 +945,14 @@ Respond with a JSON object with exactly these keys:
 
 MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Your task is to process an input memory (a list of information items) and consolidate it into a refined memory that contains only the information relevant and useful for answering the given question. An information is considered relevant and useful if it contains any clues that could help answer the question (not necessarily directly answering the question, but providing information that could help answer the question).
 
+## Input Format
+Input memory items are **numbered** (`1. [Retrieval]: ...`). The numbers are line identifiers — use them in `evicted` and `unresolved_conflicts`. Never include a line number inside a `content` field.
+
+## Provenance Tags
+- `[Retrieval]` — grounded in retrieved evidence. Highest trust.
+- `[System Prediction]` — the model's own inference. Unverified.
+- `[Assessment]` — a critique or judgement about a *candidate answer*, not a claim about the world (e.g. verifier commentary). Keep an assessment only when it carries a reusable factual observation; **never** upgrade it to `Retrieval` or `System Prediction`, and preserve its `Assessment` provenance in the output. It is excluded from re-verification, so mislabelling it as a fact causes it to be re-issued as a search query.
+
 ## Instructions
 1. Question Analysis: Identify primary subject, key entities, and specific information sought.
 2. Memory Atomization: Atomize the memory into a list of atomic, self-contained information items. Each information item should be self-contained and clear (i.e, each information must be FULLY UNDERSTANDABLE on its own without needing to refer back to the original document, question, or other items and no pronouns or other references to the original memory, question, or other items).
@@ -756,13 +965,19 @@ MEMORY_CONSOLIDATION_PROMPT = """You are an expert Memory Consolidation Agent. Y
 7. Refinement: Check each item to make sure it is self-contained and clear. If it is not, rewrite it to make it self-contained and clear.
 8. Final check: verify every kept item is self-contained, non-redundant, and has correct provenance. Remove any item that still refers to external context or uses pronouns.
 9. Return the refined memory as a list of information items.
+10. Report Removals: for EVERY input line you did not carry into `consolidated_memory`, add an entry to `evicted` with its line number and the reason. Use `contradicted` when a [Retrieval] item disproved the claim (rule 4b/6), `superseded` when a better-supported item replaced it, `duplicate` for rule 3 removals, `hop_filtered` for rule 4c removals, and `irrelevant` for rule 5 removals. A line merged into a kept item is NOT evicted — do not list it.
+11. Report Unresolved Conflicts: when rule 6 makes you keep two conflicting [Retrieval] items, add their line numbers as a group to `unresolved_conflicts`.
 
 ## Output Format:
 Respond with a JSON object with exactly these keys:
 - consolidated_memory: array of objects; each object has:
-  - content: string — one atomic, self-contained information item (NO [hop=N] prefix)
-  - provenance: string — exactly "System Prediction" or "Retrieval"
+  - content: string — one atomic, self-contained information item (NO [hop=N] prefix, NO line number)
+  - provenance: string — exactly "System Prediction", "Retrieval", or "Assessment"
   - hop_depth: integer or null — hop level of this item (null if pre-consolidated/untagged)
+- evicted: array of objects, or null — one per removed input line; each object has:
+  - line: integer — the 1-based input line number that was removed
+  - reason: string — exactly one of "contradicted", "superseded", "irrelevant", "duplicate", "hop_filtered"
+- unresolved_conflicts: array of arrays of integers, or null — groups of input line numbers that conflict and were all kept
 """
 
 
@@ -996,6 +1211,7 @@ Respond with a JSON object with exactly these keys:
 
 
 # Roles actively called by the reasoning and memory-update graphs.
+PLANNER = Role("planner", PLANNER_PROMPT, PlanInput, PlanOutput)
 SUBQUESTION_GENERATOR = Role(
     "subquestion_generator",
     GENERATE_SUBQUESTION_PROMPT,

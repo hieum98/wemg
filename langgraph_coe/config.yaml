@@ -178,6 +178,17 @@ search:
     convergence_patience: 5
     semantic_sufficiency_count: 5
     recursion_limit: 300    # LangGraph superstep budget per MCTS run
+    # Snapshot memory per tree node so a branch's retrieval writes stay in its
+    # own subtree. False = documented coe parity (one shared memory channel that
+    # rollouts mutate), which also means a rejected branch's evidence is
+    # permanent. See MCTSConfig for the full rationale.
+    branch_local_memory: false
+  # Explicit plan channel. A plan states what to find out (interrogative, no
+  # truth value) and conditions subquestion generation; it never enters memory.
+  plan:
+    enabled: false          # false = A0 baseline, byte-identical to pre-plan behaviour
+    replan_max: 0           # 0 = log-only: the gate computes plan_action but never routes
+    replan_min_depth_headroom: 2
 
 # Redis cache for LLM (db 0), Wikidata + web_search (db 1). Setup: docs/setup_redis_cache.md
 cache:

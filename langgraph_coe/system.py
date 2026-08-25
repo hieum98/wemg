@@ -69,6 +69,17 @@ class AnswerResult:
         history = state.get("iteration_history")
         if isinstance(history, list):
             metadata["num_iterations"] = len(history)
+        # Plan bookkeeping, lifted only when a plan actually ran so the
+        # plan-disabled metadata block is unchanged.
+        if state.get("plan"):
+            metadata["plan_version"] = int(state.get("plan_version", 0) or 0)
+            action_log = state.get("plan_action_log") or []
+            metadata["plan_replan_signals"] = sum(
+                1 for e in action_log if e.get("action") == "replan"
+            )
+            metadata["plan_replans_applied"] = max(
+                0, int(state.get("plan_version", 0) or 0) - 1
+            )
         return cls(
             question=str(state.get("question", "") or ""),
             answer=str(state.get("final_answer", "") or ""),
@@ -141,15 +152,26 @@ def _initial_cot_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any]
         "is_answerable": False,
         "subquestions": [],
         "subquestion_needs_kg": [],
+        "subquestion_serves_intent": [],
+        "subq_parse_failed": False,
         "retrieved_raw_context": [],
         "retrieved_raw_triples": [],
         "reranked_context": [],
         "extracted_facts": [],
         "current_subanswers": [],
+        "last_retractions": [],
         "iteration_history": [],
         "text_memory": [],
         "graph_memory": nx.DiGraph(),
         "entity_dict": {},
+        # Plan channel. Empty ``plan`` is what makes ``gen_plan`` generate rather
+        # than inherit; a rollout is handed a non-empty one.
+        "plan": "",
+        "plan_version": 0,
+        "plan_ledger": [],
+        "plan_action": "none",
+        "plan_action_log": [],
+        "plan_frozen": False,
         "final_answer": "",
         "concise_answer": "",
         "reasoning": "",
@@ -183,12 +205,21 @@ def _initial_mcts_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any
         "new_retrieval_texts": [],
         "expand_semantic_signal": False,
         "rollout_semantic_signal": False,
+        "expand_plan_view": {},
         "text_memory": [],
         "graph_memory": nx.DiGraph(),
         "entity_dict": {},
+        "snapshots": {},
         "semantic_sufficiency_signals": 0,
         "iterations_without_improvement": 0,
         "best_value": 0.0,
+        # Plan channel (mirrors ``_initial_cot_state``).
+        "plan": "",
+        "plan_version": 0,
+        "plan_ledger": [],
+        "plan_action": "none",
+        "plan_action_log": [],
+        "last_retractions": [],
         "final_answer": "",
         "concise_answer": "",
         "reasoning": "",
@@ -236,7 +267,13 @@ async def answer(
     result = await graph.ainvoke(
         initial_state, config={"recursion_limit": recursion_limit}
     )
-    return AnswerResult.from_state({**(result or {}), "strategy": strategy})
+    answer_result = AnswerResult.from_state({**(result or {}), "strategy": strategy})
+    # Stash the raw final state for diagnostics — the plan channel, ledger and
+    # memory are only inspectable from here. ``DatasetEvaluator`` sets the same key
+    # on its own path; ``AnswerResult.from_state`` never serializes it, and
+    # ``runner`` explicitly keeps it out of the JSONL rows.
+    answer_result.metadata["_raw_state"] = result or {}
+    return answer_result
 
 
 async def answer_batch(

@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import operator
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -36,30 +37,44 @@ import networkx as nx
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import Annotated, TypedDict
 
-from ..llm import RoleModelRegistry, execute_role_lc
+from ..llm import RoleModelRegistry, execute_role_lc, is_safe_default
 from ..roles import (
     ANSWER_GENERATOR,
     FINAL_ANSWER_SYNTHESIZER,
+    PLANNER,
     SELF_CORRECTOR,
     SUBQUESTION_GENERATOR,
     VERIFIER,
     AnswerGenerationInput,
     AnswerVerificationInput,
     FinalAnswerSynthesisInput,
+    PlanInput,
     SelfCorrectionInput,
     SubquestionGenerationInput,
 )
 from ._memory_text import textualize_graph as _textualize_graph
 from .cot import (
     Clear,
+    INTENT_OPEN,
     N_SUBQUESTIONS,
+    PLAN_ACTION_NONE,
+    PLAN_ACTION_REPLAN,
     append_or_clear,
+    apply_bindings,
+    apply_retractions,
     build_cot_graph,
+    build_plan_ledger,
+    classify_discharge,
     gather_evidence,
+    latest_intermediate_answer,
     pool_subquestions,
+    render_plan_for_prompt,
+    _entity_label_to_qid,
 )
 from .kg_search import build_kg_search_graph
 from .memory_update import (
+    _deep_copy_graph,
+    _is_assessment,
     _is_retrieval_grounded,
     _strip_provenance_tag,
     build_memory_update_graph,
@@ -145,10 +160,35 @@ class MCTSState(TypedDict, total=False):
     expand_semantic_signal: bool
     rollout_semantic_signal: bool
 
+    # ``expand``'s plan view plus the bindings/attempts it produced, handed to
+    # ``plan_gate``. Held separately from the global plan channels so a branch's
+    # bookkeeping stays branch-local until ``mem_update`` commits it.
+    expand_plan_view: Dict[str, Any]
+
     # Cross-iteration shared memory (rollouts mutate in place)
     text_memory: List[str]
     graph_memory: nx.DiGraph
     entity_dict: Dict[str, Any]
+
+    # ── Branch-local memory (search.mcts.branch_local_memory) ───────────────
+    # node_id → {text_memory, graph_memory, entity_dict, plan, plan_version,
+    # plan_ledger}. When enabled, expansion/rollout/evaluation read the selected
+    # path tip's snapshot instead of the global channels, and ``mem_update``
+    # writes back into the expanded node's snapshot — so a branch's retrieval
+    # writes stay inside its own subtree. Without it a rejected branch's evidence
+    # is permanent (its value is discarded but its writes are not) and
+    # ``evaluate``'s memory-grounded verifier views score later candidates
+    # against them.
+    snapshots: Annotated[Dict[str, Dict[str, Any]], dict_merge]
+
+    # ── Plan channel (mirrors CoTState; see cot.py for the rationale) ───────
+    plan: str
+    plan_version: int
+    plan_ledger: List[Dict[str, Any]]
+    plan_action: str
+    plan_action_log: Annotated[List[Dict[str, Any]], operator.add]
+    # This iteration's consolidation evictions, for the falsified-discharge test.
+    last_retractions: List[Dict[str, Any]]
 
     # Memory facts already re-verified (recheck-on-retrieval); each distinct
     # fact is re-grounded once over the run to corroborate/gap-fill/evict it.
@@ -215,12 +255,69 @@ def _make_root_node(root_id: str, question: str) -> MCTSTreeNode:
     }
 
 
+SNAPSHOT_KEYS = (
+    "text_memory",
+    "graph_memory",
+    "entity_dict",
+    "plan",
+    "plan_version",
+    "plan_ledger",
+)
+
+
+def resolve_snapshot(
+    state: MCTSState, path: List[str], *, enabled: bool
+) -> Dict[str, Any]:
+    """Memory/plan view for the selected path, honouring branch locality.
+
+    With ``enabled`` False this returns the global channels — documented coe
+    parity, where every branch shares one memory. With it True, walk the path from
+    the tip toward the root and take the nearest ancestor's snapshot: a freshly
+    expanded child has none yet, so it correctly inherits its parent's view rather
+    than seeing whatever the previously-explored branch happened to write.
+    """
+    view = {key: state.get(key) for key in SNAPSHOT_KEYS}
+    if not enabled:
+        return view
+    snapshots = state.get("snapshots") or {}
+    for node_id in reversed(path or []):
+        snap = snapshots.get(node_id)
+        if snap:
+            merged = dict(view)
+            merged.update({k: v for k, v in snap.items() if k in SNAPSHOT_KEYS})
+            return merged
+    return view
+
+
+def _snapshot_from(view: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a resolved view into a storable snapshot.
+
+    The graph is deep-copied (``_deep_copy_graph``) because ``nx.copy()`` shares
+    edge attribute *sets* — without it two sibling snapshots would alias each
+    other's ``relation`` sets and branch locality would be a comfortable fiction.
+    """
+    graph = view.get("graph_memory")
+    return {
+        "text_memory": list(view.get("text_memory") or []),
+        "graph_memory": _deep_copy_graph(graph) if graph is not None else nx.DiGraph(),
+        "entity_dict": dict(view.get("entity_dict") or {}),
+        "plan": view.get("plan", "") or "",
+        "plan_version": int(view.get("plan_version", 0) or 0),
+        "plan_ledger": [dict(e) for e in (view.get("plan_ledger") or [])],
+    }
+
+
 def _format_text_memory(text_memory: Optional[List[str]]) -> str:
     items = [t for t in (text_memory or []) if isinstance(t, str) and t.strip()]
     return "\n".join(f"- {t}" for t in items)
 
 
-def _join_memory_context(state: MCTSState) -> str:
+def _join_memory_context(state: Dict[str, Any]) -> str:
+    """Render text + graph memory for a prompt.
+
+    Accepts either the full ``MCTSState`` or a resolved snapshot view (see
+    :func:`resolve_snapshot`) — both expose ``text_memory`` / ``graph_memory``.
+    """
     text = _format_text_memory(state.get("text_memory"))
     graph_text = _textualize_graph(state.get("graph_memory"))
     sections: List[str] = []
@@ -236,15 +333,32 @@ def _answer_text(out: Any) -> str:
 
 
 def _merge_ev(*evs: Dict[str, Any]) -> Dict[str, Any]:
-    """Union the ``{facts, triples}`` evidence dicts from the expansion generators."""
+    """Union the evidence dicts from the expansion generators.
+
+    Carries ``facts`` / ``triples`` (memory persistence) plus ``bindings`` /
+    ``attempts`` / ``intents`` (plan bookkeeping), so a generator that resolved a
+    referent is not silently dropped when its evidence is merged with another's.
+    """
     facts: List[str] = []
     triples: List[Any] = []
+    bindings: List[Any] = []
+    attempts: List[Any] = []
+    intents: List[Any] = []
     for ev in evs:
         if not ev:
             continue
         facts.extend(ev.get("facts") or [])
         triples.extend(ev.get("triples") or [])
-    return {"facts": facts, "triples": triples}
+        bindings.extend(ev.get("bindings") or [])
+        attempts.extend(ev.get("attempts") or [])
+        intents.extend(ev.get("intents") or [])
+    return {
+        "facts": facts,
+        "triples": triples,
+        "bindings": bindings,
+        "attempts": attempts,
+        "intents": intents,
+    }
 
 
 def _leaf_depth(path: List[str]) -> int:
@@ -278,6 +392,10 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
     sem_count = int(getattr(mcts_cfg, "semantic_sufficiency_count", 3) or 3)
     explore = float(getattr(mcts_cfg, "exploration_weight", 2.0) or 2.0)
     min_iters = int(getattr(mcts_cfg, "min_iterations", 0) or 0)
+    branch_local = bool(getattr(mcts_cfg, "branch_local_memory", False))
+
+    plan_cfg = getattr(getattr(config, "search", None), "plan", None)
+    plan_enabled = bool(getattr(plan_cfg, "enabled", False))
 
     # Compile rollout + memory subgraphs once. These names are module globals so
     # the test harness can monkeypatch them before this builder runs.
@@ -293,6 +411,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         getattr(getattr(config, "web_search", None), "enabled", False)
     )
     web_graph = build_web_research_graph(registry) if web_enabled else None
+    corpus_enabled = bool(getattr(getattr(config, "retriever", None), "enabled", True))
     reranker_cfg = getattr(config, "reranker", None)
     rerank_top_k = max(1, int(getattr(reranker_cfg, "top_k", 10) or 10))
     extractor_max_chars = int(
@@ -303,7 +422,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
     # ── Expansion generators ────────────────────────────────────────────────
 
     async def _gen_subqa(
-        question: str, parent_id: str, ctx: str, state: MCTSState
+        question: str, parent_id: str, ctx: str, view: Dict[str, Any]
     ) -> tuple[List[MCTSTreeNode], bool, Dict[str, Any]]:
         """Decompose, retrieve evidence, and answer each subquestion.
 
@@ -311,17 +430,43 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         True when the generator deems the question answerable from context (coe
         parity: ``should_direct or not subquestions``); the caller then expands
         a FINAL_ANSWER child instead. ``evidence`` carries the retrieval facts/
-        triples for memory persistence.
+        triples for memory persistence, plus the ``(intent_index, answer)`` pairs
+        the plan gate needs to attribute bindings.
+
+        ``view`` is the resolved memory/plan snapshot for the branch being
+        expanded (see :func:`resolve_snapshot`), not the whole graph state — under
+        branch-local memory the two differ.
         """
         # coe parity: sample N completions, pool their decompositions (n=3).
         outs, _ = await execute_role_lc(
             registry,
             SUBQUESTION_GENERATOR,
-            SubquestionGenerationInput(question=question, context=ctx),
+            SubquestionGenerationInput(
+                question=question,
+                context=ctx,
+                plan=render_plan_for_prompt(
+                    view.get("plan", "") or "", view.get("plan_ledger") or []
+                )
+                or None,
+                intermediate_answer=latest_intermediate_answer(
+                    view.get("plan_ledger") or []
+                ),
+            ),
             n=N_SUBQUESTIONS,
         )
-        subqs, kg_flags, should_direct = pool_subquestions(outs)
-        if should_direct or not subqs:
+        pooled = pool_subquestions(outs)
+        subqs, kg_flags = pooled.subquestions, pooled.needs_kg
+        if pooled.n_survivors == 0:
+            # Retry-exhausted parse failure, not "answerable from context". A
+            # semantic-sufficiency signal here would push the search toward early
+            # termination (``semantic_sufficiency_count``) on the strength of an
+            # LLM outage, and expand a FINAL_ANSWER child over unchanged memory.
+            logger.error(
+                "[_gen_subqa] no SUBQUESTION_GENERATOR completion parsed; "
+                "expanding nothing this iteration rather than signalling sufficiency"
+            )
+            return [], False, {}
+        if pooled.should_direct or not subqs:
             return [], True, {}
 
         # Ground subanswers in retrieved evidence (corpus + gated KG fan-out →
@@ -332,10 +477,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             subqs,
             needs_kg=kg_flags,
             memory_context=ctx,
-            entity_dict=state.get("entity_dict"),
+            entity_dict=view.get("entity_dict"),
             kg_graph=kg_graph,
             web_graph=web_graph,
             web_enabled=web_enabled,
+            corpus_enabled=corpus_enabled,
             reranker_cfg=reranker_cfg,
             rerank_top_k=rerank_top_k,
             extractor_max_chars=extractor_max_chars,
@@ -359,20 +505,40 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         if not isinstance(answers, list):
             answers = [answers]
         nodes: List[MCTSTreeNode] = []
-        for sq, ans in zip(subqs, answers):
+        # ``(intent_index, answer)`` pairs for the plan gate. Built by index over
+        # ``subqs`` so it stays aligned with ``pooled.serves_intent``; an answer
+        # with no attribution contributes None and closes no intent.
+        bindings: List[tuple[Optional[int], str]] = []
+        for i, sq in enumerate(subqs):
+            ans = answers[i] if i < len(answers) else None
+            text = _answer_text(ans)
             nodes.append(
                 _make_node(
                     MCTSNodeType.SUB_QA,
                     parent_id,
-                    {"sub_question": sq, "sub_answer": _answer_text(ans)},
+                    {"sub_question": sq, "sub_answer": text},
                 )
             )
+            if text.strip():
+                intent_idx = (
+                    pooled.serves_intent[i]
+                    if i < len(pooled.serves_intent)
+                    else None
+                )
+                bindings.append((intent_idx, text))
         return nodes, False, {
             "facts": facts,
             "triples": list(evidence.get("raw_triples") or []),
+            "bindings": bindings,
+            "attempts": [
+                {"query": sq, "n_facts": len(facts)} for sq in subqs
+            ],
+            "intents": list(pooled.serves_intent),
         }
 
-    async def _explore_for(question: str, target_q: str, ctx: str, state: MCTSState):
+    async def _explore_for(
+        question: str, target_q: str, ctx: str, view: Dict[str, Any]
+    ):
         """coe parity: one fresh retrieval pass (gather_evidence) for ``target_q``.
 
         Returns ``(answer_ctx, evidence)`` where ``answer_ctx`` prepends the
@@ -385,10 +551,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             [target_q],
             needs_kg=[True],
             memory_context=ctx,
-            entity_dict=state.get("entity_dict"),
+            entity_dict=view.get("entity_dict"),
             kg_graph=kg_graph,
             web_graph=web_graph,
             web_enabled=web_enabled,
+            corpus_enabled=corpus_enabled,
             reranker_cfg=reranker_cfg,
             rerank_top_k=rerank_top_k,
             extractor_max_chars=extractor_max_chars,
@@ -405,10 +572,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         return answer_ctx, {
             "facts": facts,
             "triples": list(evidence.get("raw_triples") or []),
+            "attempts": [{"query": target_q, "n_facts": len(facts)}],
         }
 
     async def _reverify_memory(
-        state: MCTSState, ctx: str
+        state: MCTSState, view: Dict[str, Any], ctx: str
     ) -> tuple[str, Dict[str, Any], List[str]]:
         """Re-retrieve each unverified memory fact as its own query.
 
@@ -427,14 +595,18 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         """
         done = set(state.get("reverified_facts") or [])
         facts_q: List[str] = []
-        for item in state.get("text_memory") or []:
+        for item in view.get("text_memory") or []:
             if not isinstance(item, str) or not item.strip():
                 continue
             # Only re-verify [System Prediction] facts (the model's own
             # inferences). [Retrieval] facts are already grounded in evidence,
             # so re-retrieving them is redundant and was the main corpus+rerank
-            # fan-out amplifier.
-            if _is_retrieval_grounded(item):
+            # fan-out amplifier. [Assessment] items are verifier/self-correction
+            # commentary about a candidate answer rather than claims about the
+            # world — issuing them as retrieval queries burns a full
+            # corpus+rerank+extract pass on prose like "Verifier (no context):
+            # the answer is plausible but the context does not mention …".
+            if _is_retrieval_grounded(item) or _is_assessment(item):
                 continue
             clean = _strip_provenance_tag(item)
             if clean and clean not in done and clean not in facts_q:
@@ -454,10 +626,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             # ConnectTimeouts. Corpus re-verification (local FAISS) still runs.
             needs_kg=[False] * len(facts_q),
             memory_context=ctx,
-            entity_dict=state.get("entity_dict"),
+            entity_dict=view.get("entity_dict"),
             kg_graph=kg_graph,
             web_graph=web_graph,
             web_enabled=web_enabled,
+            corpus_enabled=corpus_enabled,
             reranker_cfg=reranker_cfg,
             rerank_top_k=rerank_top_k,
             extractor_max_chars=extractor_max_chars,
@@ -483,7 +656,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         question: str,
         parent_id: str,
         ctx: str,
-        state: MCTSState,
+        view: Dict[str, Any],
         *,
         should_explore: bool,
     ) -> tuple[List[MCTSTreeNode], Dict[str, Any]]:
@@ -491,9 +664,13 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         # terminal answer is a fresh retrieve-and-answer via ANSWER_GENERATOR,
         # not a synthesis over memory. Shallow expansions (depth < 2) retrieve;
         # deeper ones answer from the accumulated context.
+        #
+        # The plan is deliberately NOT injected here. At answer time the only
+        # question is which candidate is true; an unmet plan intent alongside
+        # candidate answers invites treating a correct answer as deficient.
         answer_ctx, evidence = ctx, {}
         if should_explore:
-            answer_ctx, evidence = await _explore_for(question, question, ctx, state)
+            answer_ctx, evidence = await _explore_for(question, question, ctx, view)
         out, _ = await execute_role_lc(
             registry,
             ANSWER_GENERATOR,
@@ -514,7 +691,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         return [node], evidence
 
     async def _gen_self_correct(
-        leaf: MCTSTreeNode, ctx: str, question: str, state: MCTSState
+        leaf: MCTSTreeNode, ctx: str, question: str, view: Dict[str, Any]
     ) -> tuple[List[MCTSTreeNode], Dict[str, Any]]:
         content = leaf.get("content", {})
         sub_q = content.get("sub_question")
@@ -523,23 +700,87 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             return [], {}
         # coe parity (generate_self_correction → _explore): re-retrieve fresh
         # evidence for the sub-question before refining, not memory alone.
-        correct_ctx, evidence = await _explore_for(question, sub_q, ctx, state)
+        correct_ctx, evidence = await _explore_for(question, sub_q, ctx, view)
         out, _ = await execute_role_lc(
             registry,
             SELF_CORRECTOR,
             SelfCorrectionInput(
-                question=sub_q, proposed_answer=sub_a, context=correct_ctx
+                question=sub_q,
+                proposed_answer=sub_a,
+                context=correct_ctx,
+                plan=render_plan_for_prompt(
+                    view.get("plan", "") or "", view.get("plan_ledger") or []
+                )
+                or None,
             ),
         )
         refined = getattr(out, "refined_answer", "") or sub_a
+        # ``status`` was previously discarded on this line. "unsupported" means the
+        # corrector could not check the answer against anything — the shape of a
+        # question whose presupposition has no referent — so it is a plan-level
+        # signal, distinct from "incorrect" (a wrong answer to a sound question).
+        status = str(getattr(out, "status", "") or "").strip().lower()
         node = _make_node(
             MCTSNodeType.SELF_CORRECTED,
             leaf["node_id"],
-            {"sub_question": sub_q, "sub_answer": refined},
+            {"sub_question": sub_q, "sub_answer": refined, "status": status},
         )
-        return [node], evidence
+        return [node], {**evidence, "self_correct_status": status}
 
     # ── Nodes ────────────────────────────────────────────────────────────────
+
+    async def gen_plan(state: MCTSState) -> Dict[str, Any]:
+        """Write the root plan once, before the first selection.
+
+        One plan per question, shared by the whole tree and inherited down each
+        branch. That is what makes siblings coordinated: without it every
+        expansion re-decomposes from scratch, so sibling subtrees duplicate work
+        and their visit statistics are not comparable.
+        """
+        if state.get("plan"):
+            return {}
+        out, _ = await execute_role_lc(
+            registry,
+            PLANNER,
+            PlanInput(
+                question=state.get("question", ""),
+                context=_join_memory_context(state),
+            ),
+        )
+        if is_safe_default(out):
+            logger.error(
+                "[gen_plan] PLANNER returned no parseable output; searching "
+                "without a plan"
+            )
+            return {"plan": "", "plan_version": 0, "plan_ledger": []}
+        plan_text = str(getattr(out, "plan", "") or "").strip()
+        ledger = build_plan_ledger(
+            list(getattr(out, "intents", None) or []),
+            list(getattr(out, "premises", None) or []),
+        )
+        result: Dict[str, Any] = {
+            "plan": plan_text,
+            "plan_version": 1,
+            "plan_ledger": ledger,
+            "plan_action": PLAN_ACTION_NONE,
+        }
+        if branch_local:
+            # Seed the root's snapshot so the first ancestor walk finds a view
+            # rather than silently falling through to the global channels.
+            root_id = state.get("root_id") or "root"
+            result["snapshots"] = {
+                root_id: _snapshot_from(
+                    {
+                        "text_memory": state.get("text_memory"),
+                        "graph_memory": state.get("graph_memory"),
+                        "entity_dict": state.get("entity_dict"),
+                        "plan": plan_text,
+                        "plan_version": 1,
+                        "plan_ledger": ledger,
+                    }
+                )
+            }
+        return result
 
     async def select(state: MCTSState) -> Dict[str, Any]:
         tree = dict(state.get("tree") or {})
@@ -605,13 +846,17 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
         ntype = _ntype(target)
         pid = target["node_id"]
-        ctx = _join_memory_context(state)
+        # Resolve the branch's memory/plan view. Under branch-local memory this is
+        # the nearest ancestor's snapshot rather than the global channels, so a
+        # sibling subtree's retrieval writes are not visible here.
+        view = resolve_snapshot(state, target_path, enabled=branch_local)
+        ctx = _join_memory_context(view)
         question = state.get("question", "")
 
         # Re-verify current memory facts (recheck-on-retrieval): fresh evidence
         # is prepended to the context all generators see this iteration, and
         # folded into ``evidence`` so consolidation can corroborate/gap-fill/evict.
-        ctx, reverify_ev, reverified_now = await _reverify_memory(state, ctx)
+        ctx, reverify_ev, reverified_now = await _reverify_memory(state, view, ctx)
 
         signal = False
         evidence: Dict[str, Any] = {}
@@ -619,33 +864,33 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         # fresh evidence; deeper ones answer from accumulated context.
         should_explore_final = _leaf_depth(target_path) < 2
         if ntype == MCTSNodeType.USER_QUESTION.value:
-            subqa, signal, evidence = await _gen_subqa(question, pid, ctx, state)
+            subqa, signal, evidence = await _gen_subqa(question, pid, ctx, view)
             children = list(subqa)
             if signal or _should_gen_final(target_path, min_depth=final_min_depth):
                 fin, ev_f = await _gen_final(
-                    question, pid, ctx, state, should_explore=should_explore_final
+                    question, pid, ctx, view, should_explore=should_explore_final
                 )
                 children.extend(fin)
                 evidence = _merge_ev(evidence, ev_f)
         elif ntype == MCTSNodeType.SUB_QA.value:
             (subqa, signal, ev_s), (sc, ev_c) = await asyncio.gather(
-                _gen_subqa(question, pid, ctx, state),
-                _gen_self_correct(target, ctx, question, state),
+                _gen_subqa(question, pid, ctx, view),
+                _gen_self_correct(target, ctx, question, view),
             )
             children = subqa + sc
             evidence = _merge_ev(ev_s, ev_c)
             if signal:
                 fin, ev_f = await _gen_final(
-                    question, pid, ctx, state, should_explore=should_explore_final
+                    question, pid, ctx, view, should_explore=should_explore_final
                 )
                 children.extend(fin)
                 evidence = _merge_ev(evidence, ev_f)
         elif ntype == MCTSNodeType.SELF_CORRECTED.value:
-            subqa, signal, evidence = await _gen_subqa(question, pid, ctx, state)
+            subqa, signal, evidence = await _gen_subqa(question, pid, ctx, view)
             children = list(subqa)
             if signal:
                 fin, ev_f = await _gen_final(
-                    question, pid, ctx, state, should_explore=should_explore_final
+                    question, pid, ctx, view, should_explore=should_explore_final
                 )
                 children.extend(fin)
                 evidence = _merge_ev(evidence, ev_f)
@@ -668,6 +913,17 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             # Redirected to the parent: backprop/simulate must work from there,
             # not through the stale terminal sibling.
             out["current_path"] = target_path
+        # Hand the branch's plan view and this expansion's bindings to the plan
+        # gate. Kept on ``expand_plan_view`` rather than written into the global
+        # plan channels so branch locality survives until ``mem_update`` commits.
+        out["expand_plan_view"] = {
+            "plan": view.get("plan", "") or "",
+            "plan_version": int(view.get("plan_version", 0) or 0),
+            "plan_ledger": [dict(e) for e in (view.get("plan_ledger") or [])],
+            "bindings": list(evidence.get("bindings") or []),
+            "attempts": list(evidence.get("attempts") or []),
+            "self_correct_status": evidence.get("self_correct_status") or "",
+        }
 
         if not children:
             out["expanded_node_ids"] = []
@@ -707,16 +963,34 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         # below — otherwise every retrieval/consolidation the rollout performed
         # would be silently discarded (coe parity: the legacy rollout mutated
         # the shared WorkingMemory object).
-        cot_out = await cot_graph.ainvoke(
-            {
-                "question": state.get("question", ""),
-                "max_depth": sim_depth,
-                "depth": 0,
-                "text_memory": state.get("text_memory"),
-                "graph_memory": state.get("graph_memory"),
-                "entity_dict": state.get("entity_dict"),
-            }
-        )
+        #
+        # The plan is threaded in so the rollout is not plan-blind. Previously the
+        # payload carried only question/depth/memory, which meant the candidate
+        # ``evaluate`` scores was produced without reference to the plan — so a
+        # reward could not speak to whether that plan was any good. ``plan_frozen``
+        # keeps the rollout from regenerating or revising the parent's plan; its
+        # ``gen_plan`` inherits and its ``plan_gate`` logs without acting.
+        view = resolve_snapshot(state, path, enabled=branch_local)
+        payload: Dict[str, Any] = {
+            "question": state.get("question", ""),
+            "max_depth": sim_depth,
+            "depth": 0,
+            "text_memory": view.get("text_memory"),
+            "graph_memory": view.get("graph_memory"),
+            "entity_dict": view.get("entity_dict"),
+        }
+        if plan_enabled:
+            payload.update(
+                {
+                    "plan": view.get("plan", "") or "",
+                    "plan_version": int(view.get("plan_version", 0) or 0),
+                    "plan_ledger": [
+                        dict(e) for e in (view.get("plan_ledger") or [])
+                    ],
+                    "plan_frozen": True,
+                }
+            )
+        cot_out = await cot_graph.ainvoke(payload)
 
         updates: Dict[str, MCTSTreeNode] = {}
         chain_ids: List[str] = []
@@ -813,6 +1087,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         graph_ctx = _textualize_graph(state.get("graph_memory")) or "Not provided"
 
         try:
+            verifier_views = ("no context", "text memory", "graph memory")
             (r1, _), (r2, _), (r3, _) = await asyncio.gather(
                 execute_role_lc(
                     registry,
@@ -838,20 +1113,46 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                     ),
                 ),
             )
-            ratings = [float(r1.rating), float(r2.rating), float(r3.rating)]
-            reward = (sum(ratings) / 3.0 - 5.0) / 5.0
-            critiques = [
-                f"Verifier (no context): {r1.reasoning}",
-                f"Verifier (text memory): {r2.reasoning}",
-                f"Verifier (graph memory): {r3.reasoning}",
-            ]
+            # A retry-exhausted VERIFIER call returns a neutral default whose
+            # ``rating`` is 0.0 — which *passes* the ``ge=0.0`` bound and so is
+            # indistinguishable from a genuine "worst possible answer". Averaging
+            # it in drags the reward by ~0.33 per failed view and manufactures
+            # spread between the three views. Drop unparsed views and average the
+            # survivors; only fall back to a neutral reward when none survive.
+            outs = (r1, r2, r3)
+            ratings: List[float] = []
+            critiques: List[str] = []
+            for view, out in zip(verifier_views, outs):
+                if is_safe_default(out):
+                    logger.warning(
+                        "[evaluate] VERIFIER (%s) returned no parseable output; "
+                        "excluding it from the reward rather than scoring it 0.0",
+                        view,
+                    )
+                    continue
+                ratings.append(float(out.rating))
+                critiques.append(f"Verifier ({view}): {out.reasoning}")
+            if ratings:
+                reward = (sum(ratings) / len(ratings) - 5.0) / 5.0
+            else:
+                logger.warning(
+                    "[evaluate] no VERIFIER view parsed; reward=0.0 (neutral)"
+                )
+                reward = 0.0
         except Exception as e:  # noqa: BLE001 — neutral reward on parse failure (coe parity)
             logger.warning("Verifier reward computation failed; reward=0.0: %s", e)
-            reward, critiques = 0.0, []
+            reward, critiques, ratings = 0.0, [], []
 
         return {
             "reward": reward,
-            "simulation_result": {**sr, "verifier_critiques": critiques},
+            "simulation_result": {
+                **sr,
+                "verifier_critiques": critiques,
+                # Retained for diagnostics: the per-view vector before averaging.
+                # Spread across the no-context / text-memory / graph-memory views
+                # is only interpretable once 0.0-on-failure is gone (above).
+                "verifier_ratings": list(ratings),
+            },
         }
 
     async def backprop(state: MCTSState) -> Dict[str, Any]:
@@ -937,6 +1238,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         gen_hop = path_len or None
         critique_hop = (path_len - 1) if path_len else None
 
+        # Consolidate against the branch's own memory, not the global channels, so
+        # a sibling subtree's writes do not leak into this branch's inputs.
+        path = list(state.get("current_path") or [])
+        view = resolve_snapshot(state, path, enabled=branch_local)
+
         payload = {
             "question": state.get("question", ""),
             "new_text_items": new_text_items,
@@ -945,21 +1251,138 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             # consolidation can prefer them over generated answers/critiques.
             "new_retrieval_items": list(state.get("new_retrieval_texts") or []),
             "new_raw_triples": list(state.get("new_raw_triples") or []),
-            "current_text_memory": list(state.get("text_memory") or []),
-            "current_graph": state.get("graph_memory") or nx.DiGraph(),
-            "entity_dict": dict(state.get("entity_dict") or {}),
+            "current_text_memory": list(view.get("text_memory") or []),
+            "current_graph": view.get("graph_memory") or nx.DiGraph(),
+            "entity_dict": dict(view.get("entity_dict") or {}),
             # Annotates [hop=N] for the consolidator's Hop Depth Filtering (RC-C).
             "hop_depth": gen_hop,
             "critique_hop_depth": critique_hop,
         }
         result = await memory_graph.ainvoke(payload)
-        return {
-            "text_memory": list(result.get("updated_text_memory") or []),
-            "graph_memory": result.get("updated_graph") or nx.DiGraph(),
-            "entity_dict": dict(result.get("updated_entity_dict") or {}),
+        new_text_memory = list(result.get("updated_text_memory") or [])
+        new_graph = result.get("updated_graph") or nx.DiGraph()
+        new_entity_dict = dict(result.get("updated_entity_dict") or {})
+        retractions = list(result.get("retractions") or [])
+
+        out: Dict[str, Any] = {
+            # The global channels still carry the latest consolidated memory:
+            # ``synthesize`` reads them, and with branch-local memory off they
+            # remain the single shared store (documented coe parity).
+            "text_memory": new_text_memory,
+            "graph_memory": new_graph,
+            "entity_dict": new_entity_dict,
+            "last_retractions": retractions,
             "new_raw_triples": Clear(),
             "new_retrieval_texts": Clear(),
         }
+        if branch_local and path:
+            # Commit to the *expanded* node's snapshot. Children inherit it by the
+            # ancestor walk in ``resolve_snapshot``, so the subtree — and only the
+            # subtree — sees what this iteration learned.
+            plan_view = state.get("expand_plan_view") or {}
+            snap = _snapshot_from(
+                {
+                    "text_memory": new_text_memory,
+                    "graph_memory": new_graph,
+                    "entity_dict": new_entity_dict,
+                    "plan": plan_view.get("plan", view.get("plan", "")),
+                    "plan_version": plan_view.get(
+                        "plan_version", view.get("plan_version", 0)
+                    ),
+                    "plan_ledger": state.get("plan_ledger")
+                    or plan_view.get("plan_ledger")
+                    or view.get("plan_ledger")
+                    or [],
+                }
+            )
+            out["snapshots"] = {path[-1]: snap}
+        return out
+
+    async def plan_gate(state: MCTSState) -> Dict[str, Any]:
+        """MCTS counterpart of the CoT plan gate. Deterministic — no LLM call.
+
+        Runs after ``mem_update`` so it sees consolidated memory and its
+        retractions. Log-only in this graph: ``replan`` is not an MCTS action,
+        because ``select`` breaks only on a childless or terminal node and the sole
+        re-expansion path is the visited-terminal redirect to ``path[-2]`` — so the
+        root is expanded exactly once, and any root-level plan fork would be minted
+        at iteration 1 with empty memory, before evidence exists. The signal is
+        recorded here so its fire rate is measurable before that is changed.
+        """
+        plan_view = state.get("expand_plan_view") or {}
+        ledger = [dict(e) for e in (plan_view.get("plan_ledger") or [])]
+        if not ledger:
+            return {"plan_action": PLAN_ACTION_NONE}
+
+        hop = len(state.get("current_path") or [])
+        label_to_qid = _entity_label_to_qid(state.get("entity_dict"))
+        bindings = [
+            (idx, text)
+            for idx, text in (plan_view.get("bindings") or [])
+            if isinstance(text, str) and text.strip()
+        ]
+        ledger = apply_bindings(ledger, bindings, label_to_qid, hop)
+        ledger = apply_retractions(ledger, state.get("last_retractions") or [])
+        for attempt in plan_view.get("attempts") or []:
+            # Attempts are recorded against every open intent: MCTS expansion
+            # fans out over the whole question rather than one plan step, so a
+            # finer attribution would be invented rather than observed.
+            for entry in ledger:
+                if entry.get("status") == INTENT_OPEN:
+                    entry["attempts"] = list(entry.get("attempts") or []) + [
+                        {**attempt, "hop": hop}
+                    ]
+
+        action, intent_idx, competing = classify_discharge(ledger)
+        # "unsupported" from the self-corrector means the answer could not be
+        # checked against anything — the shape of a false presupposition, which is
+        # a plan-level failure rather than a wrong answer.
+        if (
+            action == PLAN_ACTION_NONE
+            and plan_view.get("self_correct_status") == "unsupported"
+        ):
+            action = PLAN_ACTION_REPLAN
+        entry = {
+            "iteration": int(state.get("iteration", 0) or 0),
+            "hop": hop,
+            "action": action,
+            "intent_index": intent_idx,
+            "intent": ledger[intent_idx].get("intent")
+            if intent_idx is not None
+            else None,
+            "competing_bindings": competing,
+            "plan_version": int(plan_view.get("plan_version", 0) or 0),
+            "self_correct_status": plan_view.get("self_correct_status") or "",
+            # MCTS never arms the replan edge (see the docstring).
+            "armed": False,
+        }
+        if action == PLAN_ACTION_REPLAN:
+            logger.info(
+                "[plan_gate] replan signalled (log-only) iteration=%s intent=%r "
+                "competing=%s",
+                entry["iteration"],
+                entry["intent"],
+                competing,
+            )
+        out: Dict[str, Any] = {
+            "plan_ledger": ledger,
+            "plan_action": action,
+            "plan_action_log": [entry],
+        }
+        if branch_local:
+            # ``mem_update`` already committed this node's snapshot, but it ran
+            # *before* the ledger below existed — so the snapshot holds the
+            # previous iteration's bookkeeping. Re-emit it with the fresh ledger,
+            # or the next selection through this subtree would resolve a view whose
+            # bindings are one iteration stale and re-open closed intents.
+            path = list(state.get("current_path") or [])
+            if path:
+                node_id = path[-1]
+                existing = dict((state.get("snapshots") or {}).get(node_id) or {})
+                if existing:
+                    existing["plan_ledger"] = [dict(e) for e in ledger]
+                    out["snapshots"] = {node_id: existing}
+        return out
 
     async def synthesize(state: MCTSState) -> Dict[str, Any]:
         tree = state.get("tree") or {}
@@ -1028,15 +1451,28 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
     builder.add_node("mem_update", mem_update)
     builder.add_node("synthesize", synthesize)
 
-    builder.add_edge(START, "select")
+    # As in CoT, the plan nodes only exist when the feature is on, so the
+    # plan-disabled graph is structurally identical to the pre-plan one.
+    if plan_enabled:
+        builder.add_node("gen_plan", gen_plan)
+        builder.add_node("plan_gate", plan_gate)
+        builder.add_edge(START, "gen_plan")
+        builder.add_edge("gen_plan", "select")
+        builder.add_edge("mem_update", "plan_gate")
+        builder.add_conditional_edges(
+            "plan_gate", route_after_iteration, ["select", "synthesize"]
+        )
+    else:
+        builder.add_edge(START, "select")
+        builder.add_conditional_edges(
+            "mem_update", route_after_iteration, ["select", "synthesize"]
+        )
+
     builder.add_edge("select", "expand")
     builder.add_edge("expand", "simulate")
     builder.add_edge("simulate", "evaluate")
     builder.add_edge("evaluate", "backprop")
     builder.add_edge("backprop", "mem_update")
-    builder.add_conditional_edges(
-        "mem_update", route_after_iteration, ["select", "synthesize"]
-    )
     builder.add_edge("synthesize", END)
 
     return builder.compile()
