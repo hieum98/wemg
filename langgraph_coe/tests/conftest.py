@@ -68,15 +68,15 @@ def fake_redis_factory():
 @pytest.fixture
 def mini_backend():
     """Pre-populated ``FakeWikidataBackend`` (Berlin/Germany/Paris/France/...)."""
-    from coe.tests.wikidata._fixtures import build_mini_graph
-    from coe.tests.wikidata.fake_backend import FakeWikidataBackend
+    from .wikidata._fixtures import build_mini_graph
+    from .wikidata.fake_backend import FakeWikidataBackend
 
     return build_mini_graph(FakeWikidataBackend())
 
 
 @pytest.fixture
 def empty_backend():
-    from coe.tests.wikidata.fake_backend import FakeWikidataBackend
+    from .wikidata.fake_backend import FakeWikidataBackend
 
     return FakeWikidataBackend()
 

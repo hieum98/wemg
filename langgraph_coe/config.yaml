@@ -71,6 +71,18 @@ llm:
       #   enable_thinking: true
       #   thinking_budget: 512
     # Bounded-output classification roles: tiny, fixed-shape outputs.
+    # Planning tier: hotter so the n=3 sampled plans actually differ. A plan cannot
+    # be verified in advance, so breadth is the hedge; select_plan picks among them.
+    plan:
+      model_name: openai/Qwen/Qwen3.5-4B
+      api_base: http://n0998:30000/v1
+      temperature: 1.0
+      max_tokens: 16384
+      enable_thinking: true
+      thinking_budget: 4096
+      top_p: 0.98
+      top_k: 40
+      seed: 8888
     classify:
       model_name: openai/Qwen/Qwen3.5-4B
       api_base: http://n0998:30000/v1
@@ -105,6 +117,7 @@ llm:
     extractor: heavy
     kg_ner_agent: light
     kg_triple_search_agent: heavy
+    planner: plan
 
 # Working-memory limits (MemoryUpdateGraph + CoT extractor batching).
 memory:
@@ -189,6 +202,8 @@ search:
     enabled: false          # false = A0 baseline, byte-identical to pre-plan behaviour
     replan_max: 0           # 0 = log-only: the gate computes plan_action but never routes
     replan_min_depth_headroom: 2
+    stall_after_attempts: 2 # attempts against one intent before it counts as stalled
+    memory_disagreement_threshold: 4.0  # MCTS: closed-book minus memory-grounded rating gap
 
 # Redis cache for LLM (db 0), Wikidata + web_search (db 1). Setup: docs/setup_redis_cache.md
 cache:

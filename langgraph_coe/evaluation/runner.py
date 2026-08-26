@@ -134,12 +134,19 @@ def _save_question_artifacts(
     # the only record of what was asked per hop — required to measure the
     # cross-iteration re-ask rate that the UPDATE write is meant to remove.
     plan_payload: Optional[Dict[str, Any]] = None
-    if raw_state.get("plan"):
+    # ``iteration_history`` is the CoT trajectory — what was asked and answered per
+    # hop — and it is the only record that makes two arms comparable. It was written
+    # only when a plan was active, which left the plan-disabled baseline with no
+    # trajectory at all and made "did the plan change the questions asked?"
+    # unanswerable from artifacts.
+    if raw_state.get("plan") or raw_state.get("iteration_history"):
         plan_payload = {
             "plan": raw_state.get("plan"),
             "plan_version": raw_state.get("plan_version"),
             "plan_ledger": raw_state.get("plan_ledger") or [],
             "plan_action_log": raw_state.get("plan_action_log") or [],
+            "plan_attempts_log": raw_state.get("plan_attempts_log") or [],
+            "abstention": raw_state.get("abstention") or {},
             "iteration_history": raw_state.get("iteration_history") or [],
         }
 
@@ -222,12 +229,18 @@ class DatasetEvaluator:
             _initial_cot_state,
             _initial_mcts_state,
         )
+        from langgraph_coe.llm import read_cost_meter, start_cost_meter
         from langgraph_coe.tools.web import reset_web_research_session
         from langgraph_coe.tools.wikidata import reset_wikidata_session
 
         async with sem:
             reset_wikidata_session()
             reset_web_research_session()
+            # Same per-question ContextVar discipline as the session resets above: the
+            # meter must not blend concurrent questions. Without it no cost claim about
+            # this system is provable — hops and subquestions per question are the only
+            # other proxies, and they miss every call inside the retrieval subgraphs.
+            start_cost_meter()
             if strategy == "mcts":
                 initial = _initial_mcts_state(question, self.cfg)
             else:
@@ -240,6 +253,7 @@ class DatasetEvaluator:
                     {**(final or {}), "strategy": strategy}
                 )
                 result.metadata["_raw_state"] = final or {}
+                result.metadata["cost"] = read_cost_meter() or {}
                 return result
             except Exception as e:  # noqa: BLE001 — captured as an error row (coe parity)
                 # Many failing exceptions (timeouts, connection errors) have an
@@ -522,6 +536,11 @@ class DatasetEvaluator:
                             "acc_short": None,
                             "acc_long": None,
                             "level": level,
+                            # Per-question LLM spend, so a cost claim is checkable
+                            # rather than inferred from hop and subquestion counts
+                            # (which miss every call inside the retrieval subgraphs
+                            # and weight an n=3 role the same as an n=1 one).
+                            "cost": (result.metadata or {}).get("cost") or {},
                         }
                         try:
                             entry["artifacts"] = _save_question_artifacts(

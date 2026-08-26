@@ -27,15 +27,17 @@ cleared via the :class:`Clear` sentinel reducer; cross-iteration memory
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import logging
 import operator
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import Any, Dict, List, Optional, Sequence, Set, TypeVar, Union
 
 import networkx as nx
 from langgraph.graph import END, START, StateGraph
@@ -136,9 +138,24 @@ class CoTState(TypedDict, total=False):
     # ``concise_answer``. ``plan_gate`` binds referents from this rather than the
     # full prose answer, which also names supporting entities.
     current_subanswers_concise: List[str]
+    # Index-parallel too: ``ANSWER_GENERATOR.confidence_level``, which had zero
+    # readers repo-wide. ``plan_gate`` treats a low-confidence answer as no
+    # binding — closing an intent on the model's own admitted guess would record a
+    # referent the reasoning does not stand behind.
+    current_subanswer_confidence: List[str]
+    # What UPDATE surfaced into this hop's prompt via ``intermediate_answer``.
+    # Recorded so the artifacts show whether a closed intent's binding actually
+    # reached a generator, not merely that the intent closed.
+    last_intermediate_answer: str
+    # Subquestions dropped this hop for still referencing an unresolved earlier result.
+    last_n_uninstantiated: int
     # This hop's consolidation evictions, as surfaced by ``MemoryUpdateGraph``.
     # ``reason == "contradicted"`` is the retraction signal ``plan_gate`` reads.
     last_retractions: List[Dict[str, Any]]
+    # Groups of mutually-contradicting ``[Retrieval]`` lines the consolidator kept
+    # instead of adjudicating. Distinct from a retraction: nothing was overturned,
+    # the evidence simply disagrees with itself.
+    last_unresolved_conflicts: List[List[str]]
 
     # Append-only trajectory: each entry is one CoT iteration's decomposition.
     iteration_history: Annotated[List[Dict[str, Any]], operator.add]
@@ -171,9 +188,18 @@ class CoTState(TypedDict, total=False):
     # Append-only audit of every ``plan_gate`` decision, for the fire-rate
     # experiment. Written even when ``replan_max`` keeps the router inert.
     plan_action_log: Annotated[List[Dict[str, Any]], operator.add]
+    # Append-only across the whole run, including across replans. The per-intent
+    # ``attempts`` in the ledger are rebuilt by ``replan`` and so cannot serve as the
+    # negative record: after one replan the replanner would have no
+    # ``already_attempted`` and could re-propose a framing that already yielded
+    # nothing — the loop this record exists to prevent.
+    plan_attempts_log: Annotated[List[Dict[str, Any]], operator.add]
     # Set by MCTS when it passes its own plan into a rollout: the rollout may read
     # and log but must not regenerate or revise the parent's plan.
     plan_frozen: bool
+    # Confidence signal derived from unmet plan intents at synthesis time. Surfaced
+    # in metadata and artifacts; deliberately never injected into a prompt.
+    abstention: Dict[str, Any]
 
     # Output
     final_answer: str
@@ -233,6 +259,10 @@ def _subq_hits_known_entity(subquery: str, labels: Sequence[str]) -> bool:
 # Plan channel helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Self-reported confidence labels that disqualify an answer from binding a
+# referent. ``ANSWER_GENERATOR`` emits a free-text label, so match generously.
+_LOW_CONFIDENCE = frozenset({"low", "very low", "uncertain", "unsupported", "none"})
+
 PLAN_ACTION_NONE = "none"
 PLAN_ACTION_UPDATE = "update"
 PLAN_ACTION_REPLAN = "replan"
@@ -241,6 +271,160 @@ PLAN_ACTION_REPLAN = "replan"
 INTENT_OPEN = "open"
 INTENT_CLOSED = "closed"
 INTENT_CONTESTED = "contested"
+# A contest that stopped moving: the rival referents have not changed for
+# ``stall_after_attempts`` hops, so nothing further is going to separate them.
+#
+# ``contested`` is otherwise **absorbing**. ``apply_bindings`` only closes an intent at
+# exactly one distinct referent and the rival set only ever grows, so the sole exit was a
+# replan — and the shipped config sets ``replan_max: 0``. Measured on
+# ``results/e3_plan_logonly``: 13 intents end still contested, against 1 in the armed runs
+# where a replan cleared them. Those 13 kept drawing retrieval to no purpose.
+#
+# Deliberately NOT ``INTENT_DEAD``: ``abstention_signal`` opens with
+# ``[e for e in ledger if e.get("status") != INTENT_DEAD]``, so marking a contest dead
+# would delete the hedge on exactly the questions the system is least sure of. Undecided
+# stays live and unmet, so it still hedges — it just stops being retried.
+INTENT_UNDECIDED = "undecided"
+# An intent a replan abandoned. Kept in the ledger rather than deleted so the
+# rendered plan can show it as ruled out — a dropped intent is invisible to the
+# generator, which is free to re-propose the very framing the replan discarded.
+INTENT_DEAD = "dead"
+
+
+# A subquestion the generator could not instantiate: it wanted a value from an
+# earlier hop, had none, and emitted a bracketed placeholder in its place — e.g.
+# "When was the album [album name from previous answer] released?". Observed live on
+# a real dataset row, where that string went to retrieval verbatim as a query.
+# Any bracketed span containing letters. Deliberately broader than a keyword list:
+# the observed live case was "[album name from previous answer]", but a generator
+# equally emits "[that album]", "[X]" or "[insert name]", none of which share a
+# keyword. A genuine subquestion almost never contains square brackets, so the
+# false-positive cost is low and the failure it prevents — retrieving on the
+# placeholder text — is silent and expensive.
+_UNRESOLVED_PLACEHOLDER = re.compile(r"\[[^\]]*[A-Za-z][^\]]*\]")
+
+
+def is_uninstantiated(subquestion: str) -> bool:
+    """True when a subquestion still references an unresolved earlier result.
+
+    Retrieving on such a query is worse than not asking it: the placeholder text
+    becomes part of the embedding/SPARQL query, so it returns noise, the intent
+    closes on that noise, and the dependency is never actually resolved. Dropping it
+    keeps the intent open so the next hop can ask it with the binding in hand.
+    """
+    return bool(_UNRESOLVED_PLACEHOLDER.search(subquestion or ""))
+
+
+def _retrieval_lines(memory: Optional[Sequence[str]]) -> List[str]:
+    """Lowercased text of the ``[Retrieval]``-tagged memory lines.
+
+    Provenance is parsed here rather than imported from ``memory_update`` to keep
+    the ledger helpers free of a graph dependency; the tag format is a stable
+    contract (see ``_format_memory_item``).
+    """
+    out: List[str] = []
+    for item in memory or []:
+        if not isinstance(item, str):
+            continue
+        stripped = item.strip()
+        if stripped.startswith("[hop="):
+            end = stripped.find("]")
+            if end != -1:
+                stripped = stripped[end + 1 :].lstrip()
+        if stripped.startswith("[Retrieval]"):
+            out.append(stripped[len("[Retrieval]") :].lstrip(": ").strip().lower())
+    return out
+
+
+def _is_corroborated(surface: str, grounded_lines: Sequence[str]) -> bool:
+    """True when ``surface`` appears in a ``[Retrieval]``-tagged memory line.
+
+    Substring containment in either direction: the sub-answer is usually a short
+    concise form ("In Utero") of a longer retrieved sentence, but can also be the
+    longer prose. Deliberately crude — the question is only "did evidence mention
+    this", and a stricter matcher would silently demote real corroboration.
+    """
+    key = (surface or "").strip().lower()
+    if not key:
+        return False
+    return any(key in line or line in key for line in grounded_lines)
+
+
+# PLANNER completions to sample. One, deliberately.
+#
+# This was 3, on the reasoning that a plan is cheap to explore and impossible to
+# verify in advance, so breadth hedges against a bad decomposition. The samples do
+# differ (mean pairwise similarity 0.57 over 124 measured pairs), but the argument
+# does not survive contact with what the extra samples were *for*: the runners-up
+# were only ever read by ``replan``, and a replan is conditioned on the current
+# plan, current memory, and a stated failure. An alternative drawn at hop 0 —
+# before any evidence existed — cannot know why the plan failed, so seeding a
+# revision from it discards the only information the revision has, and can throw
+# away bindings that closed intents already earned. Measured: the alternatives
+# were consumed 0/62 times, at 3x planner tokens.
+#
+# If plan quality needs work, the cheaper and better-aimed tool is a *conditional*
+# retry — reject and re-ask when the plan names a referent the question does not —
+# not three blind draws.
+N_PLANS = 1
+
+
+def score_plan(
+    plan: Any, question: str, retrieval_memory: Optional[Sequence[str]] = None
+) -> tuple[int, int, int]:
+    """Sort key for choosing among sampled plans. Higher is better.
+
+    Deterministic and LLM-free — a judge call would cost as much as the sampling it
+    is adjudicating. Ranks on three properties the design already requires:
+
+    1. **fewest referent-discipline violations** — an entity the plan names that is
+       in neither the question nor a ``[Retrieval]`` memory line is an originated
+       claim, which is the one thing a plan must never contain.
+    2. **fewest uninstantiated placeholders** — an intent written as
+       ``"[the album]"`` cannot be asked.
+    3. **most intents** — among equally clean plans, prefer the one that decomposes
+       further; a one-step "answer the question" plan conditions nothing.
+    """
+    intents = [str(i) for i in (getattr(plan, "intents", None) or [])]
+    text = " ".join([str(getattr(plan, "plan", "") or "")] + intents)
+    allowed = (question or "").lower() + " " + " ".join(_retrieval_lines(retrieval_memory))
+    # **Multiword** capitalised spans only. A single capitalised word is almost
+    # always sentence-initial ("Identify…", "Find…") and swamped the real signal:
+    # every plan scored the same until this was narrowed. "Charles Babbage" survives;
+    # "Identify" does not.
+    # No "." in the character class: it let a span run across a sentence boundary,
+    # so "…Alan Turing. Find…" matched as the phantom entity "Turing. Find" and a
+    # plan citing a properly verified name was penalised.
+    named = re.findall(r"\b[A-Z][\w'-]+(?:\s+[A-Z][\w'-]+)+\b", text)
+    violations = sum(1 for n in named if n.lower() not in allowed)
+    placeholders = sum(1 for i in intents if is_uninstantiated(i))
+    return (-violations, -placeholders, len(intents))
+
+
+def select_plan(
+    outputs: Any, question: str, retrieval_memory: Optional[Sequence[str]] = None
+) -> tuple[Optional[Any], List[Any]]:
+    """Pick one sampled plan; return ``(chosen, runners_up)``.
+
+    The runners-up are kept as **replan seeds**: when the chosen plan fails, an
+    alternative the model already produced is a cheaper and more diverse starting
+    point than asking it to revise the one that just failed.
+    """
+    if not isinstance(outputs, list):
+        outputs = [outputs]
+    cands = [
+        o
+        for o in outputs
+        if o is not None
+        and not is_safe_default(o)
+        and str(getattr(o, "plan", "") or "").strip()
+    ]
+    if not cands:
+        return None, []
+    ranked = sorted(
+        cands, key=lambda o: score_plan(o, question, retrieval_memory), reverse=True
+    )
+    return ranked[0], ranked[1:]
 
 
 def build_plan_ledger(
@@ -295,6 +479,36 @@ def _entity_label_to_qid(entity_dict: Optional[Dict[str, Any]]) -> Dict[str, str
     return out
 
 
+def _is_matchable_label(label: str) -> bool:
+    """Whether an entity label is specific enough to identify a referent by mention.
+
+    A bare numeral is not. ``entity_dict`` routinely links the *year* ``"1"``, ``"3"``
+    and so on as entities, and a plain substring scan then finds them inside any number:
+    ``resolve_binding_qids("150 km/h (93 mph)", {"1": "Q199", "3": "Q201"})`` returned
+    ``["Q199", "Q201"]`` — two referents from the digits of one speed. Since the contested
+    test is "two or more distinct QIDs on one intent", that alone manufactured contests
+    out of arithmetic. Sub-3-character labels go the same way ("US" inside "USSR").
+    """
+    stripped = label.strip()
+    if len(stripped) < 3:
+        return False
+    return not stripped.isdigit()
+
+
+def _find_whole(haystack: str, needle: str) -> int:
+    """``haystack.find(needle)`` restricted to whole-token matches, else -1.
+
+    ``.find`` alone matched "1" inside "150" and "born" inside "reborn". Boundaries are
+    non-alphanumeric so multi-word labels and punctuation-adjacent mentions still match.
+    """
+    for m in re.finditer(re.escape(needle), haystack):
+        before = haystack[m.start() - 1] if m.start() else " "
+        after = haystack[m.end()] if m.end() < len(haystack) else " "
+        if not before.isalnum() and not after.isalnum():
+            return m.start()
+    return -1
+
+
 def resolve_binding_qids(text: str, label_to_qid: Dict[str, str]) -> List[str]:
     """QIDs of known entities mentioned in ``text``, in order of first mention.
 
@@ -311,9 +525,9 @@ def resolve_binding_qids(text: str, label_to_qid: Dict[str, str]) -> List[str]:
     hits: List[tuple[int, int, str]] = []  # (start, -len, qid)
     consumed: List[tuple[int, int]] = []
     for label in sorted(label_to_qid, key=len, reverse=True):
-        if not label:
+        if not label or not _is_matchable_label(label):
             continue
-        start = haystack.find(label)
+        start = _find_whole(haystack, label)
         if start < 0:
             continue
         end = start + len(label)
@@ -346,8 +560,73 @@ def resolve_primary_qid(text: str, label_to_qid: Dict[str, str]) -> Optional[str
     return ordered[0] if ordered else None
 
 
+# A leading date, year, or quantity — the referent form an ordinal/temporal hop
+# produces. Anchored at the start because a concise answer leads with its answer;
+# matching anywhere would pick up dates mentioned in passing.
+_LITERAL_PATTERNS = (
+    # 13 September 1993 / September 13, 1993
+    re.compile(
+        r"^\W*((?:\d{1,2}\s+)?(?:january|february|march|april|may|june|july|august"
+        r"|september|october|november|december)\s+\d{1,2}?,?\s*\d{3,4})",
+        re.I,
+    ),
+    # 1993-09-13
+    re.compile(r"^\W*(\d{4}-\d{2}-\d{2})"),
+    # 320 km/h, 310 square kilometers, 1045 BC. The unit must run to the end of the
+    # clause: without that anchor the unit alternation swallows ordinary prose, so
+    # "2012, per the tower's records" resolved to "2012 per the" and two paraphrases
+    # of the same year would read as competing referents.
+    re.compile(
+        r"^\W*(\d[\d,.]*\s*(?:[a-z/²³]+(?:\s+[a-z]+)?|BCE?|CE|AD))\s*(?:[.,;:)\]]|$)",
+        re.I,
+    ),
+    # a bare year
+    re.compile(r"^\W*(\d{3,4})(?:\W|$)"),
+)
+
+
+def resolve_primary_literal(text: str) -> Optional[str]:
+    """Normalized leading date/quantity in ``text``, or None.
+
+    The QID discriminator cannot see an ordinal or temporal hop: "In what year was
+    the tallest lattice tower completed?" binds a *year*, which links to no entity,
+    so two competing years would both resolve to no QID and the intent would never
+    be recorded as contested. Since the committed eval set is 56%
+    ordinal-then-chained, that is a large blind spot rather than an edge case.
+
+    Deliberately narrow: anchored at the start, and normalized only by case and
+    punctuation. It exists to tell *two different literals apart*, not to parse
+    dates — so "1993" and "September 13, 1993" are treated as different bindings,
+    which is the conservative direction (it can over-report a contest, never
+    silently merge two genuinely different answers).
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    for pattern in _LITERAL_PATTERNS:
+        m = pattern.match(stripped)
+        if m:
+            return re.sub(r"[\s,]+", " ", m.group(1)).strip().lower()
+    return None
+
+
+def resolve_binding_key(text: str, label_to_qid: Dict[str, str]) -> Optional[str]:
+    """Identity of the referent ``text`` proposes: a QID, else a literal.
+
+    QID first — an entity match is stronger evidence than a surface-form literal.
+    Literals are prefixed so they can never collide with a QID.
+    """
+    qid = resolve_primary_qid(text, label_to_qid)
+    if qid:
+        return qid
+    literal = resolve_primary_literal(text)
+    return f"lit:{literal}" if literal else None
+
+
 def classify_discharge(
     ledger: Sequence[Dict[str, Any]],
+    *,
+    exhausted: bool = False,
 ) -> tuple[str, Optional[int], List[str]]:
     """Decide ``plan_action`` from the ledger's current bindings.
 
@@ -359,14 +638,21 @@ def classify_discharge(
       judge because QID identity is the whole discriminator.
     * **falsified** — an intent's ``premises`` intersect this hop's retractions
       (marked by :func:`apply_retractions`). Also a replan.
-    * **update** — exactly one distinct QID survives: the intent closes.
-    * **none** — nothing linked, so there is nothing to record.
+    * **stalled** — an intent queried ``max_attempts`` times without closing
+      (marked by :func:`mark_stalled_intents`). An *efficacy* failure rather than a
+      truth failure, and the only one of the three that fires when nothing
+      surprising happens at all — without it a plan whose intents quietly return
+      nothing is never revised.
+    * **update** — exactly one distinct referent survives: the intent closes.
+    * **none** — nothing resolved, so there is nothing to record.
 
-    Contested wins over falsified when both apply: the ambiguity is the more
-    specific failure and its repair (discriminate between referents) subsumes
-    re-establishing the premise.
+    Precedence is contested > falsified > stalled, from most to least specific:
+    discriminating between two referents subsumes re-establishing a premise, which
+    subsumes finding a different route.
     """
+    conflicted: Optional[int] = None
     falsified: Optional[int] = None
+    stalled: Optional[int] = None
     for idx, entry in enumerate(ledger):
         if entry.get("status") == INTENT_CONTESTED:
             surfaces = [
@@ -375,14 +661,295 @@ def classify_discharge(
                 if b.get("qid")
             ]
             return PLAN_ACTION_REPLAN, idx, surfaces
+        if entry.get("conflicted") and conflicted is None:
+            conflicted = idx
         if entry.get("falsified") and falsified is None:
             falsified = idx
+        if entry.get("stalled") and stalled is None:
+            stalled = idx
+    if conflicted is not None:
+        return (
+            PLAN_ACTION_REPLAN,
+            conflicted,
+            list(ledger[conflicted].get("conflicted") or []),
+        )
     if falsified is not None:
         return PLAN_ACTION_REPLAN, falsified, []
+    if stalled is not None:
+        return PLAN_ACTION_REPLAN, stalled, []
+    # Exhaustion: every intent is settled yet the question is still not answerable,
+    # so the plan was *insufficient* rather than wrong. Lowest precedence — any
+    # specific failure above is a better description of what to fix.
+    if exhausted and ledger and all(
+        e.get("status") in (INTENT_CLOSED, INTENT_DEAD) for e in ledger
+    ):
+        return PLAN_ACTION_REPLAN, 0, []
     for idx, entry in enumerate(ledger):
         if entry.get("status") == INTENT_CLOSED and entry.get("closed_at") is not None:
             return PLAN_ACTION_UPDATE, idx, []
     return PLAN_ACTION_NONE, None, []
+
+
+def mark_conflicted_intents(
+    ledger: Sequence[Dict[str, Any]], conflicts: Sequence[Sequence[str]]
+) -> List[Dict[str, Any]]:
+    """Flag intents whose own evidence disagrees with itself.
+
+    Consolidator rule 6 keeps two mutually-contradicting ``[Retrieval]`` items
+    rather than adjudicating. That is a different failure from a retraction: nothing
+    was overturned, so re-asking the intent in any wording returns the same two
+    sources. The repair is a step that *discriminates between the sources*, which
+    only a replan can add.
+
+    A conflict group is attributed to an intent when the intent cites one side as a
+    premise or bound one side as its referent. An unattributable conflict is recorded
+    on the first still-open intent, because the plan as a whole is what has to
+    adjudicate it.
+    """
+    out = [dict(entry) for entry in ledger]
+    groups = [
+        [str(c).strip().lower() for c in group if str(c or "").strip()]
+        for group in (conflicts or [])
+    ]
+    groups = [g for g in groups if len(g) >= 2]
+    if not groups:
+        return out
+
+    def _touches(entry: Dict[str, Any], group: Sequence[str]) -> bool:
+        texts = [str(p or "").lower() for p in (entry.get("premises") or [])]
+        texts += [
+            str(b.get("surface") or "").lower() for b in (entry.get("bindings") or [])
+        ]
+        return any(
+            side and t and (side in t or t in side) for side in group for t in texts
+        )
+
+    for group in groups:
+        target = next(
+            (i for i, e in enumerate(out) if _touches(e, group)),
+            None,
+        )
+        if target is None:
+            target = next(
+                (i for i, e in enumerate(out) if e.get("status") == INTENT_OPEN), None
+            )
+        if target is None:
+            continue
+        out[target]["conflicted"] = list(group)
+    return out
+
+
+def mark_stalled_intents(
+    ledger: Sequence[Dict[str, Any]], *, max_attempts: int
+) -> List[Dict[str, Any]]:
+    """Flag intents that have been queried ``max_attempts`` times and still not closed.
+
+    This is the **efficacy** failure, not a truth failure: the intent may be
+    perfectly well-formed while this framing of it keeps returning nothing. Without
+    it the trigger only ever fires on ambiguity or retraction, and an intent that
+    silently yields nothing for the whole run produces no signal at all — the plan
+    is simply never revised.
+
+    Records ``stall_reason`` so the replanner can be told which of the two it is:
+    attempts that returned evidence but never resolved a referent need a
+    *different question*; attempts that returned no evidence need a *different
+    route*.
+    """
+    out = [dict(entry) for entry in ledger]
+    for entry in out:
+        if entry.get("status") == INTENT_CLOSED:
+            continue
+        attempts = list(entry.get("attempts") or [])
+        # A contest that survived a *further hop* of evidence is not going to resolve:
+        # retire it to ``undecided`` so it stops drawing retrieval, while staying live
+        # for ``abstention_signal`` to hedge on.
+        #
+        # Distinct hops, not attempt count. The per-intent pooling cap allows 2
+        # subquestions on one intent in a single hop, so an attempt-count test fires on
+        # the very hop that detected the contest — before any new evidence could have
+        # separated the rivals — and reports the intent as stalled rather than contested,
+        # losing the competing surfaces the repair needs.
+        #
+        # Evaluated BEFORE the ``stalled`` early-return below, and not gated on it. An
+        # intent commonly stalls while still merely open and only becomes contested on a
+        # later hop; when the early-return covered this branch, that ordering meant it
+        # could never retire. Measured on ``results/e4_plan_fixed``: 8 of the 13 intents
+        # left contested had attempts across 3-4 distinct hops and still did not retire,
+        # because ``stalled`` had already been set.
+        if (
+            entry.get("status") == INTENT_CONTESTED
+            and len(attempts) >= max_attempts
+            and len({a.get("hop") for a in attempts}) >= 2
+        ):
+            entry["status"] = INTENT_UNDECIDED
+            entry["undecided_rivals"] = [
+                str(b.get("surface") or "") for b in (entry.get("bindings") or [])
+            ]
+        if entry.get("stalled") or len(attempts) < max_attempts:
+            continue
+        yielded = sum(int(a.get("n_facts") or 0) for a in attempts)
+        entry["stalled"] = True
+        entry["stall_reason"] = (
+            "no evidence returned across %d attempts — the route is unproductive"
+            % len(attempts)
+            if yielded == 0
+            else "evidence returned across %d attempts but no referent resolved — "
+            "the question may presuppose something false" % len(attempts)
+        )
+    return out
+
+
+def _describe_failure(
+    entry: Dict[str, Any], competing: Sequence[str]
+) -> str:
+    """State mechanically what went wrong, and prescribe the matching repair.
+
+    Three failure kinds need three *different* repairs, and conflating them is how
+    a replan loops:
+
+    * **revision** (contested) — the question was fine, two referents answered it.
+      Discriminate between them.
+    * **revision** (falsified) — a premise was overturned. Re-establish it.
+    * **contraction** (stalled) — the intent itself may be malformed: its
+      presupposition may have no referent. Re-asking it in any wording will keep
+      failing, so the instruction is to establish what *is* the case instead. This
+      is the case the committed eval set is full of (30/62 rows rest on a definite
+      description that can fail), and the one a plain tail-revision cannot fix.
+
+    No diagnostic LLM sits in between: the planner is a model and can infer the
+    cause from these signals, so an extra call would add cost and a place to
+    confabulate a narrative.
+    """
+    intent = entry.get("intent")
+    if entry.get("status") == INTENT_CONTESTED:
+        return (
+            f"The intent {intent!r} bound {len(competing)} different referents, so "
+            "its closure is under-determined. Do not re-ask it as written — add a "
+            "step that discriminates between the candidates (a distinguishing "
+            "attribute, a date, or the criterion that decides the ranking)."
+        )
+    if entry.get("conflicted"):
+        sides = list(entry.get("conflicted") or [])
+        return (
+            f"The evidence for {intent!r} disagrees with itself: retrieval returned "
+            f"{len(sides)} mutually-contradicting sources that consolidation kept "
+            "rather than adjudicating. Re-asking it returns the same two sources, so "
+            "add a step that DISCRIMINATES BETWEEN THE SOURCES — which is more "
+            "authoritative, more recent, or scoped to what the question asks."
+        )
+    if entry.get("falsified"):
+        return (
+            f"A fact this plan relied on was contradicted by retrieved evidence: "
+            f"{entry.get('falsified')!r}. Re-establish it, and revise anything the "
+            "plan built on top of it."
+        )
+    if entry.get("stalled"):
+        return (
+            f"The intent {intent!r} did not resolve: "
+            f"{entry.get('stall_reason') or 'repeated attempts failed'}. Treat its "
+            "presupposition as suspect — the thing it asks about may not exist, may "
+            "not be unique, or may depend on a date or authority the question does "
+            "not fix. Replace it with an intent that establishes what IS the case "
+            "(e.g. whether such a thing exists at all, or which criterion decides "
+            "it), rather than re-asking the same question in different words."
+        )
+    if entry.get("status") == INTENT_CLOSED:
+        return (
+            "Every intent in this plan is settled, yet the question still cannot be "
+            "answered from what was found — so the plan was INSUFFICIENT, not wrong. "
+            "Keep what is resolved and ADD the intents that are still missing; do "
+            "not restate the ones already answered."
+        )
+    return (
+        f"The intent {intent!r} could not be closed. Find a different route to the "
+        "same information."
+    )
+
+
+def abstention_signal(ledger: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """How much the answer should hedge, given what the plan never established.
+
+    An unmet intent is genuinely informative at answer time — but as a *confidence*
+    signal, not an adjudication input. It never enters ``FINAL_ANSWER_SYNTHESIZER``'s
+    prompt: there the only question is which candidate is true, and an unmet intent
+    sitting beside candidate answers invites treating a correct answer as deficient.
+    So it is computed here and surfaced in metadata/artifacts instead, where a caller
+    can act on it.
+
+    ``level`` is ordinal, not a probability: ``none`` (everything resolved) →
+    ``low`` → ``high`` (nothing resolved, or a premise was contradicted).
+    """
+    live = [e for e in ledger if e.get("status") != INTENT_DEAD]
+    if not live:
+        return {"level": "none", "unmet": [], "resolved": 0, "total": 0, "reasons": []}
+    resolved = [e for e in live if e.get("status") == INTENT_CLOSED and not e.get("falsified")]
+    unmet = [e for e in live if e not in resolved]
+    reasons = sorted(
+        {
+            "contested"
+            if e.get("status") == INTENT_CONTESTED
+            else "referent_ambiguous"
+            if e.get("status") == INTENT_UNDECIDED
+            else "sources_disagree"
+            if e.get("conflicted")
+            else "premise_contradicted"
+            if e.get("falsified")
+            else "stuck"
+            if e.get("stalled")
+            else "never_attempted"
+            for e in unmet
+        }
+    )
+    if not unmet:
+        level = "none"
+    elif len(resolved) == 0 or "premise_contradicted" in reasons:
+        level = "high"
+    else:
+        level = "low"
+    return {
+        "level": level,
+        "unmet": [str(e.get("intent") or "") for e in unmet],
+        "resolved": len(resolved),
+        "total": len(live),
+        "reasons": reasons,
+    }
+
+
+def _dead_reason(entry: Dict[str, Any]) -> str:
+    """Why an abandoned intent was dropped, phrased so the generator can use it."""
+    if entry.get("status") == INTENT_CONTESTED:
+        return "it bound two different referents and was replaced"
+    if entry.get("conflicted"):
+        return "its sources contradicted each other"
+    if entry.get("falsified"):
+        return "the premise it rested on was contradicted by evidence"
+    if entry.get("stalled"):
+        return entry.get("stall_reason") or "repeated attempts did not resolve it"
+    return "superseded by a revised plan"
+
+
+def _discharge_reason(
+    ledger: Sequence[Dict[str, Any]], intent_idx: Optional[int], action: str
+) -> str:
+    """Name the branch that fired, for the fire-rate breakdown.
+
+    Shared by both graphs' gates: duplicating the precedence chain let MCTS drift
+    into reporting ``reason=None`` once already.
+    """
+    if intent_idx is None or not (0 <= intent_idx < len(ledger)):
+        return action
+    entry = ledger[intent_idx]
+    if entry.get("status") == INTENT_CONTESTED:
+        return "contested"
+    if entry.get("conflicted"):
+        return "conflicted"
+    if entry.get("falsified"):
+        return "falsified"
+    if entry.get("stalled"):
+        return "stalled"
+    if action == PLAN_ACTION_REPLAN and entry.get("status") == INTENT_CLOSED:
+        return "exhausted"
+    return action
 
 
 def apply_bindings(
@@ -390,6 +957,7 @@ def apply_bindings(
     candidates: Sequence[tuple[Optional[int], str]],
     label_to_qid: Dict[str, str],
     hop: int,
+    retrieval_memory: Optional[Sequence[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Fold this hop's ``(intent_index, answer_text)`` pairs into the ledger.
 
@@ -402,6 +970,12 @@ def apply_bindings(
     is what keeps paraphrase noise out of the contested test: two differently
     worded answers naming the same entity share a QID and so do not compete,
     while two genuinely different referents do.
+
+    ``retrieval_memory`` is the ``[Retrieval]``-tagged memory lines. A binding whose
+    surface is corroborated by one of them is marked ``grounded``, and only grounded
+    bindings are shown in the rendered plan — the plan may *cite* a fact that came
+    through the verified door, but must not present the model's own unverified
+    inference as established.
     """
     out = [dict(entry) for entry in ledger]
     for entry in out:
@@ -414,16 +988,24 @@ def apply_bindings(
     already_closed = {
         i for i, e in enumerate(out) if e.get("status") == INTENT_CLOSED
     }
+    grounded_lines = _retrieval_lines(retrieval_memory)
     for intent_idx, text in candidates:
         if intent_idx is None or not (0 <= intent_idx < len(out)):
             continue
         if intent_idx in already_closed:
             continue
         entry = out[intent_idx]
-        qid = resolve_primary_qid(text, label_to_qid)
-        if qid and not any(b.get("qid") == qid for b in entry["bindings"]):
-            entry["bindings"].append({"surface": text, "qid": qid, "hop": hop})
-        distinct = {b.get("qid") for b in entry["bindings"] if b.get("qid")}
+        key = resolve_binding_key(text, label_to_qid)
+        if key and not any(b.get("qid") == key for b in entry["bindings"]):
+            entry["bindings"].append(
+                {
+                    "surface": text,
+                    "qid": key,
+                    "hop": hop,
+                    "grounded": _is_corroborated(text, grounded_lines),
+                }
+            )
+        distinct = count_rival_referents(entry["bindings"])
         if len(distinct) >= 2:
             entry["status"] = INTENT_CONTESTED
             entry["closed_at"] = None
@@ -431,6 +1013,66 @@ def apply_bindings(
             entry["status"] = INTENT_CLOSED
             entry["closed_at"] = hop
     return out
+
+
+# A surface naming two or more linked entities, or shaped like a list, is an
+# *enumeration* — "Congo, Yangtze, Danube, Zambezi and Hudson", "1. Burj Khalifa, 2. Tokyo
+# Skytree", "Max Born and Walther Bothe". It must never absorb a rival by containment: it
+# contains the rival because it lists it, and merging would silently pick one element of a
+# set the question may be asking to rank.
+_ENUMERATION_SHAPE = re.compile(
+    r"(?:;)|(?:\b\d+\.\s+\w)|(?:\b[A-Z][\w'-]+\s+and\s+[A-Z][\w'-]+)"
+)
+
+
+def _is_enumeration(surface: str) -> bool:
+    s = (surface or "").strip()
+    return bool(_ENUMERATION_SHAPE.search(s)) or s.count(",") >= 2
+
+
+def count_rival_referents(bindings: Sequence[Dict[str, Any]]) -> Set[str]:
+    """Distinct QIDs on an intent, after merging surfaces that name the same referent.
+
+    The contested test is "two or more distinct referents survive for one intent", and it
+    was reading two *descriptions of one answer* as a contest. Measured on the shipped
+    config (``results/e3_plan_logonly``), 17 of 38 contested fires had a numeral or
+    sub-3-character rival, and the samples are unambiguous::
+
+        ['The Danyang-Kunshan Grand Bridge was opened in 2011.', '2011']  # one fact, twice
+        ['2012', '29 February 2012']                                     # one date, two granularities
+        ['2009', '1989']                                                  # a genuine contest
+
+    So when one surface is contained in another, they are treated as one referent and the
+    longer, more specific one wins — **unless** the container is an enumeration
+    (:func:`_is_enumeration`) or itself names two or more linked entities. Those keep both,
+    because a list containing a candidate is evidence about a *set*, not a restatement of
+    one member.
+
+    Join-never-split: merging is only ever applied to collapse, never to invent a rival, so
+    the worst case is a missed contest rather than a manufactured one — and a manufactured
+    contest is the expensive error (it blocks closure and, with ``replan_max=0``, blocks it
+    permanently).
+    """
+    keyed = [b for b in bindings if b.get("qid")]
+    absorbed: Set[str] = set()
+    for a in keyed:
+        for b in keyed:
+            if a is b or a.get("qid") == b.get("qid"):
+                continue
+            longer, shorter = str(b.get("surface") or ""), str(a.get("surface") or "")
+            if len(longer) <= len(shorter):
+                continue
+            if shorter.strip().lower() not in longer.strip().lower():
+                continue
+            if _is_enumeration(longer):
+                continue
+            absorbed.add(str(a.get("qid")))
+            logger.debug(
+                "[bindings] %r absorbed by %r — one referent, not a contest",
+                shorter[:60],
+                longer[:60],
+            )
+    return {str(b["qid"]) for b in keyed if str(b["qid"]) not in absorbed}
 
 
 def apply_retractions(
@@ -468,34 +1110,137 @@ def latest_intermediate_answer(ledger: Sequence[Dict[str, Any]]) -> Optional[str
     already resolved") already exists. No bound value is written into the plan
     prose — a referent there would be a world-claim with no provenance tag, no hop
     tag and no eviction path.
+
+    An **ungrounded** binding — one closed on the model's own inference rather than
+    corroborated by a ``[Retrieval]`` line — is marked, not withheld.
+    ``render_plan_for_prompt`` shows such an intent as ``[resolved, unverified]`` and
+    hides its value, but this function had no ``grounded`` check at all, so the same
+    binding the plan refused to state was broadcast here as the anchor for the next hop:
+    15/39 hops in ``e1_cot_armed``, 18/44 in ``e2``, 4/43 in ``e3_plan_logonly``.
+    Withholding it instead would be worse — this slot is the chaining anchor that
+    ``roles.py``'s "do NOT re-ask what was already resolved" rule depends on, and
+    suppressing it strands the next hop with no referent. So the value still goes out,
+    labelled for what it is.
     """
-    best: Optional[tuple[int, str, str]] = None
+    best: Optional[tuple[int, str, str, bool]] = None
     for entry in ledger:
         if entry.get("status") != INTENT_CLOSED:
             continue
         closed_at = entry.get("closed_at")
         if closed_at is None:
             continue
-        surface = next(
-            (b.get("surface") for b in (entry.get("bindings") or []) if b.get("qid")),
+        binding = next(
+            (b for b in (entry.get("bindings") or []) if b.get("qid")),
             None,
         )
-        if not surface:
+        if binding is None or not binding.get("surface"):
             continue
         if best is None or int(closed_at) >= best[0]:
-            best = (int(closed_at), str(entry.get("intent", "")), str(surface))
+            best = (
+                int(closed_at),
+                str(entry.get("intent", "")),
+                str(binding.get("surface")),
+                bool(binding.get("grounded")),
+            )
     if best is None:
         return None
-    _, intent, surface = best
-    return f"{intent}\n→ {surface}" if intent else surface
+    _, intent, surface, grounded = best
+    value = surface if grounded else f"(unverified) {surface}"
+    return f"{intent}\n→ {value}" if intent else value
+
+
+# Similarity above which a fresh intent is treated as a restatement of an already
+# closed one. Low, because the observed restatements sit at 0.63-0.84 ("determine the
+# opening date of the longest bridge in the world" vs "determine the date on which the
+# identified bridge was opened"). Safe at that level only because ``_fuzzy_closed_match``
+# requires the prior closure to carry a retrieval-grounded binding — the worst case is
+# closing an intent whose referent is already corroborated, against the alternative of
+# paying for a whole extra hop to re-derive it.
+_RESTATED_INTENT_THRESHOLD = 0.60
+
+
+def _resolved_intent_lines(ledger: Sequence[Dict[str, Any]]) -> List[str]:
+    """``intent -> bound referent`` for every settled intent, for the replan prompt.
+
+    Only grounded bindings show their value, matching ``render_plan_for_prompt``: an
+    intent closed on the model's own inference is reported as settled without
+    asserting the referent it guessed.
+    """
+    lines: List[str] = []
+    for entry in ledger:
+        if entry.get("status") != INTENT_CLOSED or entry.get("falsified"):
+            continue
+        intent = (entry.get("intent") or "").strip()
+        if not intent:
+            continue
+        bound = next(
+            (
+                b
+                for b in (entry.get("bindings") or [])
+                if b.get("qid") and b.get("grounded")
+            ),
+            None,
+        )
+        lines.append(
+            f"{intent} -> {bound['surface']}" if bound else f"{intent} -> settled"
+        )
+    return lines
+
+
+def _fuzzy_closed_match(
+    intent: Optional[str],
+    closed_by_intent: Dict[str, Dict[str, Any]],
+    already_matched: Set[str],
+) -> Optional[Dict[str, Any]]:
+    """Best unclaimed closed intent that ``intent`` restates, or None.
+
+    Only closures with a retrieval-grounded binding are eligible — see
+    ``_RESTATED_INTENT_THRESHOLD`` for why that restriction is what makes a threshold
+    this low safe.
+    """
+    key = _normalize_subq(intent or "")
+    if not key:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    best_ratio = _RESTATED_INTENT_THRESHOLD
+    for prior_key, prior in closed_by_intent.items():
+        if prior_key in already_matched:
+            continue
+        if not any(
+            b.get("qid") and b.get("grounded") for b in (prior.get("bindings") or [])
+        ):
+            continue
+        ratio = difflib.SequenceMatcher(None, key, _normalize_subq(prior_key)).ratio()
+        if ratio >= best_ratio:
+            best_ratio = ratio
+            best = prior
+    if best is not None:
+        logger.info(
+            "[replan] fresh intent %r restates the resolved intent %r (sim %.2f); "
+            "carrying its binding instead of re-opening it",
+            (intent or "")[:70],
+            (best.get("intent") or "")[:70],
+            best_ratio,
+        )
+    return best
+
 
 
 def render_plan_for_prompt(plan: str, ledger: Sequence[Dict[str, Any]]) -> str:
-    """Annotate the prose plan with per-intent status for prompt injection.
+    """Annotate the prose plan with per-intent status and its resolved referent.
 
-    Resolved intents are marked so the generator does not re-open them, and
-    contested ones are marked so it knows the ambiguity is live. Statuses are
-    bookkeeping, not claims — no bound value is rendered here.
+    The stored ``plan`` prose is never mutated — this view is **derived from the
+    ledger on every call**, which is what makes it safe to include bound values.
+    A binding here carries a QID, a hop, and an eviction path: a retracted premise
+    marks the intent ``falsified``, and this function checks that flag *before*
+    ``status`` so the value stops being shown from the next render onward. Writing
+    the value into the plan text instead would strand a world-claim with none of
+    those — nothing would ever un-assert it.
+
+    Only ``grounded`` bindings — those corroborated by a ``[Retrieval]``-tagged
+    memory line — are shown as resolved values. An intent closed on the model's own
+    unverified inference renders as ``[resolved, unverified]`` without its value, so
+    the plan never presents a guess as established.
     """
     text = (plan or "").strip()
     if not ledger:
@@ -503,11 +1248,56 @@ def render_plan_for_prompt(plan: str, ledger: Sequence[Dict[str, Any]]) -> str:
     lines = []
     for entry in ledger:
         status = entry.get("status", INTENT_OPEN)
-        marker = {
-            INTENT_CLOSED: "[resolved]",
-            INTENT_CONTESTED: "[ambiguous - two candidate referents]",
-        }.get(status, "[open]")
-        lines.append(f"- {marker} {entry.get('intent', '')}")
+        intent = entry.get("intent", "")
+        if entry.get("falsified"):
+            # Checked BEFORE ``closed``: ``apply_retractions`` flags the intent but
+            # deliberately leaves its status and bindings alone (the retraction was of
+            # a *premise*, and the classifier still needs the binding history). If the
+            # render trusted ``status`` first, a closed intent whose premise retrieval
+            # just contradicted would keep asserting its value — the plan restating a
+            # fact the evidence has overturned.
+            lines.append(f"- [premise contradicted - re-establish] {intent}")
+        elif status == INTENT_CLOSED:
+            bound = next(
+                (
+                    b
+                    for b in (entry.get("bindings") or [])
+                    if b.get("qid") and b.get("grounded")
+                ),
+                None,
+            )
+            if bound is not None:
+                lines.append(f"- [resolved: {bound['surface']}] {intent}")
+            else:
+                lines.append(f"- [resolved, unverified] {intent}")
+        elif status == INTENT_CONTESTED:
+            # Name the rivals. Told only that an intent is "ambiguous", the generator
+            # re-issued the same query — 13 of 17 cross-hop repeats were contested
+            # intents. Naming them makes a *discriminating* question writable.
+            rivals = [
+                str(b.get("surface") or "")[:60]
+                for b in (entry.get("bindings") or [])
+                if b.get("qid")
+            ]
+            lines.append(
+                f"- [ambiguous between {' | '.join(rivals)} - ask what tells them "
+                f"apart, do NOT re-ask this] {intent}"
+                if len(rivals) >= 2
+                else f"- [ambiguous - two candidate referents] {intent}"
+            )
+        elif status == INTENT_UNDECIDED:
+            lines.append(
+                f"- [UNRESOLVABLE - stop asking; the answer must hedge] {intent}"
+            )
+        elif status == INTENT_DEAD:
+            why = entry.get("dead_reason") or "abandoned by a replan"
+            lines.append(f"- [RULED OUT - do not re-propose: {why}] {intent}")
+        elif entry.get("conflicted"):
+            lines.append(f"- [sources disagree - needs adjudicating] {intent}")
+        elif entry.get("stalled"):
+            lines.append(f"- [stuck - this framing is not resolving it] {intent}")
+        else:
+            lines.append(f"- [open] {intent}")
     return f"{text}\n\nIntent status:\n" + "\n".join(lines) if text else ""
 
 
@@ -748,6 +1538,35 @@ class PooledSubquestions:
     serves_intent: List[Optional[int]]
     should_direct: bool
     n_survivors: int
+    # Subquestions dropped because they still referenced an unresolved earlier
+    # result. A non-zero count means the plan has a real dependency the generator
+    # could not instantiate, which is precisely when ``intermediate_answer`` matters.
+    n_uninstantiated: int = 0
+    # Dropped as a reworded twin of one already pooled (see ``_NEAR_DUP_THRESHOLD``).
+    n_near_duplicate: int = 0
+    # Dropped because their plan intent had already reached ``_MAX_PER_INTENT``
+    # attempts this hop.
+    n_intent_capped: int = 0
+
+
+def _normalize_subq(text: str) -> str:
+    """Casing/punctuation/whitespace-insensitive form, for twin detection only."""
+    return " ".join(re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).split())
+
+
+# Two subquestions above this similarity retrieve the same documents. Measured on
+# the d1 run: reworded twins that differ only in tense or word order score 0.92-0.97
+# and return *identical* fact counts, while subquestions that genuinely ask for
+# different properties of one entity ("the height of X" vs "the completion year of
+# X") score 0.84. The threshold sits above the second class deliberately — dropping
+# a real question costs a whole extra hop, dropping a twin costs nothing.
+_NEAR_DUP_THRESHOLD = 0.95
+
+# Retrievals allowed per plan intent per hop. Two, not one, because an ordinal
+# intent has two genuinely different retrieval targets — the specific item and the
+# complete ranked list. Anything beyond that was, in every case measured, the same
+# question reworded.
+_MAX_PER_INTENT = 2
 
 
 def pool_subquestions(outputs: Any) -> PooledSubquestions:
@@ -755,9 +1574,21 @@ def pool_subquestions(outputs: Any) -> PooledSubquestions:
 
     Only completions that judged the question *not* answerable contribute their
     subquestions; ``should_direct`` is the majority ``is_answerable`` vote over
-    the completions that parsed. Dedups by subquestion text, preserving
-    first-seen order, and carries the parallel ``needs_kg`` / ``serves_intent``
-    arrays alongside.
+    the completions that parsed. Preserves first-seen order and carries the
+    parallel ``needs_kg`` / ``serves_intent`` arrays alongside.
+
+    Two caps bound the union, because each surviving subquestion buys a full
+    retrieval fan-out and the ``n`` completions cannot see each other's output —
+    so no prompt rule can stop them proposing the same thing:
+
+    * **near-duplicate** — a reworded twin of something already pooled.
+    * **per-intent** — more than ``_MAX_PER_INTENT`` subquestions on one plan
+      intent in one hop.
+
+    Both are backstops, not the mechanism: the prompt is what should keep breadth
+    pointed at *distinct intents*. They exist because a single over-eager prompt
+    rule once turned 3 completions into 10 retrievals for one intent, and a cap
+    cannot regress the way prose can.
     """
     if not isinstance(outputs, list):
         outputs = [outputs]
@@ -768,7 +1599,12 @@ def pool_subquestions(outputs: Any) -> PooledSubquestions:
     flags: List[bool] = []
     intents: List[Optional[int]] = []
     seen: set[str] = set()
+    norms: List[str] = []
+    per_intent: Dict[int, int] = {}
     answerable = 0
+    uninstantiated = 0
+    near_duplicate = 0
+    intent_capped = 0
     for out in survivors:
         if bool(getattr(out, "is_answerable", False)):
             answerable += 1
@@ -782,19 +1618,64 @@ def pool_subquestions(outputs: Any) -> PooledSubquestions:
             key = sq.strip().lower()
             if key in seen:
                 continue
-            seen.add(key)
-            subqs.append(sq.strip())
-            flags.append(bool(kg_list[i]) if i < len(kg_list) else True)
+            if is_uninstantiated(sq):
+                # The generator wanted an earlier hop's value and had none. Let the
+                # intent stay open rather than retrieving on the placeholder text.
+                uninstantiated += 1
+                continue
             raw_intent = intent_list[i] if i < len(intent_list) else None
             # -1 (or any negative) is the generator's "advances no plan intent"
             # encoding; normalize it to None so attribution stays absent rather
             # than pointing at a bogus ledger slot.
-            intents.append(
+            intent = (
                 int(raw_intent)
                 if isinstance(raw_intent, int) and not isinstance(raw_intent, bool)
                 and raw_intent >= 0
                 else None
             )
+            norm = _normalize_subq(sq)
+            twin = next(
+                (
+                    prev
+                    for prev in norms
+                    if difflib.SequenceMatcher(None, norm, prev).ratio()
+                    >= _NEAR_DUP_THRESHOLD
+                ),
+                None,
+            )
+            if twin is not None:
+                near_duplicate += 1
+                logger.debug(
+                    "[pool] dropped reworded twin: %r (≈ %r)", sq.strip(), twin
+                )
+                continue
+            # Unattributed subquestions are NOT capped as a group: they carry no
+            # intent, so a shared budget would make two unrelated gaps compete.
+            if intent is not None and per_intent.get(intent, 0) >= _MAX_PER_INTENT:
+                intent_capped += 1
+                logger.debug(
+                    "[pool] intent %d already has %d subquestions this hop; "
+                    "dropping %r",
+                    intent,
+                    _MAX_PER_INTENT,
+                    sq.strip(),
+                )
+                continue
+            seen.add(key)
+            norms.append(norm)
+            if intent is not None:
+                per_intent[intent] = per_intent.get(intent, 0) + 1
+            subqs.append(sq.strip())
+            flags.append(bool(kg_list[i]) if i < len(kg_list) else True)
+            intents.append(intent)
+    if near_duplicate or intent_capped:
+        logger.info(
+            "[pool] %d subquestions kept; dropped %d reworded twins and %d over the "
+            "per-intent cap",
+            len(subqs),
+            near_duplicate,
+            intent_capped,
+        )
     should_direct = (answerable / len(survivors) > 0.5) if survivors else False
     return PooledSubquestions(
         subquestions=subqs,
@@ -802,6 +1683,9 @@ def pool_subquestions(outputs: Any) -> PooledSubquestions:
         serves_intent=intents,
         should_direct=should_direct,
         n_survivors=len(survivors),
+        n_uninstantiated=uninstantiated,
+        n_near_duplicate=near_duplicate,
+        n_intent_capped=intent_capped,
     )
 
 
@@ -949,6 +1833,9 @@ def build_cot_graph(
     plan_enabled = bool(getattr(plan_cfg, "enabled", False))
     replan_max = int(getattr(plan_cfg, "replan_max", 0) or 0)
     replan_headroom = int(getattr(plan_cfg, "replan_min_depth_headroom", 2) or 0)
+    stall_after_attempts = max(
+        1, int(getattr(plan_cfg, "stall_after_attempts", 2) or 2)
+    )
 
     # Compiled subgraphs. Lazy build at compile time keeps the per-question
     # cost down — same compiled instance is reused across all iterations.
@@ -963,23 +1850,28 @@ def build_cot_graph(
         # plan exists to remove.
         if state.get("plan"):
             return {}
-        out, _ = await execute_role_lc(
+        question = state.get("question", "")
+        memory = list(state.get("text_memory") or [])
+        outs, _ = await execute_role_lc(
             registry,
             PLANNER,
-            PlanInput(
-                question=state.get("question", ""),
-                context=_join_memory_context(state),
-            ),
+            PlanInput(question=question, context=_join_memory_context(state)),
+            n=N_PLANS,
         )
-        if is_safe_default(out):
+        # ``select_plan`` is retained at N_PLANS=1 so raising the sample count stays a
+        # one-constant change; with one completion it reduces to "take the one that
+        # parsed", and the runners-up list is empty.
+        chosen, _runners_up = select_plan(outs, question, memory)
+        if chosen is None:
             logger.error(
-                "[gen_plan] PLANNER returned no parseable output; continuing "
-                "without a plan (the loop degrades to plain decomposition)"
+                "[gen_plan] no PLANNER completion parsed; continuing without a plan "
+                "(the loop degrades to plain decomposition)"
             )
             return {"plan": "", "plan_version": 0, "plan_ledger": []}
-        plan_text = str(getattr(out, "plan", "") or "").strip()
-        intents = list(getattr(out, "intents", None) or [])
-        premises = list(getattr(out, "premises", None) or [])
+        plan_text = str(getattr(chosen, "plan", "") or "").strip()
+        intents = list(getattr(chosen, "intents", None) or [])
+        premises = list(getattr(chosen, "premises", None) or [])
+        logger.info("[gen_plan] plan with %d intents", len(intents))
         return {
             "plan": plan_text,
             "plan_version": 1,
@@ -990,6 +1882,10 @@ def build_cot_graph(
     async def gen_subq(state: CoTState) -> Dict[str, Any]:
         question = state.get("question", "")
         ctx = _join_memory_context(state)
+        # Capture what UPDATE actually surfaced this hop. Without recording it, the
+        # artifacts show that an intent closed but not whether its binding ever
+        # reached a prompt — which is the only thing that makes UPDATE do any work.
+        surfaced = latest_intermediate_answer(state.get("plan_ledger") or [])
         inp = SubquestionGenerationInput(
             question=question,
             context=ctx,
@@ -1001,9 +1897,7 @@ def build_cot_graph(
             # the prompt through this typed slot, whose "do NOT re-ask what was
             # already resolved" rule (roles.py) was previously inert because
             # nothing ever populated the field.
-            intermediate_answer=latest_intermediate_answer(
-                state.get("plan_ledger") or []
-            ),
+            intermediate_answer=surfaced,
         )
         # coe parity: sample N completions, pool their decompositions.
         outs, _ = await execute_role_lc(
@@ -1026,6 +1920,7 @@ def build_cot_graph(
                 "subquestion_needs_kg": [],
                 "subquestion_serves_intent": [],
                 "subq_parse_failed": True,
+                "last_intermediate_answer": surfaced or "",
             }
         return {
             # "answerable" routes the loop to synthesis, same as the majority vote.
@@ -1034,6 +1929,12 @@ def build_cot_graph(
             "subquestion_needs_kg": pooled.needs_kg,
             "subquestion_serves_intent": pooled.serves_intent,
             "subq_parse_failed": False,
+            "last_intermediate_answer": surfaced or "",
+            # Diagnostic: how many subquestions were dropped as un-instantiated, and
+            # how wide the pooled decomposition ended up. Retrieval breadth per hop is
+            # what the plan was measured to have collapsed (49% of hops fell to a
+            # single subquestion), so both numbers have to be visible per hop.
+            "last_n_uninstantiated": pooled.n_uninstantiated,
         }
 
     async def kg_one(state: CoTState) -> Dict[str, Any]:
@@ -1180,6 +2081,7 @@ def build_cot_graph(
         # sub-question. Consumers that need non-empty text filter downstream.
         answers: List[str] = []
         concise: List[str] = []
+        confidence: List[str] = []
         for i in range(len(subqs)):
             r = results[i] if i < len(results) else None
             text = (
@@ -1197,7 +2099,14 @@ def build_cot_graph(
                     or ""
                 )
             )
-        return {"current_subanswers": answers, "current_subanswers_concise": concise}
+            confidence.append(
+                str(getattr(r, "confidence_level", None) or "").strip().lower()
+            )
+        return {
+            "current_subanswers": answers,
+            "current_subanswers_concise": concise,
+            "current_subanswer_confidence": confidence,
+        }
 
     async def mem_update(state: CoTState) -> Dict[str, Any]:
         # This iteration's sub-answers and retrieval facts were produced one hop
@@ -1234,6 +2143,12 @@ def build_cot_graph(
             # with reason "contradicted" means a claim we held was overturned by
             # retrieved evidence — the only eviction reason that bears on the plan.
             "last_retractions": list(result.get("retractions") or []),
+            # Rule 6 of the consolidator keeps two conflicting [Retrieval] items
+            # rather than adjudicating between them. That is a *second*, distinct
+            # signal from a retraction: the evidence base disagrees with itself, so
+            # no amount of re-asking the current intent resolves it — the plan needs
+            # a step that discriminates between the two sources.
+            "last_unresolved_conflicts": list(result.get("unresolved_conflicts") or []),
         }
 
     async def plan_gate(state: CoTState) -> Dict[str, Any]:
@@ -1262,10 +2177,19 @@ def build_cot_graph(
             or state.get("current_subanswers")
             or []
         )
+        confidences = list(state.get("current_subanswer_confidence") or [])
         candidates: List[tuple[Optional[int], str]] = []
         unattributed = 0
+        low_confidence = 0
         for i, answer in enumerate(answers):
             if not (isinstance(answer, str) and answer.strip()):
+                continue
+            # A "low" self-reported confidence means the answerer is guessing.
+            # Closing an intent on that would record a referent the reasoning does
+            # not stand behind — and worse, a guess competing with a grounded answer
+            # would read as genuine ambiguity. Let the intent stay open and stall.
+            if i < len(confidences) and confidences[i] in _LOW_CONFIDENCE:
+                low_confidence += 1
                 continue
             intent_idx = intents[i] if i < len(intents) else None
             if intent_idx is None:
@@ -1281,21 +2205,51 @@ def build_cot_graph(
                 len(candidates),
             )
 
-        ledger = apply_bindings(ledger, candidates, label_to_qid, hop)
+        # Pass the consolidated memory so a binding corroborated by a [Retrieval]
+        # line is marked grounded — that is what licenses showing its value in the
+        # rendered plan (a cited verified fact, not an originated claim).
+        ledger = apply_bindings(
+            ledger, candidates, label_to_qid, hop, state.get("text_memory") or []
+        )
         ledger = apply_retractions(ledger, state.get("last_retractions") or [])
+        ledger = mark_conflicted_intents(
+            ledger, state.get("last_unresolved_conflicts") or []
+        )
         # Negative record: what was asked and what it yielded. Memory cannot hold
         # this — "nothing was found for X" is not a fact about the world — and
         # without it a replanner given only (plan, memory) rewrites the same plan.
         n_facts = len(state.get("extracted_facts") or [])
+        attempts_this_hop: List[Dict[str, Any]] = []
         for i, subq in enumerate(state.get("subquestions") or []):
+            record = {"query": subq, "n_facts": n_facts, "hop": hop}
+            # Every attempt goes to the run-level log, attributed or not: the
+            # replanner needs the full "already tried" set, and an unattributed
+            # query still tells it that framing yielded nothing.
+            attempts_this_hop.append(record)
             intent_idx = intents[i] if i < len(intents) else None
             if intent_idx is None or not (0 <= intent_idx < len(ledger)):
                 continue
             ledger[intent_idx]["attempts"] = list(
                 ledger[intent_idx].get("attempts") or []
-            ) + [{"query": subq, "n_facts": n_facts, "hop": hop}]
+            ) + [record]
 
-        action, intent_idx, competing = classify_discharge(ledger)
+        # Efficacy check: an intent queried repeatedly without closing is stuck,
+        # even when nothing surprising happened. This is the only branch that fires
+        # on a plan that is quietly getting nowhere.
+        ledger = mark_stalled_intents(ledger, max_attempts=stall_after_attempts)
+
+        # Exhaustion needs care: ``is_answerable`` was judged by ``gen_subq`` at the
+        # TOP of this hop, i.e. *before* this hop's retrieval. Reading it here alone
+        # fired on rows where the plan had just closed every intent with fresh
+        # evidence — the next ``gen_subq`` had not yet had a chance to see it. So also
+        # require that nothing closed this hop: if progress was made, let the loop
+        # re-judge answerability with the new memory before declaring the plan spent.
+        progress_this_hop = any(
+            e.get("status") == INTENT_CLOSED and e.get("closed_at") == hop
+            for e in ledger
+        )
+        exhausted = not bool(state.get("is_answerable")) and not progress_this_hop
+        action, intent_idx, competing = classify_discharge(ledger, exhausted=exhausted)
         entry = {
             "hop": hop,
             "action": action,
@@ -1303,6 +2257,15 @@ def build_cot_graph(
             "intent": ledger[intent_idx].get("intent") if intent_idx is not None else None,
             "competing_bindings": competing,
             "plan_version": int(state.get("plan_version", 0) or 0),
+            # Attribution health, recorded per hop rather than only logged: if this
+            # rate is high the gate is reading noise, and that has to be visible in
+            # the fire-rate experiment rather than inferred from stderr.
+            "answers_seen": len(candidates),
+            "answers_unattributed": unattributed,
+            "answers_low_confidence": low_confidence,
+            # Which branch fired, so the fire-rate breakdown distinguishes ambiguity
+            # from retraction from a stuck route.
+            "reason": _discharge_reason(ledger, intent_idx, action),
             # ``armed`` records whether the router was allowed to act, so a
             # log-only run stays distinguishable from an armed one after the fact.
             "armed": replan_max > 0,
@@ -1320,6 +2283,7 @@ def build_cot_graph(
             "plan_ledger": ledger,
             "plan_action": action,
             "plan_action_log": [entry],
+            "plan_attempts_log": attempts_this_hop,
         }
 
     async def replan(state: CoTState) -> Dict[str, Any]:
@@ -1334,22 +2298,13 @@ def build_cot_graph(
         if intent_idx is None:
             return {"plan_action": PLAN_ACTION_NONE}
         entry = ledger[intent_idx]
-        if entry.get("status") == INTENT_CONTESTED:
-            failure = (
-                f"The intent {entry.get('intent')!r} bound "
-                f"{len(competing)} different referents, so its closure is "
-                "under-determined. Add a step that discriminates between them."
-            )
-        else:
-            failure = (
-                f"A fact this plan relied on was contradicted by retrieved "
-                f"evidence: {entry.get('falsified')!r}. Anything the plan built on "
-                "it must be re-established."
-            )
+        failure = _describe_failure(entry, competing)
+        # Read the run-level log, not the ledger: ``build_plan_ledger`` below starts
+        # every intent with an empty ``attempts``, so a ledger-sourced list would be
+        # empty on the second and later replans.
         attempts = [
             f"{a.get('query')} → {a.get('n_facts')} facts"
-            for e in ledger
-            for a in (e.get("attempts") or [])
+            for a in (state.get("plan_attempts_log") or [])
         ]
         out, _ = await execute_role_lc(
             registry,
@@ -1363,6 +2318,10 @@ def build_cot_graph(
                 # referent is evidence of ambiguity, not a fact to build on.
                 competing_bindings=competing or None,
                 attempts=attempts or None,
+                # Settled work, named explicitly so the rewrite leaves it alone.
+                # Without this the planner re-lists resolved intents in fresh wording
+                # and the system pays to answer them again.
+                resolved=_resolved_intent_lines(ledger) or None,
             ),
         )
         if is_safe_default(out):
@@ -1374,19 +2333,66 @@ def build_cot_graph(
         new_intents = list(getattr(out, "intents", None) or [])
         new_premises = list(getattr(out, "premises", None) or [])
         new_ledger = build_plan_ledger(new_intents, new_premises)
-        # Carry forward closures whose intent text survived the rewrite, so a
-        # replan does not re-open work that is already done.
+        # Carry forward closures the rewrite restated, so a replan does not re-open
+        # work that is already done.
         closed_by_intent = {
             (e.get("intent") or "").strip().lower(): e
             for e in ledger
             if e.get("status") == INTENT_CLOSED
         }
+        matched: set[str] = set()
         for fresh in new_ledger:
-            prior = closed_by_intent.get((fresh.get("intent") or "").strip().lower())
+            key = (fresh.get("intent") or "").strip().lower()
+            prior = closed_by_intent.get(key)
+            if prior is None:
+                # Exact text is not enough. The planner rewords, and a reworded
+                # resolved intent used to be carried as closed AND re-listed here as
+                # fresh and open — so it was asked a second time. Measured on the
+                # armed 62-row run: 16 such pairs over 10 of the 20 replanned
+                # questions, intents per question doubling with each replan
+                # (2.17 -> 4.21 -> 8.17) and the closure rate falling to 32%.
+                #
+                # The prompt now names the settled intents and forbids re-listing
+                # them, but the merge must not depend on the model obeying, so match
+                # fuzzily as a backstop. Restricted to closures carrying a *grounded*
+                # binding: a false positive then closes an intent whose referent
+                # retrieval has already corroborated, which is far cheaper than
+                # re-running a hop. Unverified closures still require exact text.
+                prior = _fuzzy_closed_match(fresh.get("intent"), closed_by_intent, matched)
             if prior is not None:
+                matched.add((prior.get("intent") or "").strip().lower())
                 fresh["status"] = INTENT_CLOSED
                 fresh["bindings"] = list(prior.get("bindings") or [])
                 fresh["closed_at"] = prior.get("closed_at")
+                fresh["attempts"] = list(prior.get("attempts") or [])
+        # A resolved intent the planner reworded would otherwise vanish: its binding
+        # would drop out of the rendered plan and ``intermediate_answer`` would fall
+        # back to None, losing a referent that retrieval had already established.
+        # Keep it as a carried entry — closed, so it is never re-asked or stalled.
+        for key, prior in closed_by_intent.items():
+            if key in matched:
+                continue
+            carried = dict(prior)
+            carried["carried_from_version"] = int(state.get("plan_version", 0) or 0)
+            new_ledger.append(carried)
+        # Every *unresolved* intent the rewrite dropped is recorded DEAD rather than
+        # deleted. A deleted intent is invisible to the generator, which is then free
+        # to re-propose the exact framing this replan discarded — the loop the
+        # attempt ledger and this marker jointly guard against.
+        fresh_keys = {(e.get("intent") or "").strip().lower() for e in new_ledger}
+        version = int(state.get("plan_version", 0) or 0)
+        for prior in ledger:
+            key = (prior.get("intent") or "").strip().lower()
+            if not key or key in fresh_keys or prior.get("status") == INTENT_CLOSED:
+                continue
+            new_ledger.append(
+                {
+                    **prior,
+                    "status": INTENT_DEAD,
+                    "dead_reason": _dead_reason(prior),
+                    "dead_at_version": version,
+                }
+            )
         return {
             "plan": str(getattr(out, "plan", "") or "").strip(),
             "plan_version": int(state.get("plan_version", 0) or 0) + 1,
@@ -1406,6 +2412,12 @@ def build_cot_graph(
         if plan_enabled:
             history_entry["plan_version"] = int(state.get("plan_version", 0) or 0)
             history_entry["plan_action"] = state.get("plan_action", PLAN_ACTION_NONE)
+            history_entry["intermediate_answer"] = state.get(
+                "last_intermediate_answer", ""
+            )
+            history_entry["n_uninstantiated"] = int(
+                state.get("last_n_uninstantiated", 0) or 0
+            )
         return {
             "iteration_history": [history_entry],
             "depth": int(state.get("depth", 0) or 0) + 1,
@@ -1416,9 +2428,11 @@ def build_cot_graph(
             "extracted_facts": [],
             "current_subanswers": [],
             "current_subanswers_concise": [],
+            "current_subanswer_confidence": [],
             "retrieved_raw_context": Clear(),
             "retrieved_raw_triples": Clear(),
             "last_retractions": [],
+            "last_unresolved_conflicts": [],
             "plan_action": PLAN_ACTION_NONE,
         }
 
@@ -1450,11 +2464,23 @@ def build_cot_graph(
         )
         concise = getattr(out, "concise_answer", None) or final_text
         reasoning = getattr(out, "reasoning", None) or ""
-        return {
+        out_state: Dict[str, Any] = {
             "final_answer": str(final_text),
             "concise_answer": str(concise),
             "reasoning": str(reasoning),
         }
+        if plan_enabled:
+            signal = abstention_signal(state.get("plan_ledger") or [])
+            out_state["abstention"] = signal
+            if signal["level"] != "none":
+                logger.info(
+                    "[gen_final] abstention=%s — %d/%d intents resolved; unmet: %s",
+                    signal["level"],
+                    signal["resolved"],
+                    signal["total"],
+                    signal["reasons"],
+                )
+        return out_state
 
     # ── Routing ──────────────────────────────────────────────────────────────
 
@@ -1580,6 +2606,9 @@ __all__ = [
     "build_plan_ledger",
     "resolve_binding_qids",
     "resolve_primary_qid",
+    "resolve_primary_literal",
+    "resolve_binding_key",
+    "mark_stalled_intents",
     "apply_bindings",
     "apply_retractions",
     "classify_discharge",

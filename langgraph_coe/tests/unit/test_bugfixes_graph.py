@@ -527,3 +527,80 @@ def test_plan_gate_refreshes_the_node_snapshot_with_its_new_ledger():
     assert '"snapshots"' in gate, (
         "plan_gate must re-emit the node snapshot with the fresh plan_ledger"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MCTS iteration budget
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_patience_does_not_accumulate_during_the_min_iterations_floor():
+    """The effective budget was ``min_iterations + 1``, not ``num_iterations``.
+
+    ``route_after_iteration`` skips the termination *checks* below the floor, but
+    ``backprop`` still incremented ``iterations_without_improvement`` there. With
+    min_iterations=5 and convergence_patience=5, a best reward landing at iteration
+    1 left the counter already at 5 when the checks switched on, so a configured
+    20-iteration run stopped at 6. Simulated here against the real predicate.
+    """
+    min_iters, patience, num_iterations = 5, 5, 20
+
+    def budget(*, count_during_floor: bool) -> int:
+        # Best reward arrives on iteration 1 and is never beaten, so no_imp only grows.
+        no_imp = 0
+        for iteration in range(1, num_iterations + 1):
+            if count_during_floor or iteration - 1 >= min_iters:
+                no_imp += 1
+            if iteration >= num_iterations:
+                return iteration
+            if iteration < min_iters:
+                continue
+            if no_imp >= patience:
+                return iteration
+        return num_iterations
+
+    # Old: the counter is already at ``patience`` the instant the checks switch on,
+    # so the run ends on the very first iteration that is allowed to terminate.
+    assert budget(count_during_floor=True) == min_iters
+    # New: patience measures ``patience`` iterations *after* the floor lifts, which
+    # is what it is documented to mean. Still short of num_iterations when nothing
+    # ever improves — that is the point of patience, not a bug.
+    assert budget(count_during_floor=False) == min_iters + patience
+
+
+def test_backprop_gates_the_patience_counter_on_the_floor():
+    import inspect
+
+    src = inspect.getsource(mcts_mod.build_mcts_graph)
+    backprop = src[src.index("async def backprop") :]
+    backprop = backprop[: backprop.index("async def mem_update")]
+    assert "counting_live" in backprop, (
+        "backprop must not accumulate patience during the min_iterations floor"
+    )
+
+
+def test_mcts_plan_gate_records_attempts_before_binding_closes_intents():
+    """Observed live: MCTS reported ``attempts=0`` on every row, so the stall branch
+    could never fire in that graph. Attempts were appended only to intents still
+    OPEN, but ``apply_bindings`` closes them in the same pass."""
+    import inspect
+
+    src = inspect.getsource(mcts_mod.build_mcts_graph)
+    gate = src[src.index("async def plan_gate") :]
+    gate = gate[: gate.index("async def synthesize")]
+    attempts_at = gate.index("open_before")
+    bind_at = gate.index("apply_bindings(")
+    assert attempts_at < bind_at, (
+        "attempts must be recorded before apply_bindings closes the intents"
+    )
+    assert "mark_stalled_intents" in gate, "MCTS must run the stall check too"
+
+
+def test_mcts_plan_gate_records_which_branch_fired():
+    """Observed live: ``reasons=[None]`` — a fire was counted but not attributable."""
+    import inspect
+
+    src = inspect.getsource(mcts_mod.build_mcts_graph)
+    gate = src[src.index("async def plan_gate") :]
+    gate = gate[: gate.index("async def synthesize")]
+    assert '"reason"' in gate

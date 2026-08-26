@@ -80,6 +80,14 @@ class AnswerResult:
             metadata["plan_replans_applied"] = max(
                 0, int(state.get("plan_version", 0) or 0) - 1
             )
+            abstention = state.get("abstention") or {}
+            if abstention:
+                # Confidence, not adjudication: reported so a caller can hedge, and
+                # kept out of the synthesizer's prompt by design.
+                metadata["abstention"] = abstention.get("level")
+                metadata["intents_resolved"] = abstention.get("resolved")
+                metadata["intents_total"] = abstention.get("total")
+                metadata["unmet_intent_reasons"] = abstention.get("reasons")
         return cls(
             question=str(state.get("question", "") or ""),
             answer=str(state.get("final_answer", "") or ""),
@@ -171,6 +179,7 @@ def _initial_cot_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any]
         "plan_ledger": [],
         "plan_action": "none",
         "plan_action_log": [],
+        "plan_attempts_log": [],
         "plan_frozen": False,
         "final_answer": "",
         "concise_answer": "",
@@ -219,7 +228,9 @@ def _initial_mcts_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any
         "plan_ledger": [],
         "plan_action": "none",
         "plan_action_log": [],
+        "plan_attempts_log": [],
         "last_retractions": [],
+        "last_unresolved_conflicts": [],
         "final_answer": "",
         "concise_answer": "",
         "reasoning": "",

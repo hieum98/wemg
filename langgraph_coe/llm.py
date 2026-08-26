@@ -1,6 +1,7 @@
 """LangGraph-CoE: LLM Execution Layer with tier-based model selection."""
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -54,6 +55,58 @@ def format_messages(role: Role, item: BaseModel) -> List[Any]:
 # practice, i.e. a 32k-char payload the heuristic scored as 10k tokens was really
 # 29k. Prefer :func:`count_prompt_tokens`, which asks the tokenizer.
 _CHARS_PER_TOKEN = 3.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cost meter
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Nothing counted LLM calls, so no cost claim about this system was provable — the only
+# available proxies were hops and subquestions per question, which miss every call inside
+# the retrieval subgraphs and mis-weight a role sampled at n=3 against one sampled at n=1.
+#
+# A ContextVar rather than a module global because ``runner._answer_one`` answers
+# ``max_concurrent`` questions concurrently on one event loop, so a global would blend
+# them. It follows the per-question ``reset_*_session`` pattern already documented there.
+# Reads are free and misses are silent: when no meter is installed (unit tests, library
+# use) every hook below is a no-op, so behaviour cannot change.
+_cost_meter: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "langgraph_coe_cost_meter", default=None
+)
+
+
+def start_cost_meter() -> Dict[str, Any]:
+    """Install a fresh per-question meter and return it (call once per question)."""
+    meter: Dict[str, Any] = {"calls": 0, "completions": 0, "prompt_tokens": 0, "by_role": {}}
+    _cost_meter.set(meter)
+    return meter
+
+
+def read_cost_meter() -> Optional[Dict[str, Any]]:
+    return _cost_meter.get()
+
+
+def _record_cost(role_name: str, completions: int, prompt_tokens: Optional[int]) -> None:
+    """Add one role invocation to the active meter, if any.
+
+    ``completions`` is the number of *actual* model responses requested — ``n`` per
+    attempt, summed over shake retries — not the number of ``execute_role_lc`` calls. A
+    role at n=3 costs three times a role at n=1 and the meter has to say so.
+    """
+    meter = _cost_meter.get()
+    if meter is None:
+        return
+    meter["calls"] += 1
+    meter["completions"] += int(completions)
+    if prompt_tokens:
+        meter["prompt_tokens"] += int(prompt_tokens) * int(completions)
+    slot = meter["by_role"].setdefault(
+        role_name, {"calls": 0, "completions": 0, "prompt_tokens": 0}
+    )
+    slot["calls"] += 1
+    slot["completions"] += int(completions)
+    if prompt_tokens:
+        slot["prompt_tokens"] += int(prompt_tokens) * int(completions)
 _TRUNCATION_NOTICE = "\n\n…[input truncated to fit the model context budget]…\n\n"
 
 
@@ -520,11 +573,18 @@ async def execute_role_lc(
             messages, max_input_tokens, role.name, chars_per_token, guard_model
         )
 
+        # Counted once per item, before the retry loop, so the prompt is tokenized once.
+        item_prompt_tokens = count_prompt_tokens(messages, guard_model)
+
         last_errors: List[Exception] = []
         for attempt in range(_STRUCT_PARSE_RETRIES):
             attempt_chain = _shaken_chain(attempt)
             # Parallel execution for N completions of this one item.
             tasks = [attempt_chain.ainvoke(messages) for _ in range(n)]
+            # Recorded before awaiting: a shake retry is real spend even when it fails,
+            # and attributing it only on success would understate the cost of a role
+            # whose output is hard to parse.
+            _record_cost(role.name, n, item_prompt_tokens)
             results = await asyncio.gather(*tasks, return_exceptions=True)
             parsed, last_errors = _collect(results)
             if parsed:

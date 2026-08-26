@@ -1,0 +1,172 @@
+{
+  "In 2016, who was the host of the longest running American game show?": {
+    "gold": "Drew Carey",
+    "verdict": "GOLD_CORRECT",
+    "why": "The Price Is Right is the longest-running American game show (Wheel of Fortune is longest-running *syndicated*); Drew Carey has hosted since 2007, so 2016 is right."
+  },
+  "In what year was the tallest lattice tower completed?": {
+    "gold": "2012",
+    "verdict": "GOLD_CORRECT",
+    "why": "Tokyo Skytree, 634m, a lattice tower, completed 2012. Taller than any other lattice structure."
+  },
+  "In what year was the tallest lighthouse completed?": {
+    "gold": "1902",
+    "verdict": "GOLD_CONTESTABLE",
+    "why": "1902 = Ile Vierge, tallest *traditional/stone* lighthouse. Jeddah Light (133m, 1990) is widely cited as the world's tallest lighthouse outright. Answer depends on the 'traditional lighthouse' qualifier the question does not state."
+  },
+  "The fourth largest city in Germany was originally called what?": {
+    "gold": "Colonia Claudia Ara Agrippinensium",
+    "verdict": "GOLD_CONTESTABLE",
+    "why": "Cologne is the 4th largest. CCAA is its Roman *colonia* name from AD 50, but the settlement was originally Oppidum Ubiorum. 'Originally called' arguably favours the latter."
+  },
+  "What rocket was the first spacecraft that ever approached Uranus launched on?": {
+    "gold": "Titan IIIE",
+    "verdict": "GOLD_CORRECT",
+    "why": "Voyager 2 was the only probe to approach Uranus (1986) and launched on a Titan IIIE-Centaur."
+  },
+  "When was the tallest ferris wheel in the world completed?": {
+    "gold": "2021",
+    "verdict": "GOLD_CORRECT",
+    "why": "Ain Dubai, 250m, opened October 2021 and is the tallest."
+  },
+  "Who was the first African American mayor of the most populous city in the United States?": {
+    "gold": "David Dinkins",
+    "verdict": "GOLD_CORRECT",
+    "why": "Most populous US city is New York; Dinkins was its first African American mayor (1990-93)."
+  },
+  "Who was the second wife of the founder of CNN?": {
+    "gold": "Jane Shirley Smith",
+    "verdict": "GOLD_CORRECT",
+    "why": "Ted Turner founded CNN; wives in order were Judy Nye, Jane Shirley Smith, Jane Fonda."
+  },
+  "Who wrote the novel on which the longest running show in Broadway history is based on?": {
+    "gold": "Gaston Leroux",
+    "verdict": "GOLD_CORRECT",
+    "why": "Longest-running Broadway show is The Phantom of the Opera, from Gaston Leroux's 1910 novel."
+  },
+  "In what country is the third largest stadium in the world?": {
+    "gold": "United States",
+    "verdict": "GOLD_CORRECT",
+    "why": "Michigan Stadium is 3rd by capacity on the standard list; the top three are US-dominated."
+  },
+  "In what country was the only cruise line that flies the American flag incorporated in?": {
+    "gold": "Bermuda",
+    "verdict": "GOLD_CORRECT",
+    "why": "NCL America (Pride of America) is the only US-flagged cruise line; Norwegian Cruise Line Holdings is incorporated in Bermuda."
+  },
+  "In what year was the tallest fixed steel structure completed?": {
+    "gold": "1988",
+    "verdict": "GOLD_CORRECT",
+    "why": "Bullwinkle offshore platform, installed 1988, is the tallest fixed steel structure."
+  },
+  "In what year was the tallest self-supporting tower completed?": {
+    "gold": "2012",
+    "verdict": "GOLD_CORRECT",
+    "why": "Tokyo Skytree, 634m, completed 2012 \u2014 tallest self-supporting tower."
+  },
+  "The most populous city in Punjab is how large (area wise)?": {
+    "gold": "310 square kilometers",
+    "verdict": "GOLD_CONTESTABLE",
+    "why": "Punjab-India's most populous city is Ludhiana (~310 km2); Punjab-Pakistan's is Lahore (~1772 km2). The question does not disambiguate the two Punjabs."
+  },
+  "The most populous national capital city was established in what year?": {
+    "gold": "1045 BC",
+    "verdict": "GOLD_CORRECT",
+    "why": "Beijing is the most populous national capital by city proper; traditionally founded as Ji c. 1045 BC. (Contestable only if 'most populous' is read as metro, which favours Tokyo/Delhi.)"
+  },
+  "The third largest river (by discharge) in the world is in what countries?": {
+    "gold": "India and Bangladesh",
+    "verdict": "GOLD_CONTESTABLE",
+    "why": "Ranking of 3rd by discharge differs by source: Ganges-Brahmaputra (India/Bangladesh) on some lists, Orinoco (Venezuela/Colombia) on others; the Congo is universally 2nd."
+  },
+  "What is the length of the second deepest river in the world?": {
+    "gold": "6,300 km",
+    "verdict": "GOLD_CORRECT",
+    "why": "Congo is deepest; Yangtze is generally cited second, length ~6,300 km."
+  },
+  "What is the maximum airspeed (in km/h) of the third fastest bird?": {
+    "gold": "320 km/h",
+    "verdict": "GOLD_CONTESTABLE",
+    "why": "320 km/h is the golden eagle, which is SECOND on Wikipedia's list of birds by flight speed (peregrine 389, golden eagle 320, white-throated needletail 169). Third would be ~169 km/h. Also, one source ranks by *horizontal* speed and puts the gyrfalcon third at 145 km/h. No canonical ranking."
+  },
+  "When did Nirvana's second most selling studio album come out?": {
+    "gold": "September 13, 1993",
+    "verdict": "GOLD_CORRECT",
+    "why": "By studio-album sales: Nevermind, then In Utero (13 Sep 1993 US). MTV Unplugged is live, not studio. NOTE: 21 Sep 1993 is the non-US release date, so an answer of 21 September 1993 is defensible and would still score 0 under sub-EM."
+  },
+  "When did the first prime minister of the Russian Empire come into office?": {
+    "gold": "November 6, 1905",
+    "verdict": "GOLD_CORRECT",
+    "why": "Sergei Witte became the first Chairman of the Council of Ministers on 6 Nov 1905 (Gregorian)."
+  },
+  "When was the longest bridge in the world opened?": {
+    "gold": "30 June 2011",
+    "verdict": "GOLD_CORRECT",
+    "why": "Danyang-Kunshan Grand Bridge (164.8 km) opened June 2011."
+  },
+  "Who directed the highest grossing film?": {
+    "gold": "James Cameroon",
+    "verdict": "GOLD_DEFECTIVE",
+    "why": "MISSPELLED. Avatar's director is James CAMERON. sub_em requires the gold string as a substring of the prediction, so a fully correct 'James Cameron' scores 0. This row cannot be won."
+  },
+  "Who is the largest aircraft carrier in the world is named after?": {
+    "gold": "Gerald R. Ford",
+    "verdict": "GOLD_CORRECT",
+    "why": "USS Gerald R. Ford, named for President Gerald R. Ford. (Question is ungrammatical but answerable.)"
+  },
+  "Who is the predecessor of the longest-reigning British monarch?": {
+    "gold": "George VI\n",
+    "verdict": "GOLD_DEFECTIVE",
+    "why": "TRAILING NEWLINE in the gold string. sub_em tests `gold.lower() in predicted.lower()`, and 'george vi\\n' is not a substring of 'George VI'. The fact is right (Elizabeth II's predecessor) but the row is unwinnable as stored."
+  },
+  "What is the lowest elevation of the longest railway tunnel?": {
+    "gold": "312 m",
+    "verdict": "GOLD_CORRECT",
+    "why": "Gotthard Base Tunnel (57 km, longest) has its lowest point at ~312 m elevation."
+  },
+  "What's the motto of the oldest California State university?": {
+    "gold": "Powering Silicon Valley",
+    "verdict": "GOLD_CORRECT",
+    "why": "San Jose State University (1857) is the oldest CSU; 'Powering Silicon Valley' is its slogan."
+  },
+  "Who produced the longest running video game franchise?": {
+    "gold": "MECC",
+    "verdict": "GOLD_CORRECT",
+    "why": "The Oregon Trail (1971) is the longest-running franchise; produced by MECC (Minnesota Educational Computing Consortium) \u2014 matches the 'thank Minnesota' snippet."
+  },
+  "How many people died in the second most powerful earthquake ever recorded?": {
+    "gold": "131",
+    "verdict": "GOLD_CORRECT",
+    "why": "1964 Alaska (Good Friday) quake, M9.2, is second only to 1960 Valdivia; death toll 131."
+  },
+  "In what year did the oldest cat ever recorded with the Cat of the Year award?": {
+    "gold": "1999",
+    "verdict": "GOLD_UNVERIFIABLE",
+    "why": "The question is GARBLED \u2014 the verb is missing ('...recorded [win] the Cat of the Year award'). No well-formed reading can be checked, so neither a right nor a wrong answer is meaningful here."
+  },
+  "In what year was the current tallest wooden lattice tower completed?": {
+    "gold": "1935",
+    "verdict": "GOLD_CORRECT",
+    "why": "Gliwice Radio Tower (Poland, 1935) is the tallest wooden lattice tower still standing. 'Current' correctly excludes Muhlacker (1934), which was demolished \u2014 so the 1934 in the snippets is a distractor, not a contradiction."
+  },
+  "What is the fastest air-breathing manned aircraft mostly made out of?": {
+    "gold": "Titanium",
+    "verdict": "GOLD_CORRECT",
+    "why": "SR-71 Blackbird is ~85-93% titanium."
+  },
+  "What is the third letter of the top level domain of the military?": {
+    "gold": "l",
+    "verdict": "GOLD_INFLATING",
+    "why": "Correct (.mil -> m,i,l). But a single-character gold makes sub_em ('gold in predicted') true for almost any English answer, so this row is scored free and INFLATES results rather than deflating them."
+  },
+  "When was the first location of the world's largest coffeehouse chain opened?": {
+    "gold": "March 30, 1971",
+    "verdict": "GOLD_CORRECT",
+    "why": "Starbucks' first store, Pike Place Seattle, opened 30 March 1971."
+  },
+  "Who built the fastest air-breathing manned aircraft?": {
+    "gold": "Lockheed Corporation",
+    "verdict": "GOLD_CORRECT",
+    "why": "SR-71 Blackbird was built by Lockheed."
+  }
+}

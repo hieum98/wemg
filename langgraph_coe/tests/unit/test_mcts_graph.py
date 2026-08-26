@@ -444,17 +444,25 @@ async def test_root_expansion_calls_gen_final_when_min_depth_met(monkeypatch):
     graph = _build_graph(mcts_mod, _mcts_config(final_answer_min_depth=0))
     final = await graph.ainvoke(_state(max_iterations=1))
 
-    final_nodes = _nodes_of_type(final["tree"], "final_answer")
+    # ``_gen_final`` answers via ANSWER_GENERATOR, not FINAL_ANSWER_SYNTHESIZER —
+    # coe parity: the terminal answer is a fresh retrieve-and-answer, not a
+    # synthesis over memory. So expand's FINAL_ANSWER child carries the answerer's
+    # text, and the synthesizer is called once (by ``synthesize``), not twice.
     expand_final_nodes = [
-        node for node in final_nodes if "Expand final." in str(node.get("content", {}))
+        node
+        for node in _nodes_of_type(final["tree"], "final_answer")
+        if node.get("parent_id") is not None
     ]
     assert expand_final_nodes, "expand must emit FINAL_ANSWER when min depth is met"
     assert all(
         node["prior"] == mcts_mod.NODE_TYPE_PRIOR[mcts_mod.MCTSNodeType.FINAL_ANSWER]
         for node in expand_final_nodes
     )
-    assert len(executor.role_inputs("final_answer_synthesizer")) == 2, (
-        "expand + synthesize should each call final_answer_synthesizer"
+    assert len(executor.role_inputs("answer_generator")) >= 1, (
+        "expand's terminal answer comes from ANSWER_GENERATOR"
+    )
+    assert len(executor.role_inputs("final_answer_synthesizer")) == 1, (
+        "only ``synthesize`` calls the synthesizer"
     )
 
 
@@ -736,7 +744,13 @@ async def test_expansion_grounds_subanswers_in_gathered_evidence(monkeypatch):
     await graph.ainvoke(_state(max_iterations=1))
 
     assert evidence.calls, "expand must call gather_evidence for new subquestions"
-    assert evidence.calls[0]["subquestions"] == ["What is France's capital?"]
+    # Not calls[0]: ``expand`` runs ``_reverify_memory`` first, which issues its own
+    # gather_evidence pass over existing memory facts. Match on the subquestion
+    # instead of the call index so the assertion survives that ordering.
+    assert any(
+        call["subquestions"] == ["What is France's capital?"]
+        for call in evidence.calls
+    ), f"no gather_evidence call for the new subquestion; saw {[c['subquestions'] for c in evidence.calls]}"
 
     answer_inputs = executor.role_inputs("answer_generator")
     assert answer_inputs, "expand must answer subquestions"
@@ -828,9 +842,12 @@ async def test_answerable_signal_counts_toward_semantic_sufficiency(monkeypatch)
     assert final["semantic_sufficiency_signals"] >= 1, (
         "answerable decomposition must register a semantic-sufficiency signal"
     )
-    final_nodes = _nodes_of_type(final["tree"], "final_answer")
+    # See above: the child's text comes from ANSWER_GENERATOR, so identify it
+    # structurally (a FINAL_ANSWER node parented under the tree) rather than by the
+    # synthesizer's canned string.
     assert any(
-        "Expand final." in str(node.get("content", {})) for node in final_nodes
+        node.get("parent_id") is not None
+        for node in _nodes_of_type(final["tree"], "final_answer")
     ), "answerable signal must emit a FINAL_ANSWER child from expand"
 
 
@@ -844,5 +861,9 @@ def test_search_mcts_config_exposes_termination_knobs():
     assert cfg.search.mcts.high_confidence_threshold == 0.9
     assert cfg.search.mcts.semantic_sufficiency_count >= 1
     assert cfg.search.mcts.convergence_patience >= 1
-    assert cfg.search.mcts.max_simulation_depth == 3
+    # A tuned value, not a contract: config.yaml overrides the MCTSConfig default,
+    # so pinning the number here just breaks whenever the depth is retuned.
+    assert cfg.search.mcts.max_simulation_depth >= 1
+    assert cfg.search.mcts.min_iterations >= 0
+    assert isinstance(cfg.search.mcts.branch_local_memory, bool)
     assert cfg.search.mcts.final_answer_min_depth == 2

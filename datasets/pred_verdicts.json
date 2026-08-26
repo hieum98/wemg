@@ -1,0 +1,249 @@
+{
+  "_doc": "Per-row judgement of the A0 prediction against reality, not against the gold string. FORMAT_ONLY/ALIAS = factually correct, sub-EM failed on presentation. Adjudicated by reading the prediction against known fact + gathered web evidence.",
+  "When was the person who shared the Nobel Prize in Physics in 1954 with Max Born born?": {
+    "pred": "8 January 1891",
+    "gold": "January 8, 1891",
+    "verdict": "FORMAT_ONLY",
+    "why": "Identical date, DMY vs MDY."
+  },
+  "When did the war that Neil Armstrong served in end?": {
+    "pred": "27 July 1953",
+    "gold": "July 27, 1953",
+    "verdict": "FORMAT_ONLY",
+    "why": "Identical date (Korean War armistice), DMY vs MDY."
+  },
+  "When was the person who delivered the \"Quit India\" speech born?": {
+    "pred": "2 October 1869",
+    "gold": "October 2, 1869",
+    "verdict": "FORMAT_ONLY",
+    "why": "Identical date (Gandhi), DMY vs MDY."
+  },
+  "Where was the person who shared the Nobel Prize in Physics in 1954 with Max Born born?": {
+    "pred": "Oranienburg, near Berlin",
+    "gold": "Oranienburg, Germany",
+    "verdict": "ALIAS",
+    "why": "Same place (Walther Bothe, Oranienburg); the qualifier differs, the town matches."
+  },
+  "Who was mayor of New York City when Fiorello H. La Guardia was born?": {
+    "pred": "William R. Grace",
+    "gold": "William Russell Grace",
+    "verdict": "ALIAS",
+    "why": "Same person, middle name abbreviated."
+  },
+  "What was the father of the last surviving Canadian father of Confederation?": {
+    "pred": "Rev. Charles Tupper",
+    "gold": "Charles Tupper Sr.",
+    "verdict": "ALIAS",
+    "why": "Same person \u2014 Charles Tupper Sr. was a Baptist minister; 'Rev.' vs 'Sr.' honorific."
+  },
+  "Who was the father of the father of information theory?": {
+    "pred": "Claude Shannon Sr.",
+    "gold": "Claude Sr.",
+    "verdict": "ALIAS",
+    "why": "Same person, and the GOLD is the partial name \u2014 the prediction is strictly more complete."
+  },
+  "Who was the father of the father of psychoanalysis?": {
+    "pred": "Jacob Kolloman Freud",
+    "gold": "Jacob Freud",
+    "verdict": "ALIAS",
+    "why": "Same person; the prediction includes the middle name Kolloman."
+  },
+  "Who is the mother of the father of Barack Obama?": {
+    "pred": "Habiba Akumu Obama",
+    "gold": "Habiba Akumu Nyanjango",
+    "verdict": "ALIAS",
+    "why": "Same person; Nyanjango is the maiden name, Obama the married name."
+  },
+  "Who directed the highest grossing film?": {
+    "pred": "James Cameron",
+    "gold": "James Cameroon",
+    "verdict": "GOLD_DEFECTIVE",
+    "why": "Prediction is correct; the GOLD is misspelt."
+  },
+  "Who is the predecessor of the longest-reigning British monarch?": {
+    "pred": "King George VI",
+    "gold": "George VI\n",
+    "verdict": "GOLD_DEFECTIVE",
+    "why": "Prediction correct; gold has a trailing newline so no string can match it."
+  },
+  "When was the longest bridge in the world opened?": {
+    "pred": "2011",
+    "gold": "30 June 2011",
+    "verdict": "UNDER_SPECIFIED",
+    "why": "Right year, but the question asks when and the gold fixes the day. Genuinely incomplete."
+  },
+  "When did the president who set the precedent of a two term limit leave office?": {
+    "pred": "1797",
+    "gold": "March 4, 1797",
+    "verdict": "UNDER_SPECIFIED",
+    "why": "Right year (Washington), missing month/day."
+  },
+  "When was the first location of the world's largest coffeehouse chain opened?": {
+    "pred": "1971 at Seattle's Pike Place Market",
+    "gold": "March 30, 1971",
+    "verdict": "UNDER_SPECIFIED",
+    "why": "Right year and place, missing the date."
+  },
+  "In what year was the tallest lighthouse completed?": {
+    "pred": "1990",
+    "gold": "1902",
+    "verdict": "CONTESTABLE",
+    "why": "1990 = Jeddah Light (133m), widely cited as the world's tallest lighthouse. 1902 = Ile Vierge, tallest *traditional/stone* one. The question does not state the qualifier, so the prediction is defensible."
+  },
+  "The most populous city in Punjab is how large (area wise)?": {
+    "pred": "1,772 square kilometers",
+    "gold": "310 square kilometers",
+    "verdict": "CONTESTABLE",
+    "why": "1,772 km2 = Lahore (Punjab, Pakistan); 310 km2 = Ludhiana (Punjab, India). The question does not disambiguate the two Punjabs."
+  },
+  "In 2016, who was the host of the longest running American game show?": {
+    "pred": "Pat Sajak",
+    "gold": "Drew Carey",
+    "verdict": "WRONG",
+    "why": "Pat Sajak hosts Wheel of Fortune, the longest-running *syndicated* game show. The Price Is Right is the longest-running American game show; Drew Carey hosted it in 2016."
+  },
+  "In what year was the tallest lattice tower completed?": {
+    "pred": "2000",
+    "gold": "2012",
+    "verdict": "WRONG",
+    "why": "Tokyo Skytree (2012) is the tallest lattice tower."
+  },
+  "In what year was the tallest fixed steel structure completed?": {
+    "pred": "2011",
+    "gold": "1988",
+    "verdict": "WRONG",
+    "why": "Bullwinkle platform, 1988."
+  },
+  "In what year was the tallest self-supporting tower completed?": {
+    "pred": "2009",
+    "gold": "2012",
+    "verdict": "WRONG",
+    "why": "Tokyo Skytree, 2012."
+  },
+  "When did Nirvana's second most selling studio album come out?": {
+    "pred": "September 24, 1991",
+    "gold": "September 13, 1993",
+    "verdict": "WRONG",
+    "why": "24 Sep 1991 is Nevermind, the BEST-selling album. The second is In Utero (1993) \u2014 the ordinal hop failed."
+  },
+  "When did the first prime minister of the Russian Empire come into office?": {
+    "pred": "20 October 1905",
+    "gold": "November 6, 1905",
+    "verdict": "CALENDAR",
+    "why": "Same event in the Julian (Old Style) calendar; Witte took office 24 Oct O.S. = 6 Nov N.S. The prediction's 20 October is neither, so it is off by a few days rather than a pure calendar restatement."
+  },
+  "How much protein in four boiled egg yolks?": {
+    "pred": "10.112 grams",
+    "gold": "10.8",
+    "verdict": "WRONG",
+    "why": "Close but a different figure; egg-size dependent, though not close enough to call equal."
+  },
+  "Who produced the longest running video game franchise?": {
+    "pred": "Nintendo Co., Ltd. produced the longest running video game franchise, the Mario franchise.",
+    "gold": "MECC",
+    "verdict": "WRONG",
+    "why": "The Oregon Trail (1971, MECC) predates Mario (1981)."
+  },
+  "Who was the father of the father of behaviorism?": {
+    "pred": "John B. Watson Sr.",
+    "gold": "Pickens Butler Watson",
+    "verdict": "WRONG",
+    "why": "John B. Watson's father was Pickens Butler Watson; the prediction invented a 'Sr.' form."
+  },
+  "What is the third letter of the top level domain of the military?": {
+    "pred": "i",
+    "gold": "l",
+    "verdict": "WRONG",
+    "why": ".mil -> m,i,l; 'i' is the second letter."
+  },
+  "Who founded the city where the founder of geometry lived?": {
+    "pred": "Alexandru Ghica founded Alexandria, the city where Euclid lived.",
+    "gold": "Alexander the Great",
+    "verdict": "WRONG",
+    "why": "Hallucination \u2014 Alexandru Ghica is a 19th-century Wallachian prince. Alexandria, Egypt was founded by Alexander the Great."
+  },
+  "In what year was the company that was founded as Sound of Music added to the S&P 500?": {
+    "pred": "not explicitly provided",
+    "gold": "1999",
+    "verdict": "WRONG",
+    "why": "ABSTAINED. A0 answered 1999 correctly from the same surfaces."
+  },
+  "The fourth largest city in Germany was originally called what?": {
+    "pred": "Colonia Agrippina",
+    "gold": "Colonia Claudia Ara Agrippinensium",
+    "verdict": "ALIAS",
+    "why": "Colonia Agrippina is the standard short form of the same Roman name for Cologne."
+  },
+  "What was the founding date of the university in which Plotonium was discovered?": {
+    "pred": "founded in 1868",
+    "gold": "March 23, 1868",
+    "verdict": "UNDER_SPECIFIED",
+    "why": "Right year (UC Berkeley), missing month/day the question's 'date' asks for."
+  },
+  "The third largest river (by discharge) in the world is in what countries?": {
+    "pred": "DR Congo, Republic of the Congo, ...",
+    "gold": "India and Bangladesh",
+    "verdict": "WRONG",
+    "why": "Named the Congo basin \u2014 the Congo is universally the SECOND largest by discharge, not the third. Off-by-one on the ordinal hop."
+  },
+  "What is the length of the second deepest river in the world?": {
+    "pred": "maximum depth of 200 meters",
+    "gold": "6,300 km",
+    "verdict": "WRONG",
+    "why": "Identified the Yangtze correctly but answered its DEPTH when the question asked its LENGTH."
+  },
+  "What is the maximum airspeed (in km/h) of the third fastest bird?": {
+    "pred": "240 km/h",
+    "gold": "320 km/h",
+    "verdict": "WRONG",
+    "why": "240 km/h appears on no standard birds-by-flight-speed list (389 / 320 / 169). The gold is itself contestable, but 240 is not a defensible reading of any of them."
+  },
+  "When was the philosopher that formulated the hard problem of consciousness born?": {
+    "pred": "20 April 1966",
+    "gold": "April 20, 1966",
+    "verdict": "FORMAT_ONLY",
+    "why": "Identical date (David Chalmers), DMY vs MDY."
+  },
+  "Who is the father of the father of Barack Obama?": {
+    "pred": "Barack Obama Sr.",
+    "gold": "Hussein Onyango Obama",
+    "verdict": "WRONG",
+    "why": "Answered Obama's father, not his grandfather \u2014 one hop short."
+  },
+  "Who is the largest aircraft carrier in the world is named after?": {
+    "pred": "Gerald Ford, the 38th president",
+    "gold": "Gerald R. Ford",
+    "verdict": "ALIAS",
+    "why": "Same person; the middle initial is omitted."
+  },
+  "What is the lowest elevation of the longest railway tunnel?": {
+    "pred": "794 meters above sea level",
+    "gold": "312 m",
+    "verdict": "WRONG",
+    "why": "312 m is the Gotthard Base Tunnel's lowest point; 794 m is a portal/approach elevation."
+  },
+  "When did the person who said \"Cogito, ergo sum.\" die?": {
+    "pred": "11 February 1650",
+    "gold": "February 11, 1650",
+    "verdict": "FORMAT_ONLY",
+    "why": "Identical date (Descartes), DMY vs MDY."
+  },
+  "How many people died in the second most powerful earthquake ever recorded?": {
+    "pred": "139 people",
+    "gold": "131",
+    "verdict": "CONTESTABLE",
+    "why": "1964 Alaska quake: 131 is the usual figure, 139 appears in sources counting later tsunami deaths. A0 hedged '131 to 139' and scored."
+  },
+  "In what year was the current tallest wooden lattice tower completed?": {
+    "pred": "unknown based on the available evidence",
+    "gold": "1935",
+    "verdict": "WRONG",
+    "why": "ABSTAINED. Gliwice Radio Tower, 1935."
+  },
+  "In what country was the only cruise line that flies the American flag incorporated in?": {
+    "pred": "Bahamas",
+    "gold": "Bermuda",
+    "verdict": "WRONG",
+    "why": "NCL America is the only US-flagged cruise line; its parent Norwegian Cruise Line Holdings is incorporated in Bermuda, not the Bahamas. A0 answered Bermuda correctly."
+  }
+}

@@ -55,6 +55,7 @@ from ..roles import (
 from ._memory_text import textualize_graph as _textualize_graph
 from .cot import (
     Clear,
+    _LOW_CONFIDENCE,
     INTENT_OPEN,
     N_SUBQUESTIONS,
     PLAN_ACTION_NONE,
@@ -64,11 +65,17 @@ from .cot import (
     apply_retractions,
     build_cot_graph,
     build_plan_ledger,
+    N_PLANS,
+    abstention_signal,
     classify_discharge,
     gather_evidence,
+    mark_conflicted_intents,
     latest_intermediate_answer,
+    mark_stalled_intents,
     pool_subquestions,
     render_plan_for_prompt,
+    select_plan,
+    _discharge_reason,
     _entity_label_to_qid,
 )
 from .kg_search import build_kg_search_graph
@@ -187,8 +194,14 @@ class MCTSState(TypedDict, total=False):
     plan_ledger: List[Dict[str, Any]]
     plan_action: str
     plan_action_log: Annotated[List[Dict[str, Any]], operator.add]
+    # Append-only across the run; survives replans (see CoTState).
+    plan_attempts_log: Annotated[List[Dict[str, Any]], operator.add]
+    # Confidence signal from unmet intents; metadata only, never a prompt input.
+    abstention: Dict[str, Any]
     # This iteration's consolidation evictions, for the falsified-discharge test.
     last_retractions: List[Dict[str, Any]]
+    # Mutually-contradicting [Retrieval] groups the consolidator kept (see CoTState).
+    last_unresolved_conflicts: List[List[str]]
 
     # Memory facts already re-verified (recheck-on-retrieval); each distinct
     # fact is re-grounded once over the run to corroborate/gap-fill/evict it.
@@ -344,12 +357,14 @@ def _merge_ev(*evs: Dict[str, Any]) -> Dict[str, Any]:
     bindings: List[Any] = []
     attempts: List[Any] = []
     intents: List[Any] = []
+    low_conf = 0
     for ev in evs:
         if not ev:
             continue
         facts.extend(ev.get("facts") or [])
         triples.extend(ev.get("triples") or [])
         bindings.extend(ev.get("bindings") or [])
+        low_conf += int(ev.get("low_confidence") or 0)
         attempts.extend(ev.get("attempts") or [])
         intents.extend(ev.get("intents") or [])
     return {
@@ -358,6 +373,7 @@ def _merge_ev(*evs: Dict[str, Any]) -> Dict[str, Any]:
         "bindings": bindings,
         "attempts": attempts,
         "intents": intents,
+        "low_confidence": low_conf,
     }
 
 
@@ -396,6 +412,12 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
     plan_cfg = getattr(getattr(config, "search", None), "plan", None)
     plan_enabled = bool(getattr(plan_cfg, "enabled", False))
+    stall_after_attempts = max(
+        1, int(getattr(plan_cfg, "stall_after_attempts", 2) or 2)
+    )
+    memory_disagreement_threshold = float(
+        getattr(plan_cfg, "memory_disagreement_threshold", 4.0) or 4.0
+    )
 
     # Compile rollout + memory subgraphs once. These names are module globals so
     # the test harness can monkeypatch them before this builder runs.
@@ -509,6 +531,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         # ``subqs`` so it stays aligned with ``pooled.serves_intent``; an answer
         # with no attribution contributes None and closes no intent.
         bindings: List[tuple[Optional[int], str]] = []
+        low_confidence = 0
         for i, sq in enumerate(subqs):
             ans = answers[i] if i < len(answers) else None
             text = _answer_text(ans)
@@ -525,11 +548,20 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                     if i < len(pooled.serves_intent)
                     else None
                 )
-                bindings.append((intent_idx, text))
+                # Same gate as CoT: an answer the model itself labels low-confidence
+                # binds nothing, so a guess cannot compete with a grounded answer and
+                # read as genuine ambiguity.
+                if str(getattr(ans, "confidence_level", "") or "").strip().lower() in (
+                    _LOW_CONFIDENCE
+                ):
+                    low_confidence += 1
+                else:
+                    bindings.append((intent_idx, text))
         return nodes, False, {
             "facts": facts,
             "triples": list(evidence.get("raw_triples") or []),
             "bindings": bindings,
+            "low_confidence": low_confidence,
             "attempts": [
                 {"query": sq, "n_facts": len(facts)} for sq in subqs
             ],
@@ -739,24 +771,23 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         """
         if state.get("plan"):
             return {}
-        out, _ = await execute_role_lc(
+        question = state.get("question", "")
+        outs, _ = await execute_role_lc(
             registry,
             PLANNER,
-            PlanInput(
-                question=state.get("question", ""),
-                context=_join_memory_context(state),
-            ),
+            PlanInput(question=question, context=_join_memory_context(state)),
+            n=N_PLANS,
         )
-        if is_safe_default(out):
+        chosen, _runners_up = select_plan(outs, question, state.get("text_memory") or [])
+        if chosen is None:
             logger.error(
-                "[gen_plan] PLANNER returned no parseable output; searching "
-                "without a plan"
+                "[gen_plan] no PLANNER completion parsed; searching without a plan"
             )
             return {"plan": "", "plan_version": 0, "plan_ledger": []}
-        plan_text = str(getattr(out, "plan", "") or "").strip()
+        plan_text = str(getattr(chosen, "plan", "") or "").strip()
         ledger = build_plan_ledger(
-            list(getattr(out, "intents", None) or []),
-            list(getattr(out, "premises", None) or []),
+            list(getattr(chosen, "intents", None) or []),
+            list(getattr(chosen, "premises", None) or []),
         )
         result: Dict[str, Any] = {
             "plan": plan_text,
@@ -923,6 +954,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             "bindings": list(evidence.get("bindings") or []),
             "attempts": list(evidence.get("attempts") or []),
             "self_correct_status": evidence.get("self_correct_status") or "",
+            "low_confidence": int(evidence.get("low_confidence") or 0),
         }
 
         if not children:
@@ -1121,6 +1153,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             # survivors; only fall back to a neutral reward when none survive.
             outs = (r1, r2, r3)
             ratings: List[float] = []
+            by_view: Dict[str, float] = {}
             critiques: List[str] = []
             for view, out in zip(verifier_views, outs):
                 if is_safe_default(out):
@@ -1131,6 +1164,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                     )
                     continue
                 ratings.append(float(out.rating))
+                by_view[view] = float(out.rating)
                 critiques.append(f"Verifier ({view}): {out.reasoning}")
             if ratings:
                 reward = (sum(ratings) / len(ratings) - 5.0) / 5.0
@@ -1141,17 +1175,33 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                 reward = 0.0
         except Exception as e:  # noqa: BLE001 — neutral reward on parse failure (coe parity)
             logger.warning("Verifier reward computation failed; reward=0.0: %s", e)
-            reward, critiques, ratings = 0.0, [], []
+            reward, critiques, ratings, by_view = 0.0, [], [], {}
 
         return {
             "reward": reward,
             "simulation_result": {
                 **sr,
                 "verifier_critiques": critiques,
-                # Retained for diagnostics: the per-view vector before averaging.
-                # Spread across the no-context / text-memory / graph-memory views
-                # is only interpretable once 0.0-on-failure is gone (above).
+                # The per-view vector before averaging. Spread is only interpretable
+                # once 0.0-on-failure is gone (above), which it now is.
                 "verifier_ratings": list(ratings),
+                # Keyed by view so the *direction* of disagreement is readable, not
+                # just its magnitude: an answer rated high closed-book and low against
+                # retrieved memory means the evidence we gathered does not support the
+                # line the search is on — a plan-level problem, not a wrong answer.
+                "verifier_by_view": dict(by_view),
+                "memory_disagreement": (
+                    round(
+                        by_view.get("no context", 0.0)
+                        - min(
+                            by_view.get("text memory", 10.0),
+                            by_view.get("graph memory", 10.0),
+                        ),
+                        3,
+                    )
+                    if len(by_view) >= 2
+                    else 0.0
+                ),
             },
         }
 
@@ -1177,10 +1227,20 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
         best = float(state.get("best_value", 0.0) or 0.0)
         no_imp = int(state.get("iterations_without_improvement", 0) or 0)
+        # ``min_iterations`` is a floor on *termination*, so it must also be a floor
+        # on the counter that triggers it. Accumulating ``no_imp`` during the floor
+        # made the effective budget ``min_iterations + 1`` rather than
+        # ``num_iterations``: with min_iterations=5 and convergence_patience=5, a
+        # best reward landing at iteration 1 (common — memory is cleanest before it
+        # fills) leaves no_imp at 5 the moment the checks switch on, so
+        # ``route_after_iteration`` terminates at iteration 6 of a configured 20.
+        # Patience now measures iterations without improvement *since the checks
+        # became live*, which is what it is documented to mean.
+        counting_live = int(state.get("iteration", 0) or 0) >= min_iters
         if leaf_is_terminal:
             if reward > best:
                 best, no_imp = reward, 0
-            elif is_new_terminal:
+            elif is_new_terminal and counting_live:
                 no_imp += 1
 
         signals = int(state.get("semantic_sufficiency_signals", 0) or 0)
@@ -1272,6 +1332,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             "graph_memory": new_graph,
             "entity_dict": new_entity_dict,
             "last_retractions": retractions,
+            "last_unresolved_conflicts": list(result.get("unresolved_conflicts") or []),
             "new_raw_triples": Clear(),
             "new_retrieval_texts": Clear(),
         }
@@ -1296,6 +1357,24 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                 }
             )
             out["snapshots"] = {path[-1]: snap}
+            # Footprint is the open question with branch-local memory on: one
+            # deep-copied DiGraph per node, and expansion mints ~5 children plus a
+            # ~16-node rollout chain per iteration. Log it so the cost is measured
+            # from a real run rather than estimated.
+            existing = state.get("snapshots") or {}
+            total_nodes = sum(
+                getattr(s.get("graph_memory"), "number_of_nodes", lambda: 0)()
+                for s in existing.values()
+            ) + snap["graph_memory"].number_of_nodes()
+            total_mem_items = sum(
+                len(s.get("text_memory") or []) for s in existing.values()
+            ) + len(snap["text_memory"])
+            logger.info(
+                "[snapshots] %d stored; %d graph nodes and %d memory items in total",
+                len(existing) + 1,
+                total_nodes,
+                total_mem_items,
+            )
         return out
 
     async def plan_gate(state: MCTSState) -> Dict[str, Any]:
@@ -1321,19 +1400,43 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             for idx, text in (plan_view.get("bindings") or [])
             if isinstance(text, str) and text.strip()
         ]
-        ledger = apply_bindings(ledger, bindings, label_to_qid, hop)
-        ledger = apply_retractions(ledger, state.get("last_retractions") or [])
+        # Record attempts BEFORE binding: expansion's queries were issued against
+        # whatever was open at the time, and ``apply_bindings`` closes intents in the
+        # same pass. Appending afterwards left ``attempts`` empty on every closed
+        # intent, so the stall branch could never fire in this graph at all.
+        open_before = [
+            i for i, e in enumerate(ledger) if e.get("status") == INTENT_OPEN
+        ]
         for attempt in plan_view.get("attempts") or []:
-            # Attempts are recorded against every open intent: MCTS expansion
-            # fans out over the whole question rather than one plan step, so a
-            # finer attribution would be invented rather than observed.
-            for entry in ledger:
-                if entry.get("status") == INTENT_OPEN:
-                    entry["attempts"] = list(entry.get("attempts") or []) + [
-                        {**attempt, "hop": hop}
-                    ]
+            # Attributed to every intent that was open: MCTS expansion fans out over
+            # the whole question rather than one plan step, so a finer attribution
+            # would be invented rather than observed.
+            for i in open_before:
+                ledger[i]["attempts"] = list(ledger[i].get("attempts") or []) + [
+                    {**attempt, "hop": hop}
+                ]
+        ledger = apply_bindings(
+            ledger, bindings, label_to_qid, hop, state.get("text_memory") or []
+        )
+        ledger = apply_retractions(ledger, state.get("last_retractions") or [])
+        ledger = mark_conflicted_intents(
+            ledger, state.get("last_unresolved_conflicts") or []
+        )
+        ledger = mark_stalled_intents(ledger, max_attempts=stall_after_attempts)
 
-        action, intent_idx, competing = classify_discharge(ledger)
+        sr = state.get("simulation_result") or {}
+        disagreement = float(sr.get("memory_disagreement") or 0.0)
+        # Exhaustion in MCTS: nothing left open anywhere in the plan while the search
+        # is still producing candidates the verifiers do not endorse.
+        exhausted = float(state.get("best_value", 0.0) or 0.0) < high_conf
+        action, intent_idx, competing = classify_discharge(ledger, exhausted=exhausted)
+        # B: an answer rated high closed-book but low against retrieved memory means
+        # the evidence gathered does not support the line the search is on. That is a
+        # plan-level signal, distinct from a wrong answer. Threshold is configurable
+        # and defaults high, because the verifier's own noise floor is unmeasured
+        # (experiment E5) and a low bar here would fire on sampling noise.
+        if action == PLAN_ACTION_NONE and disagreement >= memory_disagreement_threshold:
+            action = PLAN_ACTION_REPLAN
         # "unsupported" from the self-corrector means the answer could not be
         # checked against anything — the shape of a false presupposition, which is
         # a plan-level failure rather than a wrong answer.
@@ -1353,6 +1456,22 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             "competing_bindings": competing,
             "plan_version": int(plan_view.get("plan_version", 0) or 0),
             "self_correct_status": plan_view.get("self_correct_status") or "",
+            # Which branch fired. Omitting this recorded ``reason=None`` in the log,
+            # so a fire was counted but not attributable.
+            # Shared helper so the precedence chain cannot drift between the graphs.
+            "reason": (
+                "unsupported"
+                if plan_view.get("self_correct_status") == "unsupported"
+                and intent_idx is None
+                else "memory_disagreement"
+                if intent_idx is None and disagreement >= memory_disagreement_threshold
+                else _discharge_reason(ledger, intent_idx, action)
+            ),
+            "memory_disagreement": disagreement,
+            "verifier_by_view": dict(sr.get("verifier_by_view") or {}),
+            "answers_seen": len(bindings),
+            "answers_unattributed": sum(1 for idx, _ in bindings if idx is None),
+            "answers_low_confidence": int(plan_view.get("low_confidence") or 0),
             # MCTS never arms the replan edge (see the docstring).
             "armed": False,
         }
@@ -1418,11 +1537,14 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         )
         concise = getattr(out, "concise_answer", "") or final_text
         reasoning = getattr(out, "reasoning", "") or ""
-        return {
+        out_state: Dict[str, Any] = {
             "final_answer": str(final_text),
             "concise_answer": str(concise),
             "reasoning": str(reasoning),
         }
+        if plan_enabled:
+            out_state["abstention"] = abstention_signal(state.get("plan_ledger") or [])
+        return out_state
 
     # ── Routing ────────────────────────────────────────────────────────────────
 

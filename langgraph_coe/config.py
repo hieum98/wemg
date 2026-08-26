@@ -82,6 +82,17 @@ class LLMConfig(BaseModel):
             max_tokens=1024,
             enable_thinking=False,
         ),
+        # Planning tier. A plan makes no claim about the world, so there is nothing
+        # to be right about and nothing to verify — which makes breadth, not
+        # precision, the thing worth buying. Hotter than the reasoning tiers so the
+        # n=3 samples actually differ; ``select_plan`` then picks among them. Keep
+        # reasoning roles cold and verified.
+        "plan": TierConfig(
+            model_name="Qwen3-Next-80B-A3B-Thinking-FP8",
+            temperature=1.0,
+            max_tokens=4096,
+            enable_thinking=True,
+        ),
     }
     role_tiers: Dict[str, str] = {
         # Heavy reasoning roles
@@ -90,6 +101,7 @@ class LLMConfig(BaseModel):
         "final_answer_synthesizer": "heavy",
         "subquestion_generator": "heavy",
         "reasoning_synthesizer": "heavy",
+        "planner": "plan",
         # Medium structured-output roles
         "memory_consolidation": "medium",
         "relation_extraction": "medium",
@@ -215,16 +227,57 @@ class PlanConfig(BaseModel):
 
     Off by default: the A0 baseline must stay byte-identical to the pre-plan
     behaviour so the ablation is meaningful.
+
+    **Measured effect, 62 rows, paired, identical code:** in CoT the plan scored
+    36/62 against 31/62 without it and used 4.94 subquestions per question against
+    5.66 — but only 17 rows were discordant (11 to 6), a two-sided sign test of
+    p = 0.33, so the accuracy difference is not established.
+
+    **In MCTS it is actively harmful to the search, and the reason matters.** With
+    the plan, sibling rollouts ask the same things: mean sibling-subtree overlap
+    23.1% against 10.2%, and distinct subquestions per question 6.3 against 9.9 — so
+    the tree covers roughly a third less ground for the same cost, at identical
+    accuracy (14/23 both). The design treated sibling re-decomposition as duplicated
+    work; in a tree search it is *exploration*, and a shared plan converts it into
+    repetition. Leave the plan off for MCTS until the plan is per-node forkable.
     """
 
     enabled: bool = False
     # 0 keeps ``plan_gate`` in log-only mode: ``plan_action`` is computed and
-    # recorded, but the router never takes the replan edge. The trigger's fire
-    # rate is unmeasured, so measure before spending a heavy PLANNER call on it.
+    # recorded, but the router never takes the replan edge.
+    #
+    # Measured, not merely cautious. Armed at 2 on the 62-row set, replan fired on 20
+    # questions and scored 10 against 9 for both the log-only and the no-plan arm on
+    # those same 20 — while costing 2.55 hops / 8.95 subquestions against 1.24 / 3.02
+    # on the questions that did not replan, plus up to 2 extra PLANNER calls. The
+    # trigger is not broken; it fires on referents that are genuinely ambiguous in the
+    # world, and rewriting *what to ask* cannot settle that.
     replan_max: int = 0
     # Refuse to replan within this many iterations of ``max_depth`` — a plan
     # rewritten on the last hop cannot be acted on.
     replan_min_depth_headroom: int = 2
+    # Attempts against one intent before it counts as stalled. This is the only
+    # trigger branch that fires when nothing surprising happens, so it is what keeps
+    # the plan from being revised never rather than rarely: contested and falsified
+    # discharge both need an *event*, and an intent that quietly returns nothing
+    # produces none.
+    #
+    # 3, from the run logs: 93-95% of intents that eventually closed did so within 3
+    # attempts, but only 81-89% within 2. It must also stay above the per-intent
+    # pooling cap (``cot._MAX_PER_INTENT``), or a single hop of ordinary work
+    # exhausts the budget and every unresolved intent reads as stalled.
+    stall_after_attempts: int = 3
+    # MCTS only: minimum gap between the closed-book verifier rating and the lowest
+    # memory-grounded one before it counts as the evidence disagreeing with the
+    # answer.
+    #
+    # Measured against the verifier's own noise floor (E5,
+    # ``scripts/verifier_noise_floor.py``): five identical calls per case at
+    # temperature 0.7 spread a mean of 1.5 and a max of 3.0 over 30 calls. A
+    # threshold at or below 3.0 therefore fires on resampling alone. 4.0 clears the
+    # observed floor by one point, which is a thinner margin than it looks — the max
+    # over more samples is likely higher.
+    memory_disagreement_threshold: float = 4.0
 
 
 class SearchConfig(BaseModel):

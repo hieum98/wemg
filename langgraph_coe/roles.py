@@ -170,6 +170,13 @@ class PlanInput(pydantic.BaseModel):
         None,
         description="Queries already issued and what they yielded, to avoid repeats.",
     )
+    resolved: Optional[List[str]] = pydantic.Field(
+        None,
+        description=(
+            "Intents already settled, with the referent each bound to. The planner "
+            "must NOT re-list these: a reworded restatement re-opens finished work."
+        ),
+    )
 
     def __str__(self) -> str:
         parts = [f"question:\n{self.question}", f"context:\n{self.context}"]
@@ -183,6 +190,11 @@ class PlanInput(pydantic.BaseModel):
         if self.attempts:
             joined = "\n".join(f"- {a}" for a in self.attempts)
             parts.append(f"already_attempted:\n{joined}")
+        # Rendered last among the replan fields: this is the one the model most often
+        # violated, and the input guard trims the middle of an oversized payload.
+        if self.resolved:
+            joined = "\n".join(f"- {r}" for r in self.resolved)
+            parts.append(f"already_resolved_do_not_relist:\n{joined}")
         return "\n\n".join(parts)
 
 
@@ -655,7 +667,7 @@ Preserve the question's geographic, temporal and categorical scope. Do NOT narro
 ## Revising an existing plan
 When `current_plan` is provided you are revising, not restarting.
 1. Read `failure`: it states mechanically what went wrong (an intent bound two different referents, a premise was contradicted by retrieval, a route yielded nothing).
-2. Keep every intent that is still sound and already resolved. Do not re-ask what the context already answers.
+2. **Everything under `already_resolved_do_not_relist` is finished. Do not restate it, in any wording.** Those intents are already bound to a referent; your `intents` array must contain only the work that REMAINS. Rewording a settled intent ("determine the opening date of the longest bridge" → "determine the date the identified bridge was opened") does not preserve it — it re-opens it, and the system pays to answer it a second time. Measured: this re-opened an already-resolved intent on half the questions that replanned.
 3. Rewrite only the part that failed. If two referents competed, add an intent that discriminates between them (a distinguishing attribute, a date, a defining criterion) rather than re-asking the same ambiguous question.
 4. Consult `already_attempted` and do not re-issue a framing that yielded nothing. Change the angle.
 5. If a presupposition turned out to be false, do not keep asking about the thing that does not exist — restate the intent to establish what IS the case.
@@ -674,8 +686,16 @@ If `intermediate_answer` is provided, it is the resolved result of the PREVIOUS 
 
 ## Plan
 If `plan` is provided, it is a standing statement of what still needs to be found out. It contains questions, never facts — treat it as direction, not as evidence, and never answer a subquestion from it.
-- Work on the earliest plan intent that the context does not already answer. Skip intents memory already covers.
-- Instantiate the plan against the context: where the plan says "her husband" and memory has resolved who "she" is, emit the concrete subquestion.
+- **Cover EVERY open intent you can ask right now, in this one round — not just the first.** Each subquestion is retrieved for in parallel, so asking three askable intents together costs the same wall-clock as asking one and gathers three times the evidence. Asking one intent per round and waiting is the single most expensive mistake you can make here.
+- **One subquestion per intent per round.** Breadth means *more intents*, never the same intent reworded. `What was the original name of Cologne?` and `What is the original name of Cologne?` retrieve the same documents and cost twice as much; the second is waste, not a second angle.
+  - The ONE exception is a genuinely different retrieval target for the same intent. For a ranking or ordinal ("the second most selling album", "the third fastest bird"), the specific item and the COMPLETE RANKED LIST are different targets, so ask both — otherwise you will retrieve the first-ranked item and mistake it for the one asked about. That is at most 2 subquestions for that intent, and only for ordinals.
+  - Reworded restatements of the specific item do NOT count as a different target. If you cannot say what *different documents* a second subquestion would find, do not emit it.
+- **On an intent marked ambiguous, stuck, or contradicted, change the question — do not repeat it.** Its status says the framing already failed; re-issuing it retrieves the same thing again. Ask what would tell the two candidates apart, or ask about a different property of the same referent.
+- Skip intents the context already answers, and instantiate the rest against it: where the plan says "her husband" and memory has resolved who "she" is, emit the concrete subquestion.
+- **Do not emit a subquestion you cannot yet write concretely** — but this is a rule about *that one* subquestion, not a reason to stop early. Omit the un-askable intent and still ask everything else that is askable this round.
+  - BAD: `When was the album [album name from previous answer] released?` ← a placeholder is not a question; retrieval will search for that literal text and return noise.
+  - BAD: `When was the album identified as the second most selling released?` ← still not askable; nothing names the album.
+  - GOOD: this round ask BOTH `What is the band's second most selling studio album?` AND `What are the band's studio albums ranked by sales?`; ask about the release date next round, once `intermediate_answer` names the album.
 - You may still emit a subquestion the plan did not anticipate when the context reveals a gap the plan missed. Do not force every subquestion to fit the plan.
 - Emit `serves_intent` as a parallel array to `subquestions`: the 0-based index of the plan intent each subquestion advances, or -1 for one the plan did not anticipate. If no `plan` was provided, set it to null.
 - Nothing in `plan` counts as context for judging `is_answerable`. A plan describing what to find out is not evidence that it has been found, and an unmet plan intent is not a conflict to resolve.
@@ -860,10 +880,29 @@ Build a superior answer that:
 - Introduces no facts absent from the candidates or supporting evidence
 Then verify: Is the answer directly responsive to the question? Is every factual claim traceable to at least one reliable source? Revise if not.
 
+## The concise_answer contract
+`concise_answer` is read on its own, by something that has not seen the question. It is not
+a summary of your answer — it is the answer, and these rules are about its FORM only. None
+of them licenses changing what you believe to be true.
+
+1. **The value, and nothing carrying it.** Start with the answer itself. Not "René Descartes
+   died on 11 February 1650" but "11 February 1650". Not "Gerald Ford, the 38th president of
+   the United States" but "Gerald Ford". Any lead-in, restatement of the question, or
+   trailing gloss belongs in `final_answer`.
+2. **Answer at the granularity asked.** "When did X happen?" wants the full date if the
+   evidence supports one — "1797" where the evidence says "4 March 1797" is an incomplete
+   answer, not a concise one. If the evidence only supports the year, give the year.
+3. **Keep the unit or qualifier the question asks for**, once: "310 square kilometres", not
+   bare "310" and not "approximately 310 to 311.32 square kilometres" — a range is not an
+   answer to a question that asked for a value.
+4. **Never put a hedge, a caveat or an "unknown" in `concise_answer`.** If you cannot answer,
+   leave it as your single best candidate and put the uncertainty in `confidence_level` and
+   `final_answer`.
+
 ## Output Format:
 Respond with a JSON object with exactly these keys:
 - final_answer: string — complete, well-reasoned answer to the question
-- concise_answer: string — minimal wording, direct answer only (e.g. a name, date, or one sentence)
+- concise_answer: string — the direct answer only, under the contract above
 - reasoning: string — how conflicts were resolved and which evidence anchored the final answer
 - confidence_level: string — one of: "high", "medium", "low", or "uncertain"
 """
