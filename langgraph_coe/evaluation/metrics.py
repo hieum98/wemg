@@ -35,6 +35,72 @@ def compute_sub_em(predicted: str, correct_answers: Union[str, List[str]]) -> fl
     return 0.0
 
 
+import re as _re
+
+# A leading wrapper on a gold answer: an optional preposition, an optional determiner, and
+# an optional "<head noun> of". Matches "at the city of ...", "The ...", "in the state of
+# ...". Only ever stripped from the GOLD, and only under the two-token guard below.
+_GOLD_WRAPPER = _re.compile(
+    r"^(?:(?:at|in|on|to|from|by|near|within)\s+)?"
+    r"(?:(?:the|a|an)\s+)?"
+    r"(?:(?:city|town|state|county|province|region|village|municipality|"
+    r"borough|district|country|island)\s+of\s+)?",
+    _re.I,
+)
+
+
+def _norm_answer(text: str) -> str:
+    return _re.sub(
+        r"\s+", " ", _re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+    ).strip()
+
+
+def compute_sub_em_relaxed(
+    predicted: str, correct_answers: Union[str, List[str]]
+) -> float:
+    """Sub-EM ignoring a gold answer's determiner/preposition wrapper.
+
+    **A diagnostic, not the headline metric.** :func:`compute_sub_em` requires the gold
+    string to appear in the prediction *verbatim*, so a gold that arrives wrapped —
+    ``"at the city of Cairo, Illinois"``, ``"The Australian Ballet"`` — can never be matched
+    by a correctly concise answer (``"Cairo, Illinois"``, ``"Australian Ballet"``). Measured
+    over 1,839 wrong answers across 20 runs, **28 (1.52%)** are of exactly this kind: right
+    answer, scored zero.
+
+    That matters beyond the absolute number. Those questions are scored wrong in *both* arms
+    of every paired comparison, so they never enter the discordant pool — they silently cost
+    the sign test power in every A/B in this project.
+
+    Semantics stay *containment*, as in :func:`compute_sub_em` — only the gold's wrapper is
+    removed, never its content. The two-token guard is what keeps that safe: stripping
+    ``"the state of Washington"`` leaves the single token ``"Washington"``, which
+    ``"Washington D.C."`` would then satisfy even though it is a different place, so a
+    one-token residue is refused and the strict result stands. ``"at the city of Cairo,
+    Illinois"`` leaves ``"cairo illinois"`` and is allowed.
+
+    Still an upper bound, so report it beside sub-EM rather than instead of it: the wrapper
+    list is finite and a gold phrased outside it is unaffected either way.
+    """
+    if not predicted or not correct_answers:
+        return 0.0
+    if isinstance(correct_answers, str):
+        correct_answers = [correct_answers]
+    pred = _norm_answer(predicted)
+    if not pred:
+        return 0.0
+    for ans in correct_answers:
+        gold = _norm_answer(ans)
+        if not gold:
+            continue
+        if gold in pred:
+            return 1.0
+        core = _GOLD_WRAPPER.sub("", gold, count=1).strip()
+        # A one-token residue is too weak to match on: see the Washington case above.
+        if core and core != gold and len(core.split()) >= 2 and core in pred:
+            return 1.0
+    return 0.0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Acc — LLM judge via the langgraph_coe EVALUATOR role
 # ──────────────────────────────────────────────────────────────────────────────

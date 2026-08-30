@@ -1,0 +1,90 @@
+# SearXNG override config for the local metasearch fallback.
+#
+# Why this exists: ``ddgs`` is unreachable from this host (duckduckgo.com resolves
+# to an intercepted address and the connection times out), so the free tier in
+# ``tools/web.py`` had nothing behind it. SearXNG runs locally, aggregates engines
+# that *are* reachable, and has no key and no monthly quota — which is what the
+# free tier needs to be for a multi-hour eval sweep.
+#
+# ``use_default_settings`` keeps the upstream engine definitions and only patches
+# what we care about, so an image upgrade does not silently drop engines.
+use_default_settings: true
+
+general:
+  instance_name: "wemg-local"
+  # No public exposure, so the donation/contact chrome is noise.
+  contact_url: false
+
+server:
+  # Injected from the SEARXNG_SECRET env var by scripts/searxng_up.sh.
+  secret_key: "changeme"
+  # The limiter is bot protection for public instances. This one is bound to
+  # localhost and the only client is our own sweep, so leaving it on would mean
+  # rate-limiting ourselves — exactly the failure we are escaping.
+  limiter: false
+  image_proxy: false
+
+search:
+  # ``json`` is NOT in the upstream default; without it /search?format=json
+  # returns 403 and the whole provider looks broken.
+  formats:
+    - html
+    - json
+  # A hop issues several queries back to back; autocomplete would add upstream
+  # calls we never read.
+  autocomplete: ""
+  default_lang: "en"
+
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 12.0
+  pool_connections: 100
+  pool_maxsize: 20
+
+# Engine selection is empirical: every engine below was probed from this host over
+# 5 representative eval queries. Only ``bing`` and ``google cse`` returned results;
+# the rest are hard-walled and each one left enabled costs a per-search timeout.
+engines:
+  # ── Enabled: verified to answer from this host's IP ────────────────────────
+  # 47 results over the 5 probe queries, and rank-1 on all 5.
+  - name: bing
+    disabled: false
+    weight: 3
+  # 100 results over the same 5 probes — the deepest contributor, and the only
+  # engine that found "Ford Model T" for the compositional probe that Bing
+  # answered with dictionary pages for the word "founded".
+  - name: google cse
+    disabled: false
+    weight: 3
+  # Wikipedia/Wikidata are the domain match for MuSiQue (built from Wikipedia
+  # paragraphs) and unmetered. Note they populate ``infoboxes``, not ``results``,
+  # so tools/web.py harvests both keys.
+  - name: wikipedia
+    disabled: false
+    weight: 2
+  - name: wikidata
+    disabled: false
+    weight: 2
+
+  # ── Disabled: confirmed walled from this host, 5/5 probes ──────────────────
+  # DNS for duckduckgo.com is intercepted here and the TCP connect times out.
+  - name: duckduckgo
+    disabled: true
+  # Plain-web Google returns HTTP 200 but a near-empty JS shell to this
+  # datacenter IP (1 topic hit against Bing's 9). ``google cse`` above is the
+  # one that works; this is the scraper variant.
+  - name: google
+    disabled: true
+  # "Suspended: access denied" on 5/5 probes (HTTP 403 direct).
+  - name: mojeek
+    disabled: true
+  # "Suspended: CAPTCHA" on 5/5 probes.
+  - name: startpage
+    disabled: true
+  # "CAPTCHA" on 5/5 probes.
+  - name: qwant
+    disabled: true
+  # Rate-limits this IP (HTTP 429) when scraped. The keyed Brave *API* is a
+  # separate provider in tools/web.py and is the supported way in.
+  - name: brave
+    disabled: true

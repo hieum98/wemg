@@ -199,7 +199,10 @@ search:
   # Explicit plan channel. A plan states what to find out (interrogative, no
   # truth value) and conditions subquestion generation; it never enters memory.
   plan:
-    enabled: false          # false = A0 baseline, byte-identical to pre-plan behaviour
+    # On by default for cost, not accuracy: -24.8 LLM calls/question in CoT (p < 0.0001)
+    # at a measured accuracy null. Set false for the A0 baseline, which is byte-identical
+    # to pre-plan behaviour (the plan nodes are not added to the graph at all).
+    enabled: true
     replan_max: 0           # 0 = log-only: the gate computes plan_action but never routes
     replan_min_depth_headroom: 2
     stall_after_attempts: 2 # attempts against one intent before it counts as stalled

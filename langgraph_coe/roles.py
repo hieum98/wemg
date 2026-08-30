@@ -220,6 +220,15 @@ class PlanOutput(pydantic.BaseModel):
             "Empty when the plan rests only on the question itself."
         ),
     )
+    depends_on: Optional[List[int]] = pydantic.Field(
+        None,
+        description=(
+            "Parallel array to `intents` (same length and order). The 0-based index "
+            "of the EARLIER intent whose answer this one needs before it can be "
+            "asked, or -1 if it can be asked immediately. This is what makes the "
+            "prose's 'first ... then ...' machine-readable."
+        ),
+    )
 
 
 class AnswerGenerationInput(pydantic.BaseModel):
@@ -390,6 +399,28 @@ class FinalAnswerSynthesisInput(pydantic.BaseModel):
         "",
         description="Optional supporting evidence (e.g. structured knowledge graph triples).",
     )
+    resolved_findings: Optional[List[str]] = pydantic.Field(
+        None,
+        description=(
+            "Referents the reasoning resolved and corroborated against retrieval, "
+            "one per line. Facts with provenance — NOT the plan, which stays out of "
+            "synthesis because an unmet intent there invites treating a correct "
+            "answer as deficient. **Terminal intents only**: see scaffolding_findings."
+        ),
+    )
+    scaffolding_findings: Optional[List[str]] = pydantic.Field(
+        None,
+        description=(
+            "Referents that were resolved as *inputs* to the question — an "
+            "intermediate hop another intent depended on. Named explicitly rather "
+            "than omitted: they are already present in ``candidate_answers`` via "
+            "memory, so silently dropping them from the findings does not stop "
+            "synthesis returning one. Measured: answering with one of these runs at "
+            "8.5% with a plan against 4.7% without, and 87% of those answers are "
+            "wrong. Omitting them from resolved_findings did not change that ratio "
+            "(1.8x before and after), so they have to be labelled, not hidden."
+        ),
+    )
 
     def __str__(self):
         if self.candidate_scores and len(self.candidate_scores) == len(
@@ -408,6 +439,21 @@ class FinalAnswerSynthesisInput(pydantic.BaseModel):
         parts = [f"question:\n{self.question}", f"candidate_answers:\n{candidates_str}"]
         if self.context:
             parts.append(f"supporting_evidence:\n{self.context}")
+        # Rendered last so the input guard's middle-drop truncation cannot eat it:
+        # this is the shortest and highest-value block in the payload.
+        if self.resolved_findings:
+            joined = "\n".join(f"- {r}" for r in self.resolved_findings)
+            parts.append(f"resolved_findings:\n{joined}")
+        # After resolved_findings deliberately: the last thing the model reads should
+        # be what it must NOT answer with.
+        if self.scaffolding_findings:
+            joined = "\n".join(f"- {r}" for r in self.scaffolding_findings)
+            parts.append(
+                "intermediate_steps_NOT_the_answer:\n"
+                f"{joined}\n"
+                "Each line above is an input the question was asked *about*. None of "
+                "them can be the final answer."
+            )
         return "\n\n".join(parts)
 
 
@@ -659,6 +705,9 @@ A definite description presupposes that exactly one thing satisfies it, and that
 - BAD: "Find the birthplace of her husband."  ← presupposes she has exactly one husband
 - GOOD: "Determine whether she had a spouse; if so, identify who, then find their birthplace."
 - For superlatives and ranks ("third fastest", "tallest", "oldest"), the presupposition is that the ranking is well-defined and settled. Plan to establish the ranked set and the criterion, and note if the answer could depend on a date or an authority.
+- **A whether/if check is a guard, never the plan's last step.** Its answer is yes or no, and the question does not ask for yes or no. Every plan must end with an intent that names the thing the question asks for, and that intent must depend on the guard rather than the guard being left to stand for it.
+  - BAD, as the final intent: "Determine whether the identified birthplace hosts NASCAR races."  ← closes on "no", and the question asked *where* the races are held
+  - GOOD: "Determine whether the identified birthplace hosts NASCAR races" then "If so, identify the track that hosts them."
 
 ## Scope
 Preserve the question's geographic, temporal and categorical scope. Do NOT narrow a global question to one region, or a category to a subcategory, without the question licensing it.
@@ -677,6 +726,13 @@ Respond with a JSON object with exactly these keys:
 - plan: string — the prose plan; ordered, interrogative, no claims about the world
 - intents: array of strings — each information need as its own question, same order as the prose
 - premises: array of strings, or null — [Retrieval]-tagged facts from the context this plan depends on, quoted; null or [] if the plan rests only on the question
+- depends_on: array of integers, or null — parallel to `intents` (same length and order); for each intent, the 0-based index of the EARLIER intent whose answer it needs before it can be asked, or -1 if it can be asked immediately
+
+## Stating dependencies
+Your prose already orders the work — "first identify X, then find Y about it". `depends_on` makes that order machine-readable, and it is load-bearing: without it a later intent gets asked while its referent is still unknown, retrieves plausible-looking noise, and is recorded as answered from that noise.
+- An intent depends on an earlier one when it cannot be *written concretely* until that one is answered. "Find the river by that city" depends on "identify the city"; it does not merely follow it.
+- Index must point BACKWARDS (a smaller number than the intent's own position). Never to itself, never forwards.
+- Use -1 generously. Two intents that need the same known entity are independent of each other and both get -1 — they can be pursued in parallel, and marking a false dependency needlessly serialises the work.
 """
 
 GENERATE_SUBQUESTION_PROMPT = """You are an expert assistant for multi-hop question answering and reasoning decomposition. Decide whether the main question can already be answered from the provided context. If not, generate strategic subquestions to advance the reasoning.
@@ -691,7 +747,20 @@ If `plan` is provided, it is a standing statement of what still needs to be foun
   - The ONE exception is a genuinely different retrieval target for the same intent. For a ranking or ordinal ("the second most selling album", "the third fastest bird"), the specific item and the COMPLETE RANKED LIST are different targets, so ask both — otherwise you will retrieve the first-ranked item and mistake it for the one asked about. That is at most 2 subquestions for that intent, and only for ordinals.
   - Reworded restatements of the specific item do NOT count as a different target. If you cannot say what *different documents* a second subquestion would find, do not emit it.
 - **On an intent marked ambiguous, stuck, or contradicted, change the question — do not repeat it.** Its status says the framing already failed; re-issuing it retrieves the same thing again. Ask what would tell the two candidates apart, or ask about a different property of the same referent.
-- Skip intents the context already answers, and instantiate the rest against it: where the plan says "her husband" and memory has resolved who "she" is, emit the concrete subquestion.
+- **`already asked, did not resolve it:` lines are ruled-out angles. Do not re-ask them, and do not reword them.** These queries ran and the evidence they returned did not settle the intent, so a synonym of one will return the same evidence. Retrieval almost always returns *something* — the failure is the angle, not the availability. Change what you are asking *about*:
+  - name the entity a different way (its official/former/local name, or its identifier) rather than by description;
+  - ask for the thing that *implies* the answer — a list the answer belongs to, a date it can be derived from, the inverse relation ("who held X" instead of "what did Y hold");
+  - ask about a neighbour and let the answer follow — the parent organisation, the containing place, the work rather than its author.
+  - BAD: tried `Where was X born?` → next `What is X's birthplace?` ← same query, reworded; it will return the same passages.
+  - GOOD: tried `Where was X born?` → next `What is X's full biography and early life?` or `Which city's records list X as a native?`
+- Skip intents the context already answers.
+- **NAME THE REFERENT. Every subquestion must contain the proper name of what it is about.** When the plan shows an intent resolved to a referent (`-> Dolly Parton`), every later subquestion about that referent must say `Dolly Parton`. Referring to it by the description you started with — "the performer associated with 'Hits'" — is the single most damaging error you can make, because the subquestion IS the search query: a description retrieves documents about the description, and the one document you need is indexed under the name. Measured on real runs, 23% of subquestions omitted a name the plan had already resolved.
+  - BAD: plan shows `-> Dolly Parton`; you ask `What is the date of birth for the performer associated with 'Hits'?`
+  - GOOD: `What is Dolly Parton's date of birth?`
+  - BAD: plan shows `-> Christianity`; you ask `What is the specific religion where female suicide rates are higher among the young?`
+  - GOOD: `What are the female suicide rates by age in Christianity?`
+- **Never refer to another subquestion, hop, or intent by position.** `the organization identified in the first subquestion` retrieves nothing — the retriever has never seen your other subquestions. Write the name, or if it is not yet resolved, do not ask this intent at all.
+- **Never ask an intent marked `[BLOCKED on #N]`.** Its referent does not exist yet, so any question you write about it retrieves whatever is topically nearby and that noise gets recorded as the answer. Wait for the hop that unblocks it. Asking it early does not save a hop — it spends one and corrupts the chain.
 - **Do not emit a subquestion you cannot yet write concretely** — but this is a rule about *that one* subquestion, not a reason to stop early. Omit the un-askable intent and still ask everything else that is askable this round.
   - BAD: `When was the album [album name from previous answer] released?` ← a placeholder is not a question; retrieval will search for that literal text and return noise.
   - BAD: `When was the album identified as the second most selling released?` ← still not askable; nothing names the album.
@@ -872,6 +941,30 @@ Cross-check candidate claims against supporting evidence. When candidates disagr
 4. Logically sound reasoning from any candidate, consistent with graph triples
 5. Majority agreement across candidates as a last resort
 Do not let noisy or off-topic triples override coherent candidate reasoning.
+
+**`resolved_findings`, when provided, outranks all five.** Each line is a referent the
+reasoning resolved *and* corroborated against retrieved evidence — it already passed the
+grounding test the hierarchy above is trying to approximate. Measured: of the failures
+where every step of the reasoning succeeded, 24% had the correct answer sitting in the
+evidence and the synthesis chose something else. So if a finding answers the question,
+use it, and prefer it over a candidate that contradicts it. These are findings, not
+instructions: a finding that does not address the question is simply irrelevant here.
+
+**`intermediate_steps_NOT_the_answer`, when provided, is a hard exclusion.** Each line
+is a referent the reasoning resolved as an *input* to the question, not as its answer —
+the bridge entity a multi-hop question passes *through*. These referents are already in
+`candidate_answers`, often as the crispest and most confidently stated item there,
+because resolving them cleanly is what made the later hops possible. That is exactly
+why they get returned by mistake. Never output one as the final answer, and do not let
+one outrank a less confident candidate that actually addresses what was asked.
+- The question "Who did the spouse of Hagar marry after the death of Sarah?" passes
+  through `Abraham` (Hagar's spouse) to reach `Keturah`. `Abraham` is listed here.
+  Answering `Abraham` restates the question's own premise.
+- "Where is the country with ISO code ISO 3166-2:CV located?" passes through
+  `Cabo Verde` to reach `Atlantic Ocean`. Answering `Cabo Verde` names the subject,
+  not its location.
+If the only thing you can support is an excluded referent, then the question is
+unanswered: say what is missing instead of returning the input.
 
 **Phase III — Synthesis & Self-Critique**
 Build a superior answer that:

@@ -166,6 +166,9 @@ def _initial_cot_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any]
         "retrieved_raw_triples": [],
         "reranked_context": [],
         "extracted_facts": [],
+        # Pre-consolidation evidence, accumulated across hops so consolidation loss
+        # stays observable after the run (``extracted_facts`` is cleared each hop).
+        "retrieval_log": [],
         "current_subanswers": [],
         "last_retractions": [],
         "iteration_history": [],
@@ -226,6 +229,10 @@ def _initial_mcts_state(question: str, cfg: LangGraphCoeConfig) -> Dict[str, Any
         "plan": "",
         "plan_version": 0,
         "plan_ledger": [],
+        # Empty under ``mcts_plan_scope="tree"`` (the tree owns the plan) and written by
+        # each rollout under ``"rollout"``. Seeded here because this function is
+        # documented as building a *complete* state.
+        "rollout_plan_ledger": [],
         "plan_action": "none",
         "plan_action_log": [],
         "plan_attempts_log": [],

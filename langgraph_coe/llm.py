@@ -77,7 +77,29 @@ _cost_meter: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.Cont
 
 def start_cost_meter() -> Dict[str, Any]:
     """Install a fresh per-question meter and return it (call once per question)."""
-    meter: Dict[str, Any] = {"calls": 0, "completions": 0, "prompt_tokens": 0, "by_role": {}}
+    meter: Dict[str, Any] = {
+        "calls": 0,
+        "completions": 0,
+        "prompt_tokens": 0,
+        # Output-side counters, filled from the provider's own usage block rather than
+        # estimated. ``reasoning_tokens`` is the whole cost of a reasoning-on arm and
+        # is invisible in ``prompt_tokens``, so without it a reasoning A/B can only
+        # report call counts and would score thinking as free.
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        # Responses whose usage block reported reasoning. Distinguishes "reasoning is
+        # off" from "reasoning is on but the toggle silently did nothing" — the exact
+        # failure mode that makes an on/off contrast measure zero.
+        "reasoning_responses": 0,
+        # Responses the provider cut off at max_tokens (finish_reason == "length").
+        # Under reasoning-on this is the arm-invalidating failure: reasoning is billed
+        # inside max_tokens, so a long trace truncates the JSON payload instead of the
+        # trace, and the role falls back to a neutral default. That would cost the
+        # reasoning arm accuracy for a budget reason and be indistinguishable, in the
+        # headline number, from reasoning genuinely not helping.
+        "truncated_responses": 0,
+        "by_role": {},
+    }
     _cost_meter.set(meter)
     return meter
 
@@ -107,6 +129,74 @@ def _record_cost(role_name: str, completions: int, prompt_tokens: Optional[int])
     slot["completions"] += int(completions)
     if prompt_tokens:
         slot["prompt_tokens"] += int(prompt_tokens) * int(completions)
+
+
+def _usage_of(raw: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort usage block off a LangChain message, or None.
+
+    LiteLLM surfaces it in ``response_metadata['token_usage']`` (a pydantic
+    ``Usage``), while LangChain's own normalized ``usage_metadata`` omits the
+    reasoning breakdown. Try the richer one first.
+    """
+    meta = getattr(raw, "response_metadata", None) or {}
+    usage = meta.get("token_usage") if isinstance(meta, dict) else None
+    if usage is None:
+        usage = getattr(raw, "usage_metadata", None)
+    if usage is None:
+        return None
+    if not isinstance(usage, dict):
+        dump = getattr(usage, "model_dump", None)
+        try:
+            usage = dump() if callable(dump) else dict(usage)
+        except Exception:  # noqa: BLE001 — accounting must never break a graph
+            return None
+    return usage if isinstance(usage, dict) else None
+
+
+def _record_output_cost(role_name: str, raw: Any) -> None:
+    """Add one completion's output tokens (and its reasoning share) to the meter.
+
+    Called per *completion*, not per call, so an n=3 role contributes three times —
+    matching how ``_record_cost`` weights ``completions``. Silent on anything it
+    cannot read: a provider that omits usage must not break the graph, it just
+    leaves these counters at zero, which reads as "unmeasured", not "free".
+    """
+    meter = _cost_meter.get()
+    if meter is None:
+        return
+    # Truncation is read off finish_reason, not inferred from token counts: a response
+    # that happens to end near the ceiling is fine, one the provider cut off is not.
+    meta = getattr(raw, "response_metadata", None) or {}
+    if isinstance(meta, dict):
+        finish = meta.get("finish_reason") or meta.get("stop_reason")
+        if isinstance(finish, str) and finish.lower() in ("length", "max_tokens"):
+            meter["truncated_responses"] = meter.get("truncated_responses", 0) + 1
+            slot = meter["by_role"].setdefault(
+                role_name, {"calls": 0, "completions": 0, "prompt_tokens": 0}
+            )
+            slot["truncated_responses"] = slot.get("truncated_responses", 0) + 1
+
+    usage = _usage_of(raw)
+    if not usage:
+        return
+    completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+    details = usage.get("completion_tokens_details") or {}
+    if not isinstance(details, dict):
+        dump = getattr(details, "model_dump", None)
+        try:
+            details = dump() if callable(dump) else {}
+        except Exception:  # noqa: BLE001
+            details = {}
+    reasoning = details.get("reasoning_tokens") or 0
+    meter["completion_tokens"] = meter.get("completion_tokens", 0) + int(completion or 0)
+    meter["reasoning_tokens"] = meter.get("reasoning_tokens", 0) + int(reasoning or 0)
+    if reasoning:
+        meter["reasoning_responses"] = meter.get("reasoning_responses", 0) + 1
+    slot = meter["by_role"].setdefault(
+        role_name, {"calls": 0, "completions": 0, "prompt_tokens": 0}
+    )
+    slot["completion_tokens"] = slot.get("completion_tokens", 0) + int(completion or 0)
+    slot["reasoning_tokens"] = slot.get("reasoning_tokens", 0) + int(reasoning or 0)
 _TRUNCATION_NOTICE = "\n\n…[input truncated to fit the model context budget]…\n\n"
 
 
@@ -442,6 +532,16 @@ class RoleModelRegistry:
                 "enable_thinking": cfg.enable_thinking,
             }
 
+            # Managed-provider reasoning toggle (Bedrock). The chat_template_kwargs
+            # above only reach a self-hosted chat template, so on Bedrock they are
+            # inert and this is the real switch. ``allowed_openai_params`` is not
+            # optional: without it LiteLLM drops ``reasoning_effort`` and the request
+            # is byte-identical to reasoning-off — a silent failure that would make a
+            # "reasoning on" arm measure nothing. See TierConfig.reasoning_effort.
+            if cfg.reasoning_effort:
+                model_kwargs["reasoning_effort"] = cfg.reasoning_effort
+                model_kwargs["allowed_openai_params"] = ["reasoning_effort"]
+
             # Optional reasoning-token budget: SGLang has no native param, so we
             # ship a custom logit processor that forces </think> once the budget
             # is spent (server must run with --enable-custom-logit-processor).
@@ -549,6 +649,11 @@ async def execute_role_lc(
                 continue
             try:
                 if isinstance(r, dict):
+                    # Output tokens are recorded before the parse branch: a completion
+                    # that fails to parse was still generated and paid for, and under
+                    # reasoning-on an unparseable response is *more* likely to be the
+                    # expensive one (reasoning consumed the max_tokens budget).
+                    _record_output_cost(role.name, r.get("raw"))
                     if isinstance(r.get("parsed"), role.output_model):
                         parsed.append(r["parsed"])
                         continue

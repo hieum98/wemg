@@ -11,9 +11,11 @@ Endpoints used:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
+import re
 import string
 from typing import Any, Optional, Protocol, TypedDict, runtime_checkable
 
@@ -199,6 +201,185 @@ class HTTPWikidataBackend:
         return [
             r["id"] for r in data.get("search", []) if isinstance(r, dict) and "id" in r
         ]
+
+    #: Minimum ratio between the best and second-best candidate's statement count for a
+    #: SPARQL label match to be trusted. Statement count is a prominence proxy, and it
+    #: ranks the *unambiguous* cases the same way ``wbsearchentities`` does while giving
+    #: no useful signal on genuinely ambiguous labels.
+    #:
+    #: Measured on 30 entity names taken from real runs (every one of which had failed
+    #: with HTTP 429), comparing this resolver's top-1 against the API's top-1:
+    #:
+    #:   threshold   accepted   correct   wrong   precision   coverage
+    #:          1x         23        20       3         87%        77%
+    #:          4x         18        17       1         94%        60%
+    #:        > 8x         15        15       0        100%        50%
+    #:
+    #: The errors at low thresholds are exactly the short ambiguous labels — "ABC"
+    #: (1.3x), "State" (1.0x), "The Book Thief" (4.9x) — while the correct ones separate
+    #: sharply ("Dolly Parton" 25.7x, and most have no runner-up at all). 8x is chosen
+    #: conservatively: 15/15 is consistent with a true precision near 80%, and a wrong
+    #: QID is worse than no QID because it manufactures a false binding.
+    _LOCAL_DOMINANCE = 8.0
+
+    async def search_entities_local(self, query: str, *, limit: int = 1) -> list[str]:
+        """Resolve an English label to QIDs over the configured SPARQL endpoint.
+
+        A fallback for when ``wbsearchentities`` is unavailable, **not** a replacement:
+        the API ranks by relevance, this ranks by statement count, and the two agree only
+        where the label is unambiguous. Returns ``[]`` rather than guessing when the top
+        candidate does not dominate (see ``_LOCAL_DOMINANCE``).
+
+        Motivation, measured: 3,805 name lookups across two evaluation runs were lost to
+        HTTP 429 on the public API — about 8 per question. Each loss means no QID, so an
+        intent cannot close and its referent never becomes available to ground a later
+        retrieval query, which is the dominant reason unresolved intents had facts but no
+        binding.
+        """
+        name = (query or "").strip()
+        if not name:
+            return []
+        # JSON string escaping is a valid subset of SPARQL string escaping for the
+        # quote/backslash/control characters that appear in entity labels.
+        literal = json.dumps(name)
+        sparql = (
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
+            f"SELECT ?e (COUNT(?p) AS ?n) WHERE {{ ?e rdfs:label {literal}@en . "
+            "?e ?p ?o }\n"
+            "GROUP BY ?e ORDER BY DESC(?n) LIMIT 2"
+        )
+        try:
+            rows = await self._sparql_query(sparql)
+        except Exception as exc:  # noqa: BLE001 — a dead fallback must not fail the hop
+            logger.debug("[wikidata] local label lookup failed for %r: %s", name, exc)
+            return []
+        if not rows:
+            return []
+
+        def _count(row: dict) -> int:
+            try:
+                return int(row.get("n", {}).get("value", 0))
+            except (TypeError, ValueError):
+                return 0
+
+        def _qid(row: dict) -> str:
+            return str(row.get("e", {}).get("value", "")).rsplit("/", 1)[-1]
+
+        best, best_n = _qid(rows[0]), _count(rows[0])
+        if not re.fullmatch(r"Q[1-9][0-9]*", best):
+            return []
+        runner_n = _count(rows[1]) if len(rows) > 1 else 0
+        if runner_n and best_n < runner_n * self._LOCAL_DOMINANCE:
+            logger.debug(
+                "[wikidata] local label %r is ambiguous (%d vs %d statements); "
+                "declining to guess",
+                name,
+                best_n,
+                runner_n,
+            )
+            return []
+        logger.info(
+            "[wikidata] resolved %r -> %s locally (%d statements, runner-up %d)",
+            name,
+            best,
+            best_n,
+            runner_n,
+        )
+        return [best][: max(1, limit)]
+
+    async def get_entity_details_local(
+        self, qids: list[str]
+    ) -> dict[str, EntityRecord]:
+        """Labels and English descriptions for *qids* over the SPARQL endpoint.
+
+        The other half of the public-API gap. ``wbgetentities`` is throttled exactly like
+        ``wbsearchentities``, and when it fails ``entity_dict`` has no labels — which
+        silently disables ``_known_entity_labels`` (so the KG fan-out gate stops firing on
+        known entities) and label-based binding resolution.
+
+        Unlike :meth:`search_entities_local` this needs no disambiguation gate: the lookup
+        is keyed on an exact QID, so there is nothing to guess. Aliases and Wikipedia
+        titles are not recovered — a truthy dump carries neither — so this is a partial
+        record by construction and the caller keeps whatever the API already gave it.
+        """
+        wanted = [q for q in qids if isinstance(q, str) and re.fullmatch(r"Q[1-9][0-9]*", q)]
+        if not wanted:
+            return {}
+        out: dict[str, EntityRecord] = {}
+        # Batched VALUES rather than one query per QID: 35ms for a batch against ~14ms
+        # per single lookup, and the k-hop path routinely resolves dozens at once.
+        for i in range(0, len(wanted), 100):
+            chunk = wanted[i : i + 100]
+            values = " ".join(f"<{_ENTITY_URI_PREFIX}{q}>" for q in chunk)
+            sparql = (
+                "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
+                "PREFIX schema: <http://schema.org/>\n"
+                f"SELECT ?e ?l ?d WHERE {{ VALUES ?e {{ {values} }} "
+                '?e rdfs:label ?l . FILTER(lang(?l)="en") '
+                'OPTIONAL {{ ?e schema:description ?d FILTER(lang(?d)="en") }} }}'
+            ).replace("{{", "{").replace("}}", "}")
+            try:
+                rows = await self._sparql_query(sparql)
+            except Exception as exc:  # noqa: BLE001 — a dead fallback must not fail the hop
+                logger.debug("[wikidata] local entity details failed: %s", exc)
+                continue
+            for row in rows:
+                qid = str(row.get("e", {}).get("value", "")).rsplit("/", 1)[-1]
+                if not qid:
+                    continue
+                out[qid] = {
+                    "qid": qid,
+                    "label": row.get("l", {}).get("value") or None,
+                    "description": row.get("d", {}).get("value") or None,
+                    "aliases": [],
+                }
+        if out:
+            logger.info(
+                "[wikidata] resolved %d/%d entity label(s) locally",
+                len(out),
+                len(wanted),
+            )
+        return out
+
+    async def get_property_details_local(
+        self, pids: list[str]
+    ) -> dict[str, PropertyRecord]:
+        """Property labels over the SPARQL endpoint. Same rationale as entity details.
+
+        ``PROPERTY_LABELS`` already short-circuits the common PIDs, so this only covers
+        the tail — but a throttled fetch there used to raise and take the whole triple
+        labelling with it, leaving readable triples as bare P-numbers.
+        """
+        wanted = [
+            p for p in pids if isinstance(p, str) and re.fullmatch(r"P[1-9][0-9]*", p)
+        ]
+        if not wanted:
+            return {}
+        out: dict[str, PropertyRecord] = {}
+        for i in range(0, len(wanted), 100):
+            chunk = wanted[i : i + 100]
+            values = " ".join(f"<{_ENTITY_URI_PREFIX}{p}>" for p in chunk)
+            sparql = (
+                "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
+                f"SELECT ?p ?l WHERE {{ VALUES ?p {{ {values} }} "
+                '?p rdfs:label ?l FILTER(lang(?l)="en") }'
+            )
+            try:
+                rows = await self._sparql_query(sparql)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[wikidata] local property labels failed: %s", exc)
+                continue
+            for row in rows:
+                pid = str(row.get("p", {}).get("value", "")).rsplit("/", 1)[-1]
+                if pid:
+                    out[pid] = {"pid": pid, "label": row.get("l", {}).get("value")}
+        if out:
+            logger.info(
+                "[wikidata] resolved %d/%d property label(s) locally",
+                len(out),
+                len(wanted),
+            )
+        return out
 
     async def get_entity_details(self, qids: list[str]) -> dict[str, EntityRecord]:
         if not qids:

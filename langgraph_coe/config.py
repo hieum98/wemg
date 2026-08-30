@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -44,6 +44,60 @@ class TierConfig(BaseModel):
     # and the model's think-token ids are known (see langgraph_coe.thinking_budget).
     # Must be < max_tokens, which still bounds thinking + answer combined.
     thinking_budget: Optional[int] = None
+    # Reasoning toggle for *managed providers* (Bedrock), which ignore the SGLang
+    # mechanism above: ``enable_thinking`` rides in ``chat_template_kwargs``, which
+    # only a self-hosted chat template reads, so on Bedrock it is silently inert and
+    # ``thinking_budget``'s logit processor cannot run at all.
+    #
+    # Bedrock's own switch is ``additionalModelRequestFields={"reasoning_effort": ...}``.
+    # Probed live against bedrock/qwen.qwen3-32b-v1:0 in us-west-2:
+    #
+    #   * Only "high" engages it. The gateway advertises an enum of high/low/max/
+    #     medium/minimal/none/xhigh, but that is the *gateway's* enum, not the model's:
+    #     none/low/medium return 4-6 output tokens and no reasoning block, minimal and
+    #     xhigh pass the gateway then fail in the backend, and max is rejected outright.
+    #     So this field is effectively None | "high" here — anything else is a silent
+    #     no-op that would make a "reasoning on" arm a duplicate of the off arm.
+    #   * LiteLLM drops the field unless it is allow-listed, hence the
+    #     ``allowed_openai_params`` companion in ``llm.get_model_by_tier``. Passing
+    #     ``reasoning_effort`` alone measured identical to omitting it (30 output
+    #     tokens, no reasoning) — a passthrough that fails silently.
+    #   * The Anthropic-style ``{"thinking": {...}}`` block is inert: it returns 200
+    #     with no reasoning. It is not a fallback signal.
+    #
+    # Reasoning tokens are billed inside ``max_tokens`` (they arrive as
+    # ``completion_tokens_details.reasoning_tokens``), so raising this without raising
+    # max_tokens truncates the JSON payload instead of the reasoning. Calibrated on this
+    # workload: at 4096 ``open_ie`` truncated on 15% of its completions; at 8192, zero.
+    #
+    # **Measured, and left off by default.** Reasoning costs ~19.5k tokens/question =
+    # **77% of all output tokens** and bought no measured accuracy. On CoT over 117 pairs
+    # (``r_cot_plan_*``) it left the plan contrast a null (+1.71 pts, p = 0.8145, i.e. the
+    # same verdict as reasoning-off) and was itself directionally *negative* against the
+    # reasoning-off runs, -4.3 to -5.1 pts at p = 0.38-0.46 — suggestive but confounded,
+    # because those runs predate both current code and the current retrieval regime.
+    #
+    # Where the loss sits is clearer than whether it is real: **retrieval, not
+    # conversion.** Gold reached memory on 25.6% of questions against 30.8-43.8%
+    # reasoning-off, while conversion held at 80.0% vs 80.6%. Two large distributional
+    # shifts accompany it — consolidated memory items 3.5 vs 6.1 (ten reasoning-off runs
+    # on current code span a tight 5.62-6.68), and single-hop terminations on 23% of
+    # questions against 0-5%. The tempting inference that early stopping truncates the
+    # multi-hop chain is NOT supported: those 1-hop questions score *above* the run
+    # average (32.0%), so the early stop is selection, not damage.
+    #
+    # **If you do want reasoning, enable it SELECTIVELY.** On the roles that reason over
+    # evidence it is harmless; on the extraction and consolidation roles it suppresses
+    # evidence, because those are recall tasks with asymmetric costs (a spurious fact
+    # merely occupies a memory slot, a dropped fact is unrecoverable) and reasoning makes
+    # the model filter harder — 38% fewer facts extracted, ~50% fewer memory items kept.
+    # Reasoning on heavy+plan only, with memory_consolidation moved off the reasoning
+    # tier, gave identical accuracy for 59.7% less reasoning spend (p < 0.0001).
+    # config.eval.yaml is wired that way; see docs/RESULTS.md and §14.10/§14.15 of
+    # docs/plan_idea_and_results.md.
+    #
+    # See docs/plan_idea_and_results.md §14.
+    reasoning_effort: Optional[str] = None
     max_retries: int = 3
     timeout: int = 300
 
@@ -133,6 +187,35 @@ class WebSearchConfig(BaseModel):
     crawl_full_text: bool = True
     max_crawl_requests_per_second: float = 2.0
     max_queries_per_agent: int = 2
+    # Paid last-resort provider, used ONLY when the free providers are all blocked.
+    # Prefer the ``TAVILY_API_KEY`` environment variable over setting this: a key in
+    # a YAML file gets committed. Leave both unset to disable the fallback entirely,
+    # in which case a blocked search returns empty as it does today.
+    tavily_api_key: Optional[str] = None
+    # Brave Search API. Keyed and quota'd (2k queries/month on the free tier), so it
+    # sits behind the unmetered providers. ``BRAVE_API_KEY`` env var takes precedence.
+    brave_api_key: Optional[str] = None
+
+    # ``providers`` is the fallback chain, tried in order until one returns a
+    # non-empty result. Names must be keys of ``tools.web._PROVIDERS``:
+    #
+    #   builtin   Serper when ``api_key``/``SERPER_API_KEY`` is set, else the free
+    #             ``ddgs`` rotation. The legacy slot, and the one unit tests stub.
+    #   searxng   Local SearXNG container (``setup/searxng_up.sh``). Unmetered.
+    #   wikipedia MediaWiki search API. Unmetered, no key, returns page text inline.
+    #   brave     Brave Search API. Needs ``brave_api_key``.
+    #   tavily    Billed. Needs ``tavily_api_key``.
+    #
+    # The default is deliberately the pre-existing behavior (builtin → tavily) so
+    # that enabling the newer providers is an explicit, per-config decision rather
+    # than something that silently changes what a run retrieves. See
+    # ``config.eval.yaml`` for the chain the sweeps actually use.
+    providers: List[str] = Field(default_factory=lambda: ["builtin", "tavily"])
+    # Base URL of the local SearXNG instance. Only read when ``searxng`` is in
+    # ``providers``. ``SEARXNG_URL`` env var takes precedence.
+    searxng_url: str = "http://localhost:8080"
+    # MediaWiki site queried by the ``wikipedia`` provider.
+    wikipedia_lang: str = "en"
 
 
 class CacheRedisConfig(BaseModel):
@@ -209,6 +292,71 @@ class CoTConfig(BaseModel):
     # headroom over ``max_depth × 8``.
     recursion_limit: int = 75
 
+    # Present the LATEST evidence first in ``candidate_answers``.
+    #
+    # ``candidate_answers`` is the whole of ``text_memory`` in oldest-first order, rendered as
+    # an explicit numbered list, and it is ~94% of what the synthesiser reads (``resolved_
+    # findings`` is 0.49 lines per question). Measured over 149 conversion failures where the
+    # gold-bearing memory line and the line the answer came from are distinct, length-matched
+    # so a short prediction cannot win by matching an early line more readily: the gold sits
+    # **later** in memory **67 times against 41, p = 0.0157**, by a mean 0.089 of the list.
+    # (Unmatched the same test reads 101/48 at p < 0.0001, which overstates it; and an
+    # unpaired check across all questions puts the gold at mean position 0.425 against the
+    # wrong answer's 0.450, i.e. disagrees in sign. So this is a modest effect on a weak
+    # prior, kept off until the A/B rules.)
+    #
+    # Two rival orderings were tested on the same cases and both favour the WRONG line, so
+    # relevance ranking is deliberately NOT used here: question content-word overlap (gold 28
+    # / rival 71, p < 0.0001) and idf-weighted overlap (35 / 78, p = 0.0001).
+    #
+    # **Measured and left off.** `ro_on` vs `ro_off`, 117 paired questions, plan disabled in
+    # both: paired conversion 18/26 vs 21/26 — **gap -3**, theta=0.286, p=0.4531 — and accuracy
+    # 22.22% vs 23.93%, 22 discordant (10/12), p=0.8318. Null and directionally *negative*,
+    # which is the direction the unpaired positional check had already pointed to. So the
+    # positional asymmetry is real but too small to act on, and the synthesiser is not
+    # meaningfully primacy-biased over an ~8-item list.
+    #
+    # Recorded so this is not retried: of the seven interventions measured against conversion,
+    # this is the one that tested the 94% channel directly, and it moved nothing.
+    recent_evidence_first: bool = False
+
+    # Show the synthesiser the retrieved facts that CONSOLIDATION DROPPED.
+    #
+    # Measured on a 60-question instrumented run (``results/cl_probe``, via the new
+    # ``retrieval_log`` channel, which accumulates every extracted fact because
+    # ``extracted_facts`` is cleared each hop and nothing else preserved it):
+    #
+    #   gold in retrieved facts (pre-consolidation)   22/60 = 36.7%
+    #   gold in consolidated text_memory              19/60 = 31.7%
+    #   **lost by consolidation**                     **6 = 10.0% of all questions**
+    #   of those 6, answered wrong                    **6 (all of them)**
+    #
+    # So 27% of the questions whose retrieval found the gold lose it before synthesis ever
+    # sees it, and none recovered. MEMORY_CONSOLIDATOR keeps a mean 0.56 of the retrieved
+    # facts — as low as 0.08 on individual questions — deciding per hop, without knowing
+    # which fact the final answer will need.
+    #
+    # This is the only conversion channel that was not exhausted: the ledger is ~6% of the
+    # synthesiser's input and four ledger fixes measured null; candidate ordering is the other
+    # 94% and measured null too. Dropped evidence is neither — it is material that never
+    # reached synthesis at all.
+    #
+    # Only the *dropped* facts are appended, capped at 25, and placed LAST with an explicit
+    # lower-reliability label: the scaffolding result established that content at top
+    # authority gets returned as the answer whether it deserves to be or not.
+    #
+    # **MEASURED AND REFUTED — left off.** ``rd_on`` vs ``r_cot_selective``, 117 pairs,
+    # identical but for this flag: accuracy 23/117 vs 26/117 (-2.56 pts, p = 0.6072), and on
+    # the 22 questions where *both* arms held the gold the two convert **identically**,
+    # 15/22 each, discordant 4 (2/2), p = 1.0000. Cost moved exactly as designed (prompt
+    # tokens +10,378, calls -0.2), so the mechanism was wired correctly — it simply does
+    # nothing. Putting consolidation-discarded evidence back in front of the synthesiser
+    # does not recover it; the most likely reason is the §8 position-and-authority result,
+    # i.e. the same last-place lower-reliability framing that makes this safe also makes it
+    # inert. See docs/plan_idea_and_results.md §14.13.
+    synthesis_sees_dropped_evidence: bool = False
+
+
 
 class PlanConfig(BaseModel):
     """Knobs for the explicit plan channel (planning/reasoning separation).
@@ -225,8 +373,16 @@ class PlanConfig(BaseModel):
     survive for one intent) or *falsified discharge* (a fact the plan cited was
     evicted by retrieval).
 
-    Off by default: the A0 baseline must stay byte-identical to the pre-plan
-    behaviour so the ablation is meaningful.
+    **On by default, and the reason is cost, not accuracy.** The accuracy effect is a
+    measured null across eight paired experiments (see below and docs/RESULTS.md); what
+    replicates is a substantial reduction in spend at unchanged accuracy — CoT -24.8 LLM
+    calls per question (p < 0.0001) and -36,993 prompt tokens (p = 0.0179), MCTS
+    plan-rollout -3.9 calls (p = 0.0274) and -15,023 prompt tokens (p = 0.0049). Four
+    independent measurements, all surviving Wilcoxon, in both reasoning regimes.
+
+    Set ``enabled=false`` to recover the A0 baseline, which is byte-identical to the
+    pre-plan behaviour: when this is False ``gen_plan``/``plan_gate``/``replan`` are not
+    added to the graph at all, so the ablation stays meaningful in both directions.
 
     **Measured effect, 62 rows, paired, identical code:** in CoT the plan scored
     36/62 against 31/62 without it and used 4.94 subquestions per question against
@@ -239,10 +395,16 @@ class PlanConfig(BaseModel):
     the tree covers roughly a third less ground for the same cost, at identical
     accuracy (14/23 both). The design treated sibling re-decomposition as duplicated
     work; in a tree search it is *exploration*, and a shared plan converts it into
-    repetition. Leave the plan off for MCTS until the plan is per-node forkable.
+    repetition.
+
+    That harm is specific to ``mcts_plan_scope="tree"`` and is why the default is
+    ``"rollout"``: each rollout plans from its own branch memory, so plans differ where
+    the branches differ and sibling diversity is preserved by construction. Under
+    ``"rollout"`` the MCTS contrast is an accuracy null with a real cost saving, in both
+    reasoning regimes — so the plan is safe to leave on for MCTS too.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     # 0 keeps ``plan_gate`` in log-only mode: ``plan_action`` is computed and
     # recorded, but the router never takes the replan edge.
     #
@@ -278,6 +440,142 @@ class PlanConfig(BaseModel):
     # observed floor by one point, which is a thinner margin than it looks — the max
     # over more samples is likely higher.
     memory_disagreement_threshold: float = 4.0
+    # Verify a *terminal* intent's referent against this hop's evidence with
+    # ``SELF_CORRECTOR`` before closing on it, replacing the answer when the evidence
+    # supports a different one and withholding it when nothing is corroborated.
+    #
+    # Measured motivation: on 70 questions whose memory held the gold answer and whose
+    # final answer was still wrong, the terminal intent had closed on the *wrong*
+    # referent 67% of the time, and only 3% of those were flagged by the consolidator's
+    # conflict detection — the rest were silent. The cause is structural: binding
+    # candidates come from one ``current_subanswers_concise`` entry per subquestion, so
+    # when the answer generator picks wrong that value is the only candidate and
+    # ``count_rival_referents`` sees no rivalry to contest.
+    #
+    # Terminal intents only. ``SELF_CORRECTOR`` is reused rather than a new role: it
+    # already returns correct/partial/incorrect/unsupported plus a refinement, and was
+    # wired only into MCTS despite this docstring claiming the plan conditions it.
+    #
+    # **Measured and defaulted OFF.** ``vf_on`` vs ``vf_off``, 117 paired questions, both
+    # arms with the plan enabled so nothing else differs:
+    #
+    #   * paired conversion — of questions whose memory held the gold in BOTH arms, the
+    #     fraction answered correctly — 14/18 vs 14/18. theta=0.500, p=1.0000. Zero.
+    #   * accuracy +4.3 pts (23.08% vs 18.80%), 21 discordant (13/8), p=0.3833. The gain
+    #     is real but comes from *retrieval*, not conversion: gold-in-memory rose 24.8% ->
+    #     29.9%, because withholding an unverified referent leaves the intent open and
+    #     buys another hop of search. An extra hop is a cheaper way to buy an extra hop.
+    #   * cost +5.8 calls/question, Wilcoxon p=0.0236 — 3.03 of them SELF_CORRECTOR, the
+    #     rest the extra hops. The estimate above of "~1 extra call" was wrong: the gate
+    #     runs per hop over a mean 3.67 hops, not once per question.
+    #
+    # So it fails the cost half of the goal outright and delivers nothing on the metric
+    # it was built for. Kept because the code is sound and the role is now wired into CoT
+    # for future use, but off by default.
+    verify_terminal_referents: bool = False
+
+    # Treat a *guard* — an intent whose answer is a truth value, "determine whether she
+    # had a spouse" — as a guard rather than as a referent-bearing intent. The PLANNER
+    # prompt asks for presuppositions to be hedged into conditionals, so guards are
+    # generated deliberately, and every consumer of the ledger assumed a referent.
+    #
+    # Measured over 1,920 questions / 6,250 intents: 399 guards (6.4% of intents), 188 of
+    # them terminal, 131 of those closed, and 139 of 284 closed guards bound a *full
+    # sentence* as their referent. Three concrete harms:
+    #
+    #   * ``resolved_findings`` is ranked above every other source in the synthesis
+    #     prompt, so a closed guard arrived there as "Confirm whether the author wrote a
+    #     short story -> No, Stephen King did not write a short story featuring Herman
+    #     Wouk." on a question whose gold was 1,335,907. Same mechanism that made
+    #     scaffolding referents cost ~4.7 points.
+    #   * resolving the answer as a referent bound the intent's own *input* — "No,
+    #     Yangzhou is not a capital city" -> Yangzhou — which either closed the intent on
+    #     the subject or manufactured a rival against the real answer. 16% of intents with
+    #     bindings echoed a prerequisite's referent.
+    #   * "Yes, Meg Ryan." resolved to Dennis Quaid (the subject) rather than Meg Ryan,
+    #     because the whole sentence was the surface. The affirmation is now stripped
+    #     before resolution.
+    #
+    # Off restores the previous behaviour exactly, which is what makes the A/B a single
+    # variable rather than a code-version comparison.
+    #
+    # **Measured: mechanism confirmed, outcome null.** `gd_on` vs `gd_off`, 117 paired
+    # questions, concurrent arms: paired conversion 17/23 vs 18/23 (p=1.0000), accuracy
+    # 26/117 vs 26/117 (18 discordant 9/9, p=1.0000), calls -5.4/question (Wilcoxon
+    # p=0.0874, n.s.), intermediate-referent leak 1.7% vs 5.2% (p=0.2891).
+    #
+    # The reason it cannot move accuracy is structural: ``candidate_answers`` is the entire
+    # consolidated memory (7.7-8.9 items) while ``resolved_findings`` is 0.49 lines per
+    # question, so the ledger supplies ~6% of what synthesis reads however correct it is.
+    # That ceiling explains this null and the ``verify_terminal_referents`` one.
+    #
+    # Kept on as **correctness housekeeping, not a measured improvement**: closing an intent
+    # on the string "No, Stephen King did not write a short story featuring Herman Wouk" is
+    # wrong whatever the accuracy does, it is directionally cheaper rather than dearer, and
+    # it takes the intermediate-referent leak from 5.2% to 1.7%.
+    guard_intents_are_not_referents: bool = True
+
+    # Stop an intent binding the referent its own prerequisites already bound. The QID
+    # resolver takes the *earliest* linked entity in the answer, which is right for a
+    # concise answer and exactly backwards for a sentence one: in "Dennis Quaid is married
+    # to Meg Ryan" the earliest entity is the subject the intent was asked *about* and the
+    # answer sits in the predicate. Measured on 5,593 intents with bindings, 897 (16%)
+    # resolved to a prerequisite's referent and 640 closed on nothing else.
+    #
+    # Separate from ``guard_intents_are_not_referents`` and defaulted OFF so the two are
+    # measured independently rather than as one bundle — they overlap in the cases they
+    # touch, and attributing a pooled effect to whichever half is cheaper to explain is
+    # how the earlier retracted claims in this project happened.
+    #
+    # **Measured and left off.** `bd_input` vs `gd_on`, 117 paired questions: paired
+    # conversion 15/19 vs 15/19 (gap 0, p=1.0000), accuracy 18.80% vs 22.22% — gap **-4**,
+    # 18 discordant (7/11), theta=0.389, p=0.4807 — and cost flat (Wilcoxon p=0.5427). Not
+    # significant in either direction, but with zero conversion effect and a negative
+    # accuracy sign there is no case for enabling it. The mechanism is real (640 intents
+    # closed on nothing but their own input referent); it just does not reach the answer,
+    # for the same reason as every other ledger fix here — see
+    # ``guard_intents_are_not_referents`` on the ~6% ceiling.
+    skip_input_referent_in_binding: bool = False
+
+    # Let a sub-answer whose self-reported ``confidence_level`` is low still bind a
+    # referent when a ``[Retrieval]`` line corroborates it.
+    #
+    # ``plan_gate`` discards low-confidence answers outright. But ``ANSWER_GENERATOR`` is
+    # told to "always try your best to answer the question even if the context is
+    # incomplete or missing" (rule 3), so a low label frequently reports doubt about the
+    # *context*, not about the referent — and when a [Retrieval] line does corroborate the
+    # answer, that doubt has already been resolved by evidence. Measured over 6,453 hops,
+    # 2,980 of 17,848 sub-answers (16.7%) were dropped this way before binding — the
+    # largest single source of attrition, ahead of missing intent attribution (6.6%).
+    #
+    # Corroboration is the arbiter, so the original concern survives: an *uncorroborated*
+    # guess still cannot bind, and so still cannot compete with a grounded answer.
+    #
+    # **Measured and left off: the premise was wrong.** On the live arm the rescue fired on
+    # **1 of 85** low-confidence drops. The self-reported label and [Retrieval] corroboration
+    # agree almost perfectly — ~99% of low-confidence answers are also uncorroborated — so
+    # the gate was not discarding recoverable answers and there is nothing here to recover.
+    # The 22-28% attrition is real but the answers were genuinely unsupported.
+    bind_corroborated_low_confidence: bool = False
+
+    # Where the plan lives under MCTS: ``"tree"`` (one plan, generated at the root and
+    # inherited by every node and rollout) or ``"rollout"`` (no plan in the tree; each
+    # rollout runs the CoT loop and generates its own).
+    #
+    # ``"tree"`` was measured to harm the search. Over 23 paired rows at
+    # ``num_iterations=2``, sharing one plan cut distinct subquestions per question from
+    # 9.9 to 6.3 (-36%) and more than doubled sibling-subtree overlap, 10.2% -> 23.1%,
+    # at identical accuracy. The cause is structural: a plan is a variance-*reduction*
+    # device, and pUCT can only prefer one child over another when the children differ.
+    # Sharing one plan across siblings makes them converge, so the tree re-confirms one
+    # line of enquiry instead of comparing several.
+    #
+    # ``"rollout"`` separates the two effects. The plan's benefits are all *within* a
+    # single reasoning chain — grounded retrieval queries, a scoped triple-pruner
+    # budget, scaffolding excluded from synthesis — and none of them require siblings to
+    # share anything. Each rollout plans from its own branch memory, so plans differ
+    # where the branches differ and diversity is preserved by construction.
+    mcts_plan_scope: str = "rollout"
 
 
 class SearchConfig(BaseModel):

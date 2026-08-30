@@ -300,7 +300,21 @@ class WikidataClient:
                     seen.add(title)
                     titles.append(title)
             if titles:
-                await self._fetch_wikipedia(titles)
+                try:
+                    await self._fetch_wikipedia(titles)
+                except Exception as exc:  # noqa: BLE001
+                    # Page text is an enrichment bonus; labels and descriptions are the
+                    # part callers depend on. Letting a throttled MediaWiki fetch
+                    # propagate discarded the whole enrichment — including labels that
+                    # had already resolved — and surfaced upstream as "SPARQL fetch
+                    # failed", which pointed at the local endpoint rather than the public
+                    # API that actually failed.
+                    logger.info(
+                        "[wikidata] %s fetching %d Wikipedia page(s); "
+                        "returning entities without page text",
+                        type(exc).__name__,
+                        len(titles),
+                    )
 
         return [self._make_entity(q, with_wiki=get_details) for q in qid_list]
 
@@ -437,12 +451,37 @@ class WikidataClient:
         if cached is not None:
             return list(cached)
 
-        qids = await self._coalesce(
-            f"search_e:{n.lower()}:{top_k}",
-            lambda: self._call_with_retry(
-                self._wiki_limiter, self._backend.search_entities_text, n, limit=top_k
-            ),
-        )
+        async def _resolve() -> List[str]:
+            try:
+                return await self._call_with_retry(
+                    self._wiki_limiter,
+                    self._backend.search_entities_text,
+                    n,
+                    limit=top_k,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # ``wbsearchentities`` has no local equivalent — the configured
+                # ``sparql_endpoint`` covers triples, not the ranking service — so a
+                # throttled lookup used to return nothing at all. Measured: 3,805 name
+                # lookups lost to HTTP 429 across two evaluation runs, ~8 per question.
+                # Each loss means no QID, so an intent cannot close and its referent
+                # never becomes available to ground a later retrieval query.
+                #
+                # Second, not first: the API ranks by relevance and the fallback ranks by
+                # statement count, and they agree only where the label is unambiguous
+                # (measured 67% top-1 agreement overall, 100% on the dominant cases the
+                # fallback is willing to accept).
+                local = getattr(self._backend, "search_entities_local", None)
+                if local is None:
+                    raise
+                logger.info(
+                    "[wikidata] %s on %r; trying the local endpoint",
+                    type(exc).__name__,
+                    n,
+                )
+                return list(await local(n, limit=top_k))
+
+        qids = await self._coalesce(f"search_e:{n.lower()}:{top_k}", _resolve)
         self._entity_search[key] = list(qids)
         return list(qids)
 
@@ -617,10 +656,31 @@ class WikidataClient:
             lru=self._entities,
             redis_prefix="wiki:ent:",
             coalesce_prefix="ent",
-            backend_fn=self._backend.get_entity_details,
+            backend_fn=self._entity_details_with_fallback,
             limiter=self._wiki_limiter,
             on_miss=lambda q: {"qid": q},
         )
+
+    async def _entity_details_with_fallback(self, qids: List[str]):
+        """``wbgetentities``, falling back to SPARQL labels when it is throttled.
+
+        Without a label, ``entity_dict`` entries are bare ``{"qid": ...}`` — which
+        silently disables ``_known_entity_labels`` (so the KG fan-out gate stops firing
+        on entities already linked) and label-based binding resolution. The fallback is
+        keyed on exact QIDs, so unlike entity *search* there is nothing to disambiguate.
+        """
+        try:
+            return await self._backend.get_entity_details(qids)
+        except Exception as exc:  # noqa: BLE001
+            local = getattr(self._backend, "get_entity_details_local", None)
+            if local is None:
+                raise
+            logger.info(
+                "[wikidata] %s fetching %d entity detail(s); trying the local endpoint",
+                type(exc).__name__,
+                len(qids),
+            )
+            return await local(qids)
 
     async def _fetch_properties(self, pids: List[str]) -> None:
         # O(1) short-circuit for well-known PIDs; the rest go through the backend.
@@ -639,10 +699,25 @@ class WikidataClient:
                 lru=self._properties,
                 redis_prefix="wiki:prop:",
                 coalesce_prefix="prop",
-                backend_fn=self._backend.get_property_details,
+                backend_fn=self._property_details_with_fallback,
                 limiter=self._wiki_limiter,
                 on_miss=lambda p: {"pid": p},
             )
+
+    async def _property_details_with_fallback(self, pids: List[str]):
+        """``wbgetentities`` for properties, falling back to SPARQL labels."""
+        try:
+            return await self._backend.get_property_details(pids)
+        except Exception as exc:  # noqa: BLE001
+            local = getattr(self._backend, "get_property_details_local", None)
+            if local is None:
+                raise
+            logger.info(
+                "[wikidata] %s fetching %d property label(s); trying the local endpoint",
+                type(exc).__name__,
+                len(pids),
+            )
+            return await local(pids)
 
     async def _fetch_outgoing(
         self, qids: List[str]

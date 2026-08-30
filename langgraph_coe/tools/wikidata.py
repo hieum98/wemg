@@ -121,6 +121,73 @@ def reset_wikidata_session() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Plan focus: the open intents this retrieval is serving
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Stage B (``triple_pruner``) is 45.3% of every LLM call the system makes and its
+# call count is ``ceil(pruning_top_k / 16)`` — a fixed 4, because ``pruning_top_k``
+# is a constant 64 guess made without reference to what is being looked for. The
+# measured input is 1,780,510 triples reduced to 141,248 (7.9%) by Stage A, so the
+# 64 is what Stage B pays for, not the raw fetch.
+#
+# The plan is the only thing in the system that knows *how many distinct things are
+# still being asked for*. A question with one open intent does not need the same
+# candidate budget as one with four. Threading that through as a ContextVar rather
+# than a parameter because ``query`` reaches the tool from an LLM tool call, so
+# there is no call path from the graph to widen — and this module already binds
+# per-question state this way for exactly that reason.
+_cv_plan_focus: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "wikidata_plan_focus", default=None
+)
+
+
+def set_plan_focus(intents: Optional[List[str]], n_open: int) -> None:
+    """Declare the open intents the next retrievals serve. ``None`` disables."""
+    if not intents or n_open <= 0:
+        _cv_plan_focus.set(None)
+        return
+    _cv_plan_focus.set({"intents": list(intents), "n_open": int(n_open)})
+
+
+def clear_plan_focus() -> None:
+    _cv_plan_focus.set(None)
+
+
+def read_plan_focus() -> Optional[Dict[str, Any]]:
+    return _cv_plan_focus.get(None)
+
+
+def _planned_top_k(configured_top_k: int) -> int:
+    """Scale the Stage-B candidate budget to the number of intents still open.
+
+    ``_PRUNE_BATCH_SIZE`` per open intent, floored at one batch and capped at the
+    configured value, so this can only ever *lower* cost and a question with four or
+    more open intents behaves exactly as today. No plan → configured value.
+    """
+    focus = read_plan_focus()
+    if not focus:
+        return configured_top_k
+    scaled = _PRUNE_BATCH_SIZE * max(1, int(focus.get("n_open") or 1))
+    return max(_PRUNE_BATCH_SIZE, min(configured_top_k, scaled))
+
+
+def _focused_query(query: str) -> str:
+    """Append open-intent content words to the Stage-A ranking query.
+
+    Lowering ``top_k`` only preserves recall if the ranking that fills it is
+    sharper, and the ranking query is whatever the KG agent happened to pass. The
+    open intents name the properties actually wanted, so they belong in the ranking
+    signal. Appended, never substituted — the agent's query carries the entity that
+    Stage A also has to match.
+    """
+    focus = read_plan_focus()
+    if not focus:
+        return query
+    extra = " ".join(str(i) for i in (focus.get("intents") or []))
+    return f"{query} {extra}".strip() if extra else query
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Stage A pruning: fast reranker-based score filter
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -438,12 +505,22 @@ async def _fetch_and_prune_subgraph_core(
     reranker_url = getattr(_wikidata_config, "reranker_url", None)
     reranker_model = getattr(_wikidata_config, "reranker_model", None)
     reranker_instruction = getattr(_wikidata_config, "reranker_instruction", None)
+    # Plan-conditioned budget: a sharper ranking query, and only as many candidates
+    # as there are open intents to serve. Both are no-ops without a plan focus.
+    planned_top_k = _planned_top_k(_wikidata_config.pruning_top_k)
+    if planned_top_k != _wikidata_config.pruning_top_k:
+        logger.info(
+            "[stage_a] plan focus: %d open intent(s) -> top_k %d (configured %d)",
+            (read_plan_focus() or {}).get("n_open"),
+            planned_top_k,
+            _wikidata_config.pruning_top_k,
+        )
     triples = await _stage_a_prune(
-        query,
+        _focused_query(query),
         triples,
         reranker_url,
         reranker_model,
-        top_k=_wikidata_config.pruning_top_k,
+        top_k=planned_top_k,
         delta=_wikidata_config.pruning_delta,
         instruction=reranker_instruction,
     )

@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Sequence
 from unittest.mock import MagicMock
 
+import inspect
 import networkx as nx
 import pytest
 
@@ -1746,3 +1747,1603 @@ def test_the_plan_prompt_buys_breadth_across_intents_not_within_one():
     # The placeholder rule survives, but must not read as licence to stop early.
     assert "placeholder is not a question" in p
     assert "not a reason to stop early" in p
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dependency ordering (``depends_on`` / ``is_executable``)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_dependent_intent_is_not_executable_until_its_prerequisite_closes():
+    """The failure this exists to stop, taken from a real 4-hop MuSiQue question.
+
+    The ledger held intent 0 (*Elizabeth Berg's birthplace*) open while intent 2
+    (*the river by the city bordering it*) was asked anyway. It retrieved 9 facts of
+    topically-nearby noise and **closed on them**. Both rendered as ``[open]``, so
+    nothing told the generator the second was unanswerable. At two hops that wastes a
+    hop; at four it destroys the chain.
+    """
+    ledger = cot_mod.build_plan_ledger(
+        [
+            "Identify Elizabeth Berg's birthplace.",
+            "Determine the city bordering it.",
+            "Identify the river by that city.",
+        ],
+        None,
+        [-1, 0, 1],
+    )
+    assert [e["depends_on"] for e in ledger] == [None, 0, 1]
+    assert cot_mod.is_executable(ledger, 0) is True
+    assert cot_mod.is_executable(ledger, 1) is False
+    assert cot_mod.is_executable(ledger, 2) is False
+
+    # Closing the head unblocks exactly one step, not the whole chain.
+    ledger[0]["status"] = cot_mod.INTENT_CLOSED
+    assert cot_mod.is_executable(ledger, 1) is True
+    assert cot_mod.is_executable(ledger, 2) is False, (
+        "intent 2 must stay blocked: walking only the immediate parent would unblock "
+        "it while its own prerequisite is still open"
+    )
+    ledger[1]["status"] = cot_mod.INTENT_CLOSED
+    assert cot_mod.is_executable(ledger, 2) is True
+
+
+def test_blocked_intents_render_as_blocked_not_open():
+    ledger = cot_mod.build_plan_ledger(
+        ["Identify the city.", "Find the river by that city."], None, [-1, 0]
+    )
+    rendered = cot_mod.render_plan_for_prompt("First the city, then its river.", ledger)
+    assert "[open] Identify the city." in rendered
+    assert "[BLOCKED on #1 - do not ask yet] Find the river by that city." in rendered
+    # 1-based in the render because the prose numbers steps from one for a reader.
+    assert "[open] Find the river" not in rendered
+
+
+def test_dependency_sanitizer_rejects_what_would_deadlock():
+    """Self- and forward-references are dropped rather than trusted.
+
+    Either would block an intent permanently: a self-reference can never close
+    first, and a forward edge is a mistake or a cycle. Since the prose orders the
+    intents, a real dependency always points backwards.
+    """
+    ledger = cot_mod.build_plan_ledger(
+        ["A", "B", "C", "D"],
+        None,
+        [0, 5, "1", 2],  # self-ref, out of range, wrong type, valid
+    )
+    assert [e["depends_on"] for e in ledger] == [None, None, None, 2]
+    assert all(cot_mod.is_executable(ledger, i) for i in (0, 1, 2))
+    assert cot_mod.is_executable(ledger, 3) is False
+
+
+def test_ledger_without_dependencies_behaves_exactly_as_before():
+    """A0 regression lock: a PLANNER that omits ``depends_on`` must lose nothing."""
+    ledger = cot_mod.build_plan_ledger(["A", "B"], ["[Retrieval]: x"])
+    assert [e["depends_on"] for e in ledger] == [None, None]
+    assert all(cot_mod.is_executable(ledger, i) for i in range(2))
+    assert "[open] A" in cot_mod.render_plan_for_prompt("p", ledger)
+
+
+def test_dependency_indices_follow_kept_intents_when_a_blank_is_dropped():
+    """``build_plan_ledger`` skips blank intents, so indices must be remapped.
+
+    The model's indices refer to its own emitted list; the ledger's refer to what
+    survived. Reading the raw index against the compacted ledger would point a
+    dependency at the wrong intent.
+    """
+    ledger = cot_mod.build_plan_ledger(["A", "   ", "C"], None, [-1, -1, 0])
+    assert [e["intent"] for e in ledger] == ["A", "C"]
+    assert ledger[1]["depends_on"] == 0
+
+
+def test_a_contested_prerequisite_does_not_block_forever():
+    """Blocking is for *unresolved*, not for *unresolvable*.
+
+    A contested intent will not improve by waiting — two referents survived and no
+    further hop settles it — so holding its dependents hostage would strand the rest
+    of the plan. Ask with the ambiguity rather than never ask.
+    """
+    ledger = cot_mod.build_plan_ledger(["A", "B"], None, [-1, 0])
+    ledger[0]["status"] = cot_mod.INTENT_CONTESTED
+    assert cot_mod.is_executable(ledger, 1) is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Grounded-phrase closure (the third binding tier)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_grounded_phrase_answer_closes_an_intent():
+    """The 70% leak, fixed.
+
+    Of 69 intents left open across the 120-row MuSiQue depth run, 48 had retrieved
+    facts but recorded **no binding at all**: the answer named no linked entity and
+    was no date or quantity. "Treaty of Paris" is an answer; it was simply
+    unrepresentable, so the intent stayed open and the hop was spent for nothing.
+    """
+    mem = ["[Retrieval][hop=0]: The Treaty of Paris ceded the territory to the US."]
+    ledger = cot_mod.apply_bindings(
+        _ledger("Identify the treaty that ceded the territory."),
+        [(0, "Treaty of Paris")],
+        {},  # entity linking produced nothing
+        hop=0,
+        retrieval_memory=mem,
+    )
+    assert ledger[0]["status"] == cot_mod.INTENT_CLOSED
+    assert ledger[0]["closed_at"] == 0
+    b = ledger[0]["bindings"][0]
+    assert b["qid"] == "phr:treaty of paris"
+    assert b["grounded"] is True, "a phrase tier binding is grounded by construction"
+
+
+def test_an_ungrounded_phrase_does_not_close_anything():
+    """The gate that keeps this from becoming a confidently-wrong machine.
+
+    41% of QID closures are already ungrounded — closing on the model's own
+    inference. The phrase tier carries no evidence of referenthood at all, so
+    without corroboration it must not close an intent.
+    """
+    ledger = cot_mod.apply_bindings(
+        _ledger("Identify the treaty."),
+        [(0, "Treaty of Ghent")],
+        {},
+        hop=0,
+        retrieval_memory=["[Retrieval][hop=0]: Unrelated fact about canals."],
+    )
+    assert ledger[0]["status"] == cot_mod.INTENT_OPEN
+    assert ledger[0]["bindings"] == []
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["unknown", "Not specified", "n/a", "  ", "no information", "It"],
+)
+def test_contentless_answers_never_close_an_intent(answer):
+    """Recording "unknown" as a resolved referent would let the chain build on it."""
+    ledger = cot_mod.apply_bindings(
+        _ledger("Identify the treaty."),
+        [(0, answer)],
+        {},
+        hop=0,
+        retrieval_memory=[f"[Retrieval][hop=0]: {answer}"],
+    )
+    assert ledger[0]["status"] == cot_mod.INTENT_OPEN
+
+
+def test_a_sentence_is_not_a_phrase_key():
+    """A key that varies with phrasing manufactures rivals, and a manufactured rival
+    blocks closure permanently at ``replan_max=0``. So the tier only accepts concise
+    text."""
+    long_answer = (
+        "The treaty in question, after reviewing the historical record carefully, "
+        "turns out to have been the Treaty of Paris signed in 1783."
+    )
+    assert cot_mod.resolve_primary_phrase(long_answer) is None
+    assert cot_mod.resolve_primary_phrase("Treaty of Paris") == "treaty of paris"
+    # Determiner- and punctuation-insensitive, so restatements share one key.
+    assert cot_mod.resolve_primary_phrase("the Treaty of Paris") == "treaty of paris"
+    assert (
+        cot_mod.resolve_primary_phrase("Best Buy Co., Inc.")
+        == cot_mod.resolve_primary_phrase("Best Buy Co Inc")
+    )
+
+
+def test_a_phrase_never_contests_a_real_referent():
+    """One answer reaching the ledger through two tiers is one referent.
+
+    Letting the weak tier compete would manufacture a contest, and with
+    ``replan_max=0`` a contested intent never closes — trading the stall this
+    change removes for a different permanent stall.
+    """
+    bindings = [
+        {"surface": "Alan Turing", "qid": "Q7251", "hop": 0, "grounded": True},
+        {"surface": "Alan Turing", "qid": "phr:alan turing", "hop": 1, "grounded": True},
+    ]
+    assert cot_mod.count_rival_referents(bindings) == {"Q7251"}
+
+    # Two phrases with no strong referent present still compete — that is a real
+    # disagreement about the answer, not an artefact of tiering.
+    two_phrases = [
+        {"surface": "Treaty of Paris", "qid": "phr:treaty of paris", "hop": 0, "grounded": True},
+        {"surface": "Treaty of Ghent", "qid": "phr:treaty of ghent", "hop": 0, "grounded": True},
+    ]
+    assert len(cot_mod.count_rival_referents(two_phrases)) == 2
+
+
+def test_phrase_closure_feeds_the_next_hop():
+    """Why this matters for a 4-hop chain: closure is what anchors the next step.
+
+    ``intermediate_answer`` is populated from closed bindings, so an intent that
+    cannot close cannot hand its referent forward — which is how a deep chain
+    silently loses its anchor and the later hops guess.
+    """
+    mem = ["[Retrieval][hop=0]: Elizabeth Berg was born in Saint Paul."]
+    ledger = cot_mod.apply_bindings(
+        _ledger("Identify Elizabeth Berg's birthplace.", "Find the river by that city."),
+        [(0, "Saint Paul")],
+        {},
+        hop=0,
+        retrieval_memory=mem,
+    )
+    assert ledger[0]["status"] == cot_mod.INTENT_CLOSED
+    assert cot_mod.latest_intermediate_answer(ledger)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Plan-derived depth budget and synthesis findings
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_chain_depth_drives_the_hop_budget():
+    """A linear chain of N needs N hops; ``max_depth=4`` gave a 4-chain zero slack.
+
+    44% of the depth-run failures were "partially resolved, ran out of hops" — a
+    4-hop chain admits one executable intent per hop, so a single hop that fails to
+    close makes the question unanswerable regardless of plan quality.
+    """
+    chain = cot_mod.build_plan_ledger(["A", "B", "C", "D"], None, [-1, 0, 1, 2])
+    assert cot_mod.plan_chain_depth(chain) == 4
+    assert cot_mod.effective_max_depth({"max_depth": 4, "plan_ledger": chain}) == 5
+
+    # A flat plan asks for nothing extra — this is not a blanket budget increase.
+    flat = cot_mod.build_plan_ledger(["A", "B", "C", "D"], None, [-1, -1, -1, -1])
+    assert cot_mod.plan_chain_depth(flat) == 1
+    assert cot_mod.effective_max_depth({"max_depth": 4, "plan_ledger": flat}) == 4
+
+
+def test_the_budget_never_shrinks_and_never_applies_without_a_plan():
+    # No ledger (the no-plan arm) must be untouched, or the control is not a control.
+    assert cot_mod.effective_max_depth({"max_depth": 4, "plan_ledger": []}) == 4
+    # A short chain under a generous configured budget must not lower it.
+    short = cot_mod.build_plan_ledger(["A", "B"], None, [-1, 0])
+    assert cot_mod.effective_max_depth({"max_depth": 10, "plan_ledger": short}) == 10
+
+
+def test_chain_depth_terminates_on_a_cycle():
+    """A malformed ledger must not take the run down with unbounded recursion."""
+    led = cot_mod.build_plan_ledger(["A", "B"], None, [-1, 0])
+    led[0]["depends_on"] = 1  # cycle injected past the sanitizer
+    assert cot_mod.plan_chain_depth(led) <= len(led) + 1
+
+
+def test_resolved_findings_carries_only_grounded_surviving_bindings():
+    """The 10 recoverable rows: the answer was in evidence and synthesis lost it.
+
+    Only grounded bindings, so synthesis never sees an unverified inference; and
+    never a falsified intent, whose premise retrieval has already contradicted.
+    """
+    led = cot_mod.build_plan_ledger(["Who founded it?", "When?", "Where?"])
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Ada Lovelace", "qid": "Q7259", "hop": 0, "grounded": True}],
+    )
+    led[1].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "1843", "qid": "lit:1843", "hop": 1, "grounded": False}],
+    )
+    led[2].update(
+        status=cot_mod.INTENT_CLOSED,
+        falsified=True,
+        bindings=[{"surface": "London", "qid": "Q84", "hop": 1, "grounded": True}],
+    )
+    findings = cot_mod.resolved_findings(led)
+    assert findings == ["Who founded it -> Ada Lovelace"]
+    assert not any("1843" in f for f in findings), "ungrounded inference must not reach synthesis"
+    assert not any("London" in f for f in findings), "a falsified premise must not be restated"
+
+
+def test_synthesis_input_renders_findings_last():
+    """The input guard drops the middle of an oversized payload, so the shortest and
+    highest-value block has to be at the tail."""
+    inp = roles_mod.FinalAnswerSynthesisInput(
+        question="Q?",
+        candidate_answers=["a", "b"],
+        context="some evidence",
+        resolved_findings=["Who founded it -> Ada Lovelace"],
+    )
+    s = str(inp)
+    assert s.index("resolved_findings") > s.index("supporting_evidence")
+    assert "- Who founded it -> Ada Lovelace" in s
+    # Absent findings must not add an empty section.
+    assert "resolved_findings" not in str(
+        roles_mod.FinalAnswerSynthesisInput(question="Q?", candidate_answers=["a"])
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Evidence slicing: query-aware fallback + plan-directed escalation
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_no_reranker_slice_is_query_aware():
+    """The identity slice ignored the query, which broke per-query reranking.
+
+    ``rerank_per_query`` exists so each subquestion keeps its own top-k. With an
+    identity slice every subquestion received the *same* first-k passages, so the
+    union across a fan-out was k passages in total rather than k per query — only
+    the first 10 passages in arrival order ever reached the extractor, however wide
+    the retrieval.
+    """
+    items = [
+        "filler about canals and barges",
+        "more unrelated filler text here",
+        "The Treaty of Paris ceded the territory west to the Mississippi",
+    ]
+    got = cot_mod._lexical_top_k("Which treaty ceded the territory?", items, 1)
+    assert got == [items[2]], "the relevant passage must survive a slice of 1"
+    # No content terms in the query -> fall back to arrival order, unchanged behaviour.
+    assert cot_mod._lexical_top_k("the of and", items, 2) == items[:2]
+    # A slice wider than the candidate set is a no-op.
+    assert cot_mod._lexical_top_k("treaty", items, 99) == items
+
+
+@pytest.mark.asyncio
+async def test_per_query_budgets_give_each_subquestion_its_own_slice():
+    items = [f"passage about alpha {i}" for i in range(5)] + [
+        f"passage about beta {i}" for i in range(5)
+    ]
+    merged = await cot_mod.rerank_per_query(
+        ["alpha", "beta"], items, 1, None, per_query_top_k={"beta": 3}
+    )
+    assert sum(1 for m in merged if "alpha" in m) == 1
+    assert sum(1 for m in merged if "beta" in m) == 3, "beta bought a wider slice"
+
+
+def test_only_an_already_failing_intent_gets_a_wider_slice():
+    """Escalation must not fire on speculation — the cheap slice gets first refusal.
+
+    This is the one lever the no-plan arm structurally cannot use: identifying a
+    starving question needs the per-intent attempt history, which only the ledger
+    has.
+    """
+    ledger = cot_mod.build_plan_ledger(["fresh intent", "failing intent"])
+    ledger[1]["attempts"] = [{"query": "q1", "n_facts": 0, "hop": 0},
+                             {"query": "q2", "n_facts": 0, "hop": 1}]
+    state = {
+        "plan_ledger": ledger,
+        "subquestion_serves_intent": [0, 1],
+    }
+    subqs = ["ask about the fresh one", "ask about the failing one"]
+    budgets = cot_mod._starving_query_budgets(state, subqs, 10, stall_after=2)
+    # Only the failing intent's subquestion is selected. The *size* of its budget is
+    # ``_STARVING_TOP_K_MULTIPLIER``, currently 1 — escalation is off because at 3x it
+    # cost +34% input tokens for zero accuracy (dep_plan_v3 vs dep_plan_v2, both
+    # 32/120). Assert the targeting, which is the part that must stay correct.
+    assert set(budgets) == {"ask about the failing one"}
+    assert budgets["ask about the failing one"] == 10 * cot_mod._STARVING_TOP_K_MULTIPLIER
+
+    # A closed intent is not starving, whatever its attempt count.
+    ledger[1]["status"] = cot_mod.INTENT_CLOSED
+    assert cot_mod._starving_query_budgets(state, subqs, 10, stall_after=2) == {}
+
+
+def test_no_plan_means_no_escalation():
+    """A0 regression lock: without a ledger the slicing is untouched."""
+    assert cot_mod._starving_query_budgets({"plan_ledger": []}, ["q"], 10, 2) == {}
+    assert cot_mod._starving_query_budgets({}, ["q"], 10, 2) == {}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The negative record: failed queries reach the generator
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_an_unresolved_intent_shows_what_already_failed():
+    """The measured gap: 43 of 65 attempt pairs on open intents were near-duplicate
+    re-issues (66%), while retrieval returned zero facts only 3 times in 1010
+    attempts. The angle was the problem and nothing in the prompt carried it."""
+    led = cot_mod.build_plan_ledger(["Identify the birthplace."])
+    led[0]["attempts"] = [
+        {"query": "Where was Elizabeth Berg born?", "n_facts": 9, "hop": 0},
+        {"query": "What is Elizabeth Berg's birthplace?", "n_facts": 4, "hop": 1},
+    ]
+    rendered = cot_mod.render_plan_for_prompt("First the birthplace.", led)
+    assert "[open] Identify the birthplace." in rendered
+    assert "already asked, did not resolve it: Where was Elizabeth Berg born?" in rendered
+    assert "already asked, did not resolve it: What is Elizabeth Berg's birthplace?" in rendered
+    # Most recent first — the freshest failure is the most informative.
+    assert rendered.index("birthplace?") < rendered.index("born?")
+
+
+def test_the_negative_record_is_bounded_and_deduplicated():
+    led = cot_mod.build_plan_ledger(["Find it."])
+    led[0]["attempts"] = (
+        [{"query": f"query number {i}", "n_facts": 1, "hop": i} for i in range(6)]
+        + [{"query": "query number 5", "n_facts": 1, "hop": 6}]  # exact repeat
+    )
+    rendered = cot_mod.render_plan_for_prompt("p", led)
+    shown = [l for l in rendered.splitlines() if "already asked" in l]
+    assert len(shown) == cot_mod._MAX_RENDERED_ATTEMPTS
+    assert len(set(shown)) == len(shown), "a repeated query must be listed once"
+
+
+def test_resolved_and_blocked_intents_do_not_list_attempts():
+    """A closed intent's history is noise; a blocked one must not be asked at all."""
+    led = cot_mod.build_plan_ledger(["A", "B"], None, [-1, 0])
+    for e in led:
+        e["attempts"] = [{"query": "some query", "n_facts": 3, "hop": 0}]
+    # B is blocked on A while A is open.
+    rendered = cot_mod.render_plan_for_prompt("p", led)
+    assert rendered.count("already asked") == 1, "only the open intent lists attempts"
+
+    led[0].update(status=cot_mod.INTENT_CLOSED, closed_at=0,
+                  bindings=[{"surface": "X", "qid": "Q1", "hop": 0, "grounded": True}])
+    assert "already asked" not in cot_mod.render_plan_for_prompt("p", [led[0]])
+
+
+def test_the_prompt_forbids_rewording_a_ruled_out_angle():
+    p = roles_mod.GENERATE_SUBQUESTION_PROMPT
+    assert "already asked, did not resolve it:" in p, "the rule must name the rendered marker"
+    assert "do not reword them" in p
+    # The worked example is what stops "ask differently" collapsing into a synonym.
+    assert "same query, reworded" in p
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Oversized-passage compression (the evidence ceiling)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_buried_fact_survives_compression_where_truncation_loses_it():
+    """The dominant failure mode, reproduced and fixed at unit level.
+
+    The EXTRACTOR was called with a mean prompt of 89,277 tokens against a
+    20,000-token ceiling, and the guard keeps head+tail and drops the middle. A fact
+    in the body of a long crawled page was therefore discarded however relevant —
+    which is the most likely cause of "every intent resolved, gold never retrieved"
+    (41% of failures).
+    """
+    filler = "unrelated boilerplate about shipping schedules. " * 400
+    needle = "The Treaty of Paris ceded the territory west to the Mississippi River."
+    page = filler + needle + filler
+    budget = 4000
+    assert len(page) > budget * 4, "the fixture must be genuinely oversized"
+
+    # Head+tail truncation, i.e. the old behaviour, loses it.
+    head_tail = page[: budget // 2] + page[-(budget // 2):]
+    assert needle not in head_tail
+
+    kept = cot_mod._relevant_windows(page, "Which treaty ceded the territory?", budget)
+    assert needle in kept, "query-relevant window selection must keep the answer"
+    assert len(kept) <= budget + len(cot_mod._ELISION) * 4
+
+
+def test_compression_preserves_document_order_and_marks_gaps():
+    a = "Alpha section mentions the treaty explicitly. " * 20
+    mid = "irrelevant middle. " * 300
+    b = "Beta section also discusses the treaty terms. " * 20
+    kept = cot_mod._relevant_windows(a + mid + b, "treaty", 3000)
+    assert kept.index("Alpha") < kept.index("Beta"), "windows must return to document order"
+    assert cot_mod._ELISION in kept, "a gap must be marked so the extractor knows"
+
+
+def test_compression_is_a_no_op_for_normal_passages():
+    """Only oversized items are touched, so ordinary retrieval is unchanged."""
+    small = "A short passage about the treaty."
+    assert cot_mod._relevant_windows(small, "treaty", 10_000) == small
+
+
+def test_compression_falls_back_to_the_head_without_a_usable_query():
+    page = "content " * 5000
+    got = cot_mod._relevant_windows(page, "the of and", 1000)
+    assert got == page.strip()[:1000], "no query terms -> bounded head, not an error"
+
+
+@pytest.mark.asyncio
+async def test_extract_facts_compresses_before_batching(monkeypatch):
+    """A single oversized page must not become one enormous prompt."""
+    seen: List[str] = []
+
+    async def fake_exec(registry, role, input_data, *a, **k):
+        seen.append(input_data.raw_data)
+        return roles_mod.ExtractionOutput(relevant_information=["fact"]), {}
+
+    monkeypatch.setattr(cot_mod, "execute_role_lc", fake_exec)
+    huge = ("filler. " * 2000) + "The answer is Paris." + ("filler. " * 2000)
+    await cot_mod.extract_facts(None, "Where is it?", ["Where is the answer?"], [huge], 4000)
+    assert seen, "the extractor must still be called"
+    assert all(len(blob) <= 4000 + 200 for blob in seen), (
+        f"no batch may blow the budget; got {[len(b) for b in seen]}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# The four fixes for the measured plan failures. Each test names the number that
+# motivated it, because each of these was a *harm* the plan was causing.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_scaffolding_referents_never_reach_synthesis():
+    """The measured harm: the plan doubled the rate of answering with an intermediate.
+
+    Paired over 3 seeds x 120 questions, answering with a non-terminal referent ran at
+    10.6% with the plan against 5.3% without, discordant 43 (31/12), sign test
+    p = 0.0054, and 87% of those answers were wrong. Cause: ``resolved_findings`` fed
+    *every* closed intent to synthesis, and the synthesis prompt ranks it above all
+    other context — so a hop-1 referent arrived as the highest-authority statement.
+    """
+    led = cot_mod.build_plan_ledger(
+        ["Who was Hagar's spouse?", "Who did he marry after Sarah died?"],
+        depends_on=[None, 0],
+    )
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Abraham", "qid": "Q17997608", "hop": 0, "grounded": True}],
+    )
+    led[1].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Keturah", "qid": "Q243871", "hop": 2, "grounded": True}],
+    )
+    findings = cot_mod.resolved_findings(led)
+    assert findings == ["Who did he marry after Sarah died -> Keturah"]
+    assert not any("Abraham" in f for f in findings), (
+        "intent 0 is scaffolding for intent 1; promoting its referent to synthesis is "
+        "what produced the answer 'Abraham' when the gold was 'Keturah'"
+    )
+
+
+def test_a_flat_plan_keeps_every_finding():
+    """No dependencies means no scaffolding, so the terminal filter must be inert."""
+    led = cot_mod.build_plan_ledger(["Who directed it?", "Who scored it?"])
+    for i, (s, q) in enumerate([("Kubrick", "Q2201"), ("Ligeti", "Q76326")]):
+        led[i].update(
+            status=cot_mod.INTENT_CLOSED,
+            bindings=[{"surface": s, "qid": q, "hop": i, "grounded": True}],
+        )
+    assert len(cot_mod.resolved_findings(led)) == 2
+
+
+def test_the_plan_can_end_a_question_when_its_target_resolves():
+    """96 of 360 questions ran a mean 1.65 hops after the plan had nothing left."""
+    led = cot_mod.build_plan_ledger(["Who is the spouse?", "Where born?"], depends_on=[None, 0])
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Abraham", "qid": "Q1", "hop": 0, "grounded": True}],
+    )
+    # Scaffolding closed but the target still open — must NOT stop.
+    assert not cot_mod.plan_target_resolved(led)
+    led[1].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Ur", "qid": "Q2", "hop": 1, "grounded": True}],
+    )
+    assert cot_mod.plan_target_resolved(led)
+
+
+def test_an_ungrounded_or_empty_plan_never_stops_the_loop():
+    """A stop condition that fires on no evidence would truncate every question."""
+    assert not cot_mod.plan_target_resolved([])
+    led = cot_mod.build_plan_ledger(["Where born?"])
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "somewhere", "qid": None, "hop": 0, "grounded": False}],
+    )
+    assert not cot_mod.plan_target_resolved(led), "an uncorroborated phrase must not end the question"
+    led[0].update(falsified=True, bindings=[{"surface": "Ur", "qid": "Q2", "hop": 0, "grounded": True}])
+    assert not cot_mod.plan_target_resolved(led), "a falsified target must not end the question"
+
+
+def test_a_circumlocuting_query_gets_its_referent_back():
+    """23% of 3,328 issued queries omitted a referent the plan had already bound.
+
+    The retrieval query is the subquestion, so a description retrieves documents about
+    the description while the needed document is indexed under the name.
+    """
+    led = cot_mod.build_plan_ledger(
+        ["Who performs 'Hits'?", "When were they born?"], depends_on=[None, 0]
+    )
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Dolly Parton", "qid": "Q483994", "hop": 0, "grounded": True}],
+    )
+    q = "What is the date of birth for the performer associated with 'Hits'?"
+    assert cot_mod.ground_retrieval_query(q, led, 1) == q + " Dolly Parton"
+    # Already named → unchanged, no duplicate term.
+    named = "What is Dolly Parton's date of birth?"
+    assert cot_mod.ground_retrieval_query(named, led, 1) == named
+    # No plan, or an unattributed subquestion → untouched.
+    assert cot_mod.ground_retrieval_query(q, [], 1) == q
+    assert cot_mod.ground_retrieval_query(q, led, None) == q
+    # The scaffolding intent itself has no prerequisite → untouched.
+    assert cot_mod.ground_retrieval_query(q, led, 0) == q
+
+
+def test_grounding_refuses_a_sentence_and_a_falsified_referent():
+    """The ledger's ``surface`` may be a fragment; appending one swamps the query."""
+    led = cot_mod.build_plan_ledger(["What changed?", "When?"], depends_on=[None, 0])
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{
+            "surface": "The name 'Burma' did not change to 'Thailand'.",
+            "qid": None, "hop": 0, "grounded": True,
+        }],
+    )
+    q = "When was the name changed?"
+    assert cot_mod.ground_retrieval_query(q, led, 1) == q, "a sentence is not a name"
+    led[0].update(
+        falsified=True,
+        bindings=[{"surface": "Siam", "qid": "Q3", "hop": 0, "grounded": True}],
+    )
+    assert cot_mod.ground_retrieval_query(q, led, 1) == q, "a retracted referent must not be re-asserted"
+
+
+def test_the_pruning_budget_tracks_the_number_of_open_intents():
+    """``triple_pruner`` is 45.3% of all LLM calls at a fixed ceil(64/16)=4 per fetch."""
+    from langgraph_coe.tools import wikidata as wd
+
+    try:
+        wd.set_plan_focus(["a"], 1)
+        assert wd._planned_top_k(64) == 16, "one open intent needs one batch, not four"
+        wd.set_plan_focus(["a", "b"], 2)
+        assert wd._planned_top_k(64) == 32
+        wd.set_plan_focus([f"i{i}" for i in range(9)], 9)
+        assert wd._planned_top_k(64) == 64, "must never exceed the configured budget"
+        assert wd._focused_query("q") == "q i0 i1 i2 i3 i4 i5 i6 i7 i8"
+        wd.clear_plan_focus()
+        assert wd._planned_top_k(64) == 64, "no plan must be byte-identical to today"
+        assert wd._focused_query("q") == "q"
+        wd.set_plan_focus([], 0)
+        assert wd._planned_top_k(64) == 64, "an empty intent list is not a focus"
+    finally:
+        wd.clear_plan_focus()
+
+
+def test_scaffolding_is_labelled_not_merely_hidden():
+    """Omitting scaffolding did not work: the leak ratio was 1.8x before AND after.
+
+    The referents survive in ``candidate_answers`` via ``text_memory``, which both arms
+    share, so synthesis has to be told which ones are inputs.
+    """
+    led = cot_mod.build_plan_ledger(
+        ["Who was Hagar's spouse?", "Who did he marry after Sarah died?"],
+        depends_on=[None, 0],
+    )
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Abraham", "qid": "Q1", "hop": 0, "grounded": True}],
+    )
+    led[1].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Keturah", "qid": "Q2", "hop": 2, "grounded": True}],
+    )
+    scaff = cot_mod.scaffolding_findings(led)
+    assert len(scaff) == 1 and scaff[0].startswith("Abraham")
+    assert "input to" in scaff[0]
+    # The two sets must partition the closed intents — never overlap.
+    resolved = cot_mod.resolved_findings(led)
+    assert not any("Abraham" in r for r in resolved)
+    assert not any("Keturah" in s for s in scaff)
+
+
+def test_a_flat_plan_has_no_scaffolding():
+    led = cot_mod.build_plan_ledger(["Who directed it?", "Who scored it?"])
+    for i, s in enumerate(["Kubrick", "Ligeti"]):
+        led[i].update(
+            status=cot_mod.INTENT_CLOSED,
+            bindings=[{"surface": s, "qid": f"Q{i}", "hop": i, "grounded": True}],
+        )
+    assert cot_mod.scaffolding_findings(led) == []
+    assert len(cot_mod.resolved_findings(led)) == 2
+
+
+def test_an_ungrounded_or_falsified_bridge_is_not_listed_as_excluded():
+    """Excluding a referent the evidence never supported would forbid a valid answer."""
+    led = cot_mod.build_plan_ledger(["Who is X?", "Where born?"], depends_on=[None, 0])
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Guess", "qid": None, "hop": 0, "grounded": False}],
+    )
+    assert cot_mod.scaffolding_findings(led) == []
+    led[0].update(
+        falsified=True,
+        bindings=[{"surface": "Abraham", "qid": "Q1", "hop": 0, "grounded": True}],
+    )
+    assert cot_mod.scaffolding_findings(led) == []
+
+
+def test_the_synthesis_payload_names_the_exclusion_last():
+    """Rendered after resolved_findings: the last thing read is what not to answer."""
+    from langgraph_coe.roles import FinalAnswerSynthesisInput
+
+    s = str(
+        FinalAnswerSynthesisInput(
+            question="Who did the spouse of Hagar marry after Sarah died?",
+            candidate_answers=["Abraham", "Keturah"],
+            resolved_findings=["Who did he marry -> Keturah"],
+            scaffolding_findings=["Abraham (resolved only as the input to: Who was Hagar's spouse)"],
+        )
+    )
+    assert s.index("resolved_findings:") < s.index("intermediate_steps_NOT_the_answer:")
+    assert "None of them can be the final answer." in s
+    # Absent field renders nothing at all.
+    bare = str(
+        FinalAnswerSynthesisInput(question="q", candidate_answers=["a"])
+    )
+    assert "intermediate_steps_NOT_the_answer" not in bare
+
+
+def test_the_synthesis_prompt_forbids_returning_a_bridge_entity():
+    from langgraph_coe.roles import SYNTHESIZE_FINAL_ANSWER_PROMPT as P
+
+    assert "intermediate_steps_NOT_the_answer" in P
+    assert "hard exclusion" in P
+    assert "Never output one as the final answer" in P
+    # The measured reason must stay in the prompt: these are the *crispest* candidates.
+    assert "crispest" in P
+
+
+def test_gather_evidence_grounds_all_three_fanouts():
+    """MCTS's retrieval twin silently bypassed every plan mechanism.
+
+    ``gather_evidence`` is used only by ``mcts.py`` and sent the raw subquestion to
+    corpus, KG *and* web. So under ``search.strategy=mcts`` the plan's measured
+    retrieval effect (41.4% recall vs 37.5% without, 461 paired questions) could not
+    reproduce — the CoT arm and the MCTS arm were not running the same retrieval.
+    """
+    import asyncio
+
+    led = cot_mod.build_plan_ledger(
+        ["Who performs 'Hits'?", "When were they born?"], depends_on=[None, 0]
+    )
+    led[0].update(
+        status=cot_mod.INTENT_CLOSED,
+        bindings=[{"surface": "Dolly Parton", "qid": "Q483994", "hop": 0, "grounded": True}],
+    )
+    subq = "What is the date of birth for the performer associated with 'Hits'?"
+
+    corpus_seen, kg_seen, web_seen = [], [], []
+
+    class _Corpus:
+        async def ainvoke(self, payload):
+            corpus_seen.append(payload["query"])
+            return []
+
+    class _Graph:
+        def __init__(self, sink, key):
+            self.sink, self.key = sink, key
+
+        async def ainvoke(self, payload):
+            self.sink.append(payload["subquery"])
+            return {self.key: [], "triples": [], "results": []}
+
+    async def _fake_rerank(subqs, pooled, top_k, cfg):
+        return list(pooled)
+
+    async def _fake_extract(registry, question, subqs, ctx, max_chars):
+        return []
+
+    orig = (cot_mod.corpus_search, cot_mod.rerank_per_query, cot_mod.extract_facts)
+    cot_mod.corpus_search = _Corpus()
+    cot_mod.rerank_per_query = _fake_rerank
+    cot_mod.extract_facts = _fake_extract
+    try:
+        asyncio.run(
+            cot_mod.gather_evidence(
+                None,
+                "Who performs 'Hits' and when were they born?",
+                [subq],
+                needs_kg=[True],
+                kg_graph=_Graph(kg_seen, "kg_articles"),
+                web_graph=_Graph(web_seen, "results"),
+                web_enabled=True,
+                corpus_enabled=True,
+                plan_ledger=led,
+                serves_intent=[1],
+            )
+        )
+    finally:
+        cot_mod.corpus_search, cot_mod.rerank_per_query, cot_mod.extract_facts = orig
+
+    expected = subq + " Dolly Parton"
+    assert corpus_seen == [expected], f"corpus fan-out not grounded: {corpus_seen}"
+    assert kg_seen == [expected], f"KG fan-out not grounded: {kg_seen}"
+    assert web_seen == [expected], f"web fan-out not grounded: {web_seen}"
+
+
+def test_gather_evidence_is_unchanged_without_a_plan():
+    """``_reverify_memory`` passes facts, not subquestions — it must not be rewritten."""
+    import asyncio
+
+    seen = []
+
+    class _Corpus:
+        async def ainvoke(self, payload):
+            seen.append(payload["query"])
+            return []
+
+    async def _fake_rerank(subqs, pooled, top_k, cfg):
+        return list(pooled)
+
+    async def _fake_extract(registry, question, subqs, ctx, max_chars):
+        return []
+
+    fact = "Abraham married Keturah after the death of Sarah."
+    orig = (cot_mod.corpus_search, cot_mod.rerank_per_query, cot_mod.extract_facts)
+    cot_mod.corpus_search = _Corpus()
+    cot_mod.rerank_per_query = _fake_rerank
+    cot_mod.extract_facts = _fake_extract
+    try:
+        asyncio.run(
+            cot_mod.gather_evidence(
+                None, "q", [fact], needs_kg=[False], corpus_enabled=True
+            )
+        )
+    finally:
+        cot_mod.corpus_search, cot_mod.rerank_per_query, cot_mod.extract_facts = orig
+    assert seen == [fact], "a fact with no attribution must be re-verified verbatim"
+
+
+def test_gather_evidence_clears_the_pruning_focus():
+    """A leaked focus would scope a later retrieval to a stale plan state."""
+    import asyncio
+
+    from langgraph_coe.tools import wikidata as wd
+
+    led = cot_mod.build_plan_ledger(["Who performs 'Hits'?"])
+
+    async def _fake_rerank(subqs, pooled, top_k, cfg):
+        return list(pooled)
+
+    async def _fake_extract(registry, question, subqs, ctx, max_chars):
+        return []
+
+    orig = (cot_mod.rerank_per_query, cot_mod.extract_facts)
+    cot_mod.rerank_per_query = _fake_rerank
+    cot_mod.extract_facts = _fake_extract
+    try:
+        asyncio.run(
+            cot_mod.gather_evidence(
+                None, "q", ["some subquestion here"], corpus_enabled=False,
+                plan_ledger=led,
+            )
+        )
+    finally:
+        cot_mod.rerank_per_query, cot_mod.extract_facts = orig
+        wd.clear_plan_focus()
+    assert wd.read_plan_focus() is None, "focus must not outlive the fan-out"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MCTS plan scope. Tree-scope sharing was measured to collapse the search
+# (distinct subquestions 9.9 -> 6.3, sibling overlap 10.2% -> 23.1%). Rollout
+# scope keeps the plan's within-chain benefits without coupling siblings.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_rollout_scope_is_the_default():
+    from langgraph_coe.config import PlanConfig
+
+    assert PlanConfig().mcts_plan_scope == "rollout", (
+        "tree scope cut distinct subquestions per question by 36% and more than "
+        "doubled sibling-subtree overlap at identical accuracy"
+    )
+
+
+def test_tree_scope_adds_the_root_plan_nodes_and_rollout_scope_does_not():
+    """Under rollout scope the tree must hold no plan at all."""
+    import langgraph_coe.graphs.mcts as mcts_mod
+
+    src = inspect.getsource(mcts_mod.build_mcts_graph)
+    assert 'tree_plan = plan_enabled and plan_scope == "tree"' in inspect.getsource(
+        mcts_mod.build_mcts_graph
+    ) or 'plan_scope == "tree"' in src
+    # The root-level gen_plan/plan_gate must be gated on tree scope, not on
+    # plan_enabled — otherwise rollout scope would still mint a shared tree plan.
+    assert 'if tree_plan:\n        builder.add_node("gen_plan"' in src
+
+
+def test_the_rollout_plans_for_itself_under_rollout_scope():
+    """``gen_plan`` returns early when ``plan`` is non-empty, so it must be unset.
+
+    Seeding the parent's plan is exactly what made sibling rollouts converge.
+    """
+    import langgraph_coe.graphs.mcts as mcts_mod
+
+    src = inspect.getsource(mcts_mod.build_mcts_graph)
+    i = src.index("elif rollout_plan:")
+    block = src[i : i + 700]
+    assert '"plan_frozen"] = False' in block or '"plan_frozen": False' in block
+    # Must NOT seed plan / plan_ledger in the rollout payload under this branch.
+    upto_next = block.split("cot_out = await")[0]
+    assert '"plan":' not in upto_next, "seeding the parent plan defeats rollout scope"
+    assert '"plan_ledger":' not in upto_next
+
+
+def test_gen_plan_regenerates_only_when_no_plan_was_handed_down():
+    """The inherit-vs-generate switch that rollout scope depends on."""
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    i = src.index("async def gen_plan")
+    head = src[i : i + 400]
+    assert 'if state.get("plan"):' in head and "return {}" in head
+
+
+def test_the_rollout_ledger_reaches_synthesis_but_never_a_sibling():
+    """The confirmed mechanism (scaffolding exclusion) must survive rollout scope.
+
+    It drove the scaffolding-answer rate from 1.8x the no-plan arm to exact parity in
+    CoT, so losing it under MCTS would discard the one effect with a confirmed cause.
+    """
+    import langgraph_coe.graphs.mcts as mcts_mod
+
+    src = inspect.getsource(mcts_mod.build_mcts_graph)
+    # Written to its own channel, so nothing inherits it.
+    assert 'out["rollout_plan_ledger"]' in src
+    # And consumed by synthesis, with the tree ledger taking precedence.
+    assert 'state.get("plan_ledger")\n            or state.get("rollout_plan_ledger")' in src
+    assert "scaffolding_findings(synthesis_ledger)" in src
+    assert "resolved_findings(synthesis_ledger)" in src
+
+
+def test_initial_mcts_state_seeds_the_rollout_ledger():
+    from langgraph_coe.config import LangGraphCoeConfig
+    from langgraph_coe.system import _initial_mcts_state
+
+    st = _initial_mcts_state("q", LangGraphCoeConfig())
+    assert "rollout_plan_ledger" in st and st["rollout_plan_ledger"] == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bypasses found by the audit. Each was a place a plan mechanism was computed
+# and then silently discarded.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_kg_gate_tests_the_query_it_will_actually_send():
+    """The gate read the ungrounded subquestion while sending the grounded one.
+
+    A circumlocuting subquestion names no entity, so ``_subq_hits_known_entity`` was
+    False and the KG was skipped — for precisely the queries that grounding had just
+    made KG-answerable. Reachable in the shipped CoT config.
+    """
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    i = src.index("tagged_kg = needs_kg[i]")
+    block = src[i : i + 300]
+    assert "_subq_hits_known_entity(rq, known_labels)" in block
+    assert "_subq_hits_known_entity(sq, known_labels)" not in block
+    # And the same gate inside gather_evidence.
+    gsrc = inspect.getsource(c.gather_evidence)
+    assert "_subq_hits_known_entity(queries[i], known_labels)" in gsrc
+
+    # Behavioural: the grounded form hits, the bare form does not.
+    labels = ["dolly parton"]
+    bare = "What is the date of birth for the performer associated with 'Hits'?"
+    assert not c._subq_hits_known_entity(bare, labels)
+    assert c._subq_hits_known_entity(bare + " Dolly Parton", labels)
+
+
+def test_a_plan_chain_cannot_deepen_an_mcts_rollout():
+    """``effective_max_depth`` raises max_depth to fit a chain — right in CoT, wrong here.
+
+    ``max_simulation_depth`` sizes the tree, so a rollout running deeper than its budget
+    charges the difference to every iteration.
+    """
+    led = cot_mod.build_plan_ledger(
+        ["a", "b", "c", "d"], depends_on=[None, 0, 1, 2]
+    )
+    assert cot_mod.plan_chain_depth(led) == 4
+    soft = {"max_depth": 2, "plan_ledger": led}
+    assert cot_mod.effective_max_depth(soft) == 5, "standalone CoT still gets the chain"
+    hard = {"max_depth": 2, "plan_ledger": led, "max_depth_is_hard": True}
+    assert cot_mod.effective_max_depth(hard) == 2, "a rollout budget is a hard cap"
+    # And the rollout payload sets it.
+    import langgraph_coe.graphs.mcts as m
+
+    assert '"max_depth_is_hard": True' in inspect.getsource(m.build_mcts_graph)
+
+
+def test_a_rollout_that_resolved_its_plan_counts_as_a_sufficiency_vote():
+    """``route_after_subq`` reaches gen_final without setting ``is_answerable``.
+
+    Reading only that flag discarded the plan's own stop condition, so MCTS never
+    learned that a rollout finished because the plan was complete.
+    """
+    import langgraph_coe.graphs.mcts as m
+
+    src = inspect.getsource(m.build_mcts_graph)
+    assert 'plan_target_resolved(cot_out.get("plan_ledger") or [])' in src
+    # Anchor on the real assignment, not the early-return ``: False`` above it.
+    i = src.index('"rollout_semantic_signal": bool(')
+    assert "or plan_target_resolved" in src[i : i + 260]
+
+
+def test_self_correction_reretrieval_keeps_its_intent_attribution():
+    """``_gen_subqa`` had the intent index and dropped it when writing the node.
+
+    So ``_gen_self_correct`` re-retrieved a circumlocuting sub-question verbatim —
+    the exact query class ground_retrieval_query exists to repair.
+    """
+    import langgraph_coe.graphs.mcts as m
+
+    src = inspect.getsource(m.build_mcts_graph)
+    assert '"serves_intent": intent_idx' in src, "attribution must be stored on the node"
+    assert 'content.get("serves_intent")' in src, "and read back for re-retrieval"
+    assert "serves_intent=[target_intent]" in src, "and forwarded to gather_evidence"
+
+
+def test_memory_reverification_keeps_the_pruning_focus():
+    """Omitting the ledger does not leave the focus alone — it disables it.
+
+    ``gather_evidence`` calls ``set_plan_focus([], 0)``, which sets the ContextVar to
+    None, so re-verification paid the unfocused 64-candidate pruner cost while every
+    sibling retrieval in the same iteration paid 16.
+    """
+    import langgraph_coe.graphs.mcts as m
+
+    src = inspect.getsource(m.build_mcts_graph)
+    i = src.index("needs_kg=[False] * len(facts_q)")
+    block = src[i : i + 700]
+    assert 'plan_ledger=view.get("plan_ledger")' in block
+    # No ``serves_intent=`` KWARG (the comment names it, which is fine): passing one
+    # would let ground_retrieval_query rewrite the fact strings being re-verified.
+    assert "serves_intent=" not in block.split("memory_context")[0], (
+        "facts must not be rewritten — only the focus is wanted here"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Terminal-referent verification. The dominant conversion failure: on 70
+# questions whose memory held the gold and whose answer was still wrong, the
+# terminal intent had closed on the WRONG referent 67% of the time, and the
+# consolidator's conflict detection caught only 3% — the rest were silent.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_terminal_intents_are_the_ones_nothing_depends_on():
+    led = cot_mod.build_plan_ledger(
+        ["who is A", "where born", "what year"], depends_on=[None, 0, 1]
+    )
+    assert cot_mod.terminal_intents(led) == [2]
+    flat = cot_mod.build_plan_ledger(["who directed", "who scored"])
+    assert cot_mod.terminal_intents(flat) == [0, 1], "a flat plan is all terminal"
+    assert cot_mod.terminal_intents([]) == []
+
+
+def test_verification_is_disabled_by_default_and_configurable():
+    """Measured out: paired conversion 14/18 vs 14/18 at +5.8 calls/question."""
+    from langgraph_coe.config import PlanConfig
+
+    assert PlanConfig().verify_terminal_referents is False
+    assert PlanConfig(verify_terminal_referents=True).verify_terminal_referents is True
+
+
+def test_the_verifier_replaces_a_referent_the_evidence_contradicts():
+    """The Canyon case: two different Canyons, the answerer picked the wrong county."""
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    i = src.index("if verify_terminal and candidates:")
+    block = src[i : i + 4200]
+    # Only terminal intents are checked — a scaffolding error surfaces when its
+    # dependent fails, and checking every intent would cost a call per subquestion.
+    assert "terminals = set(terminal_intents(ledger" in block
+    assert "if idx in terminals" in block
+    # A replacement must itself be corroborated by the evidence.
+    assert "_is_corroborated(refined, evidence)" in block
+    # correct/partial close unchanged; incorrect/unsupported are acted on.
+    assert 'status in ("correct", "partial")' in block
+    # An uncorroborated refinement withholds rather than binding either value.
+    assert 'candidates[pos] = (idx, "")' in block
+    # And a failure of the verification call itself must not block the hop.
+    assert "closing on the unverified answers" in block
+
+
+def test_the_verifier_reuses_self_corrector_rather_than_a_new_role():
+    """It already returns correct/partial/incorrect/unsupported plus a refinement."""
+    import langgraph_coe.graphs.cot as c
+    from langgraph_coe.roles import SELF_CORRECTOR, SelfCorrectionOutput
+
+    assert SELF_CORRECTOR.output_model is SelfCorrectionOutput
+    src = inspect.getsource(c.build_cot_graph)
+    assert "execute_role_lc(registry, SELF_CORRECTOR, inputs)" in src
+    # The plan is passed so the check knows which intent is being verified.
+    i = src.index("if verify_terminal and candidates:")
+    assert "render_plan_for_prompt(" in src[i : i + 4200]
+
+
+def test_a_safe_default_verification_does_not_disturb_the_binding():
+    """A retry-exhausted parse failure must not be read as "incorrect"."""
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    i = src.index("if verify_terminal and candidates:")
+    block = src[i : i + 4200]
+    assert "is_safe_default(out)" in block and "continue" in block
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Guards (polarity intents): a truth value is not a referent
+#
+# The PLANNER prompt asks for presuppositions to be hedged into conditionals, so the
+# ledger is full of intents whose answer is yes or no. Everything downstream assumed a
+# referent. Measured over 1,920 questions / 6,250 intents: 399 guards (6.4%), 188 of them
+# terminal, 131 of those closed, and 139 of 284 closed guards bound a full sentence.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_guard_is_recognised_and_an_ordinary_intent_is_not():
+    pol = cot_mod.is_polarity_intent
+    assert pol("Determine whether she had a spouse.")
+    assert pol("Verify whether the identified country maintains border troops.")
+    assert pol("Is the headquarters location of Yaxing Coach a capitol city?")
+    assert pol("If the USS Kajeruna is real, determine whether it was commissioned.")
+    assert pol("Establish whether or not the ranking is settled.")
+    # Not guards: these name a thing to find.
+    assert not pol("Determine the city that shares a border with Saint Paul.")
+    assert not pol("Identify the birthplace of Elizabeth Berg.")
+    assert not pol("Find the three-letter abbreviation for the identified country.")
+    # "if" inside an ordinary intent must not trigger it.
+    assert not pol("Find the river by that city, if it is named in the evidence.")
+    assert not cot_mod.is_polarity_intent("")
+
+
+def test_an_affirmation_is_stripped_so_the_referent_behind_it_resolves():
+    """'Yes, Meg Ryan.' bound Dennis Quaid — the intent's own input — or nothing."""
+    assert cot_mod.strip_affirmation("Yes, Meg Ryan.") == ("Meg Ryan.", True)
+    assert cot_mod.strip_affirmation("No, Yangzhou is not a capital.")[1] is False
+    assert cot_mod.strip_affirmation("Incorrect - Berlin.") == ("Berlin.", False)
+    # No affirmation: unchanged, and polarity unknown rather than assumed.
+    assert cot_mod.strip_affirmation("Meg Ryan") == ("Meg Ryan", None)
+    assert cot_mod.strip_affirmation("") == ("", None)
+    # "Nokia" must not be read as a leading "no", and neither must "no information" —
+    # without the delimiter requirement that left "information", which the phrase tier
+    # closed an intent on.
+    assert cot_mod.strip_affirmation("Nokia") == ("Nokia", None)
+    assert cot_mod.strip_affirmation("no information") == ("no information", None)
+
+
+def test_a_guard_binds_a_truth_value_not_the_intent_s_own_input():
+    led = cot_mod.build_plan_ledger(
+        [
+            "Identify the actor who plays the father.",
+            "Determine whether the identified actor has a wife who is an actress.",
+        ],
+        depends_on=[None, 0],
+    )
+    labels = {"dennis quaid": "Q1", "meg ryan": "Q2"}
+    mem = [
+        "[Retrieval]: Dennis Quaid is married to Meg Ryan.",
+        "[Retrieval]: Yes, Dennis Quaid is married to an actress.",
+    ]
+    out = cot_mod.apply_bindings(
+        led,
+        [
+            (1, "Yes, Dennis Quaid is married to an actress."),
+            (1, "Yes, Meg Ryan."),
+        ],
+        labels,
+        hop=1,
+        retrieval_memory=mem,
+    )
+    entry = out[1]
+    # One polarity key, so the input can no longer masquerade as a rival answer. Before
+    # this, the two surfaces resolved to Q1 and Q2 and the intent went CONTESTED, which
+    # at replan_max=0 blocks closure permanently.
+    assert entry["status"] == cot_mod.INTENT_CLOSED
+    assert [b["qid"] for b in entry["bindings"]] == ["pol:true"]
+    assert entry["bindings"][0]["polarity"] is True
+
+
+def test_a_guard_answered_both_ways_records_the_conflict_and_still_closes():
+    led = cot_mod.build_plan_ledger(["Determine whether X held office."])
+    mem = ["[Retrieval]: Yes, X held office.", "[Retrieval]: No, X never held office."]
+    out = cot_mod.apply_bindings(
+        led,
+        [(0, "Yes, X held office."), (0, "No, X never held office.")],
+        {},
+        hop=0,
+        retrieval_memory=mem,
+    )
+    entry = out[0]
+    assert entry["polarity_conflict"] is True
+    # Closed anyway: a contested guard can never close, and the guard is not what the
+    # question asks, so blocking termination on it only buys hops that cannot help.
+    assert entry["status"] == cot_mod.INTENT_CLOSED
+    assert len(entry["bindings"]) == 1
+
+
+def test_an_affirmed_referent_reaches_synthesis_without_the_affirmation():
+    led = cot_mod.build_plan_ledger(["Identify the wife of the actor."])
+    out = cot_mod.apply_bindings(
+        led,
+        [(0, "Yes, Meg Ryan.")],
+        {"meg ryan": "Q2"},
+        hop=0,
+        retrieval_memory=["[Retrieval]: Dennis Quaid is married to Meg Ryan."],
+    )
+    assert out[0]["bindings"][0]["qid"] == "Q2"
+    assert out[0]["bindings"][0]["surface"] == "Meg Ryan."
+    assert cot_mod.resolved_findings(out) == [
+        "Identify the wife of the actor -> Meg Ryan."
+    ]
+
+
+def test_a_truth_value_is_never_offered_to_synthesis_as_a_candidate_answer():
+    """This block is ranked above every other context source in the prompt."""
+    led = cot_mod.build_plan_ledger(
+        ["Confirm whether the author wrote a short story featuring Herman Wouk."]
+    )
+    out = cot_mod.apply_bindings(
+        led,
+        [(0, "No, Stephen King did not write a short story featuring Herman Wouk.")],
+        {"stephen king": "Q3"},
+        hop=0,
+        retrieval_memory=[
+            "[Retrieval]: No, Stephen King did not write a short story "
+            "featuring Herman Wouk."
+        ],
+    )
+    assert out[0]["status"] == cot_mod.INTENT_CLOSED
+    assert cot_mod.resolved_findings(out) == []
+    assert cot_mod.scaffolding_findings(out) == []
+
+
+def test_a_sentence_is_never_offered_to_synthesis_as_a_candidate_answer():
+    led = cot_mod.build_plan_ledger(["Identify the treaty that ceded the territory."])
+    long_surface = (
+        "The land that became St. Louis was acquired by the United States in 1804 "
+        "as part of the Louisiana Purchase."
+    )
+    out = cot_mod.apply_bindings(
+        led, [(0, long_surface)], {}, hop=0, retrieval_memory=[f"[Retrieval]: {long_surface}"]
+    )
+    # It may well close — the phrase tier is corroborated — but a 20-word sentence
+    # presented at top authority is a paragraph, not a referent to return.
+    assert cot_mod.resolved_findings(out) == []
+
+
+def test_a_guard_is_not_a_termination_target_when_a_real_target_exists():
+    led = cot_mod.build_plan_ledger(
+        [
+            "Identify the birth city.",
+            "Determine whether the identified birth city hosts NASCAR races.",
+            "Identify the track that hosts them.",
+        ],
+        depends_on=[None, 0, 1],
+    )
+    # Only intent 2 is a real target; intent 1 is depended on anyway.
+    assert cot_mod.terminal_intents(led) == [2]
+    flat = cot_mod.build_plan_ledger(
+        [
+            "Identify the track that hosts the races.",
+            "Determine whether the city hosts NASCAR races.",
+        ]
+    )
+    assert cot_mod.terminal_intents(flat) == [0], "the guard is not a target"
+    # All-terminal-guard plans are malformed (2.8% of questions); return them rather
+    # than an empty list so the caller decides.
+    only = cot_mod.build_plan_ledger(["Determine whether the city hosts races."])
+    assert cot_mod.terminal_intents(only) == [0]
+
+
+def test_a_closed_guard_cannot_end_the_loop():
+    """A guard now always closes, so this is what stops it standing in for the answer."""
+    led = cot_mod.build_plan_ledger(["Determine whether the city hosts NASCAR races."])
+    out = cot_mod.apply_bindings(
+        led,
+        [(0, "No, Tucson does not host NASCAR races.")],
+        {},
+        hop=0,
+        retrieval_memory=["[Retrieval]: Tucson does not host NASCAR races."],
+    )
+    assert out[0]["status"] == cot_mod.INTENT_CLOSED
+    assert cot_mod.plan_target_resolved(out) is False
+    # A real target still ends it.
+    real = cot_mod.apply_bindings(
+        cot_mod.build_plan_ledger(["Identify the track."]),
+        [(0, "Tucson Raceway Park")],
+        {},
+        hop=0,
+        retrieval_memory=["[Retrieval]: Tucson Raceway Park is in Tucson."],
+    )
+    assert cot_mod.plan_target_resolved(real) is True
+
+
+def test_a_truth_value_never_enters_a_retrieval_query():
+    led = cot_mod.build_plan_ledger(
+        [
+            "Determine whether the country maintained border troops.",
+            "Find the three-letter abbreviation for the identified country.",
+        ],
+        depends_on=[None, 0],
+    )
+    out = cot_mod.apply_bindings(
+        led,
+        [(0, "No, Germany does not maintain border troops.")],
+        {"germany": "Q183"},
+        hop=0,
+        retrieval_memory=["[Retrieval]: Germany does not maintain border troops."],
+    )
+    subq = "What is the three-letter abbreviation for the identified country?"
+    assert cot_mod.ground_retrieval_query(subq, out, 1) == subq
+
+
+def test_the_planner_prompt_forbids_a_guard_as_the_final_step():
+    prompt = roles_mod.PLANNER.system_prompt
+    assert "never the plan's last step" in prompt
+    # The worked example is the measured failure: the plan closed on "no" for a
+    # question that asked *where* the races are held.
+    assert "Determine whether the identified birthplace hosts NASCAR races" in prompt
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# An intent must not bind the referent its own prerequisites already bound
+#
+# "Earliest mention wins" is right for a concise answer and backwards for a sentence one:
+# in "Dennis Quaid is married to Meg Ryan" the earliest linked entity is the subject the
+# intent was asked *about*. Measured on 5,593 intents with bindings: 897 (16%) resolved to
+# a prerequisite's referent, and 640 closed on nothing else.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_prerequisite_keys_walk_the_chain_transitively():
+    led = cot_mod.build_plan_ledger(
+        ["who is A", "where born", "what river"], depends_on=[None, 0, 1]
+    )
+    led[0]["bindings"] = [{"surface": "Elizabeth Berg", "qid": "Q1"}]
+    led[1]["bindings"] = [{"surface": "Saint Paul", "qid": "Q2"}]
+    assert cot_mod._prerequisite_keys(led, 2) == {"Q1", "Q2"}, "two hops back, not one"
+    assert cot_mod._prerequisite_keys(led, 1) == {"Q1"}
+    assert cot_mod._prerequisite_keys(led, 0) == set()
+    # A guard's truth value is not an input referent, so it is not excluded.
+    led[1]["bindings"] = [{"surface": "Yes", "qid": "pol:true", "polarity": True}]
+    assert cot_mod._prerequisite_keys(led, 2) == {"Q1"}
+
+
+def test_a_cycle_cannot_hang_the_prerequisite_walk():
+    """``build_plan_ledger`` breaks cycles, so this is built by hand on purpose."""
+    led = [
+        {"intent": "a", "depends_on": 1, "bindings": [{"surface": "A", "qid": "Q1"}]},
+        {"intent": "b", "depends_on": 0, "bindings": [{"surface": "B", "qid": "Q2"}]},
+    ]
+    assert cot_mod._prerequisite_keys(led, 0) == {"Q1", "Q2"}
+    # An out-of-range index is ignored rather than raising.
+    assert cot_mod._prerequisite_keys([{"intent": "a", "depends_on": 9}], 0) == set()
+
+
+def test_the_answer_in_the_predicate_wins_over_the_subject_in_the_sentence():
+    led = cot_mod.build_plan_ledger(
+        ["Identify the actor.", "Identify the actor's wife."], depends_on=[None, 0]
+    )
+    led[0]["bindings"] = [{"surface": "Dennis Quaid", "qid": "Q1", "grounded": True}]
+    labels = {"dennis quaid": "Q1", "meg ryan": "Q2"}
+    mem = ["[Retrieval]: Dennis Quaid is married to Meg Ryan."]
+    answer = "Dennis Quaid is married to Meg Ryan."
+    # Off: the subject wins, and the intent closes on its own input.
+    off = cot_mod.apply_bindings(
+        led, [(1, answer)], labels, hop=1, retrieval_memory=mem
+    )
+    assert off[1]["bindings"][0]["qid"] == "Q1"
+    # On: the input is skipped and the predicate's referent is bound.
+    on = cot_mod.apply_bindings(
+        led,
+        [(1, answer)],
+        labels,
+        hop=1,
+        retrieval_memory=mem,
+        skip_input_referent=True,
+    )
+    assert on[1]["bindings"][0]["qid"] == "Q2"
+    assert on[1]["status"] == cot_mod.INTENT_CLOSED
+
+
+def test_an_answer_naming_only_the_input_still_binds_it():
+    """Some intents legitimately re-name their subject; binding nothing is worse."""
+    led = cot_mod.build_plan_ledger(
+        ["Identify the city.", "Which of the two cities is meant?"], depends_on=[None, 0]
+    )
+    led[0]["bindings"] = [{"surface": "Canyon", "qid": "Q1", "grounded": True}]
+    on = cot_mod.apply_bindings(
+        led,
+        [(1, "Canyon")],
+        {"canyon": "Q1"},
+        hop=1,
+        retrieval_memory=["[Retrieval]: Canyon is the county seat of Randall County."],
+        skip_input_referent=True,
+    )
+    assert on[1]["bindings"][0]["qid"] == "Q1"
+
+
+def test_excluding_the_input_is_off_by_default_and_configurable():
+    from langgraph_coe.config import PlanConfig
+
+    assert PlanConfig().skip_input_referent_in_binding is False
+    assert PlanConfig(skip_input_referent_in_binding=True).skip_input_referent_in_binding
+    assert PlanConfig().guard_intents_are_not_referents is True
+
+
+def test_resolve_primary_qid_excludes_without_disturbing_the_default():
+    labels = {"dennis quaid": "Q1", "meg ryan": "Q2"}
+    text = "Dennis Quaid is married to Meg Ryan."
+    assert cot_mod.resolve_primary_qid(text, labels) == "Q1"
+    assert cot_mod.resolve_primary_qid(text, labels, exclude={"Q1"}) == "Q2"
+    # Every mention excluded -> fall back rather than resolving to nothing.
+    assert cot_mod.resolve_primary_qid(text, labels, exclude={"Q1", "Q2"}) == "Q1"
+    assert cot_mod.resolve_binding_key(text, labels, exclude={"Q1"}) == "Q2"
+
+
+def test_both_binding_flags_are_threaded_from_config_to_apply_bindings():
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    assert 'getattr(plan_cfg, "guard_intents_are_not_referents", True)' in src
+    assert 'getattr(plan_cfg, "skip_input_referent_in_binding", False)' in src
+    assert "guard_intents=guard_intents" in src
+    assert "skip_input_referent=skip_input_referent" in src
+
+
+def test_a_corroborated_low_confidence_answer_can_be_rescued():
+    """16.7% of sub-answers are dropped on the confidence label before binding."""
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    assert 'getattr(plan_cfg, "bind_corroborated_low_confidence", False)' in src
+    i = src.index("if i < len(confidences) and confidences[i] in _LOW_CONFIDENCE:")
+    block = src[i : i + 900]
+    # Corroboration is the arbiter, so an uncorroborated guess still cannot bind.
+    assert "rescue_low_confidence and _is_corroborated(answer, gate_lines)" in block
+    assert "low_confidence += 1" in block and "continue" in block
+    # And the rate is recorded per hop rather than only logged.
+    assert '"answers_low_confidence_rescued": low_confidence_rescued,' in src
+
+
+def test_the_low_confidence_rescue_is_off_by_default_and_configurable():
+    from langgraph_coe.config import PlanConfig
+
+    assert PlanConfig().bind_corroborated_low_confidence is False
+    assert PlanConfig(
+        bind_corroborated_low_confidence=True
+    ).bind_corroborated_low_confidence
+
+
+def test_the_answer_generator_is_told_to_answer_on_incomplete_context():
+    """Why a low label is not evidence about the referent — it is about the context."""
+    prompt = roles_mod.ANSWER_GENERATOR.system_prompt
+    assert "confidence_level" in prompt
+    assert "even if the context is incomplete" in prompt
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# candidate_answers ordering: the 94% channel into synthesis
+#
+# resolved_findings is 0.49 lines per question; candidate_answers is the whole of
+# text_memory. Measured over 149 conversion failures with distinct gold/answered lines, the
+# gold sits LATER in memory 101 times against 48 (p < 0.0001) — synthesis returned the
+# earlier line 68% of the time.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_latest_evidence_is_presented_first():
+    lines = ["[hop=0] a", "[hop=1] b", "[Retrieval]: c"]
+    assert cot_mod.order_candidates_recent_first(lines) == [
+        "[Retrieval]: c",
+        "[hop=1] b",
+        "[hop=0] a",
+    ]
+    assert cot_mod.order_candidates_recent_first([]) == []
+    assert cot_mod.order_candidates_recent_first(None) == []
+
+
+def test_an_untagged_line_is_not_demoted():
+    """A measured case had the GOLD on a line with no [hop=N] tag.
+
+    That is why this is a plain reverse and not a sort on the hop tag: sorting untagged
+    lines to the end would demote exactly what the reordering exists to promote.
+    """
+    lines = ["[hop=0] early", "[Retrieval]: the gold, untagged", "[hop=3] late"]
+    out = cot_mod.order_candidates_recent_first(lines)
+    assert out.index("[Retrieval]: the gold, untagged") < out.index("[hop=0] early")
+
+
+def test_the_ordering_is_off_by_default_and_configurable():
+    from langgraph_coe.config import CoTConfig
+
+    assert CoTConfig().recent_evidence_first is False
+    assert CoTConfig(recent_evidence_first=True).recent_evidence_first is True
+
+
+def test_synthesis_applies_the_ordering_only_when_enabled():
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    assert '"recent_evidence_first", False)' in src
+    i = src.index("async def gen_final(")
+    block = src[i : i + 500]
+    assert "if recent_evidence_first:" in block
+    assert "order_candidates_recent_first(candidate_answers)" in block
+
+
+def test_relevance_ranking_is_documented_as_measured_harmful():
+    """It favours the wrong line, so a future reader must not 'improve' this to a reranker."""
+    doc = cot_mod.order_candidates_recent_first.__doc__ or ""
+    assert "favour the WRONG line" in doc
+    assert "28 / rival 71" in doc
+
+
+def test_the_ordering_evidence_records_its_own_weakness():
+    """The unmatched p < 0.0001 was an overstatement; the docstring must say so."""
+    doc = cot_mod.order_candidates_recent_first.__doc__ or ""
+    assert "67 times against 41" in doc and "p = 0.0157" in doc
+    assert "0.425" in doc and "unconditioned" in doc
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Consolidation loss: evidence that never reached synthesis at all
+#
+# Measured on 60 instrumented questions: the gold is in the retrieved facts on 22, in
+# consolidated memory on 19 — 6 questions (10%) lose it to consolidation, and all 6 were
+# answered wrong. MEMORY_CONSOLIDATOR keeps a mean 0.56 of retrieved facts.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_only_the_dropped_facts_are_resurfaced():
+    kept = "Elizabeth Berg's birthplace is Saint Paul"
+    log = [kept, "Saint Paul borders Minneapolis", "Unrelated trivia about rowing"]
+    out = cot_mod.dropped_evidence(log, [f"[hop=1] [Retrieval]: {kept}."])
+    assert kept not in out, "already in candidate_answers; resending it pays tokens twice"
+    assert "Saint Paul borders Minneapolis" in out
+    assert "Unrelated trivia about rowing" in out
+
+
+def test_a_paraphrased_survivor_counts_as_kept():
+    """Exact containment would call almost everything dropped — the consolidator rewrites."""
+    fact = "Dennis Quaid is married to the actress Meg Ryan"
+    memory = ["[Retrieval]: Dennis Quaid is married to actress Meg Ryan."]
+    assert cot_mod.dropped_evidence([fact], memory) == []
+
+
+def test_dropped_evidence_is_most_recent_first_and_capped():
+    log = [f"fact number {i} about a distinct subject" for i in range(40)]
+    out = cot_mod.dropped_evidence(log, [], limit=5)
+    assert len(out) == 5
+    assert out[0] == "fact number 39 about a distinct subject", "latest hop first"
+
+
+def test_dropped_evidence_tolerates_empty_and_junk():
+    assert cot_mod.dropped_evidence([], []) == []
+    assert cot_mod.dropped_evidence(None, None) == []
+    assert cot_mod.dropped_evidence(["", "   ", "a"], []) == [], "no content tokens"
+
+
+def test_the_dropped_block_is_appended_last_and_labelled_lower_reliability():
+    """Anything at top authority gets returned as the answer — the scaffolding result."""
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c.build_cot_graph)
+    i = src.index("async def gen_final(")
+    block = src[i : i + 1800]
+    assert "if synthesis_sees_dropped:" in block
+    assert "ctx = ctx + (" in block, "appended, not prepended"
+    assert "Retrieved but not retained" in block
+    assert "lower reliability" in block
+
+
+def test_the_dropped_evidence_flag_is_off_by_default_and_configurable():
+    from langgraph_coe.config import CoTConfig
+
+    assert CoTConfig().synthesis_sees_dropped_evidence is False
+    assert CoTConfig(
+        synthesis_sees_dropped_evidence=True
+    ).synthesis_sees_dropped_evidence
+
+
+def test_the_retrieval_log_accumulates_across_hops():
+    """``extracted_facts`` is cleared by ``increment``, so a plain key would lose it."""
+    import langgraph_coe.graphs.cot as c
+
+    src = inspect.getsource(c)
+    assert "retrieval_log: Annotated[List[str], operator.add]" in src
+    # Written wherever facts are produced, so no hop's evidence is missed.
+    assert '"retrieval_log": list(facts_out)' in src
+
+
+def test_the_runner_persists_the_retrieval_log_separately():
+    import inspect as _i
+
+    from langgraph_coe.evaluation import runner as r
+
+    src = _i.getsource(r._save_question_artifacts)
+    assert 'q_dir / "retrieval_log.json"' in src
+    assert '"retrieval_log_path"' in src

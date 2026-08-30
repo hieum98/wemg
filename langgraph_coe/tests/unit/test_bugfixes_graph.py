@@ -32,6 +32,10 @@ def _config():
     cfg.reranker.enabled = False
     cfg.reranker.top_k = 3
     cfg.web_search.enabled = False
+    # Pinned explicitly: these are bug-fix regression tests over the plan-free baseline
+    # graph, and `search.plan.enabled` now defaults to True. Inheriting the default would
+    # change what they exercise without any test saying so.
+    cfg.search.plan.enabled = False
     return cfg
 
 

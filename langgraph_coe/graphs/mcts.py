@@ -74,6 +74,9 @@ from .cot import (
     mark_stalled_intents,
     pool_subquestions,
     render_plan_for_prompt,
+    resolved_findings,
+    plan_target_resolved,
+    scaffolding_findings,
     select_plan,
     _discharge_reason,
     _entity_label_to_qid,
@@ -192,6 +195,9 @@ class MCTSState(TypedDict, total=False):
     plan: str
     plan_version: int
     plan_ledger: List[Dict[str, Any]]
+    # Ledger produced by the most recent rollout under ``mcts_plan_scope="rollout"``.
+    # Deliberately NOT ``plan_ledger``: nothing inherits this, it only feeds synthesis.
+    rollout_plan_ledger: List[Dict[str, Any]]
     plan_action: str
     plan_action_log: Annotated[List[Dict[str, Any]], operator.add]
     # Append-only across the run; survives replans (see CoTState).
@@ -412,6 +418,15 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
     plan_cfg = getattr(getattr(config, "search", None), "plan", None)
     plan_enabled = bool(getattr(plan_cfg, "enabled", False))
+    # Where the plan lives (see ``PlanConfig.mcts_plan_scope``). ``"tree"`` reproduces
+    # the measured diversity collapse — distinct subquestions 9.9 -> 6.3, sibling
+    # overlap 10.2% -> 23.1% — because siblings that share a plan stop differing, and
+    # pUCT needs them to differ. ``"rollout"`` keeps the tree plan-free and lets each
+    # rollout plan from its own branch memory, so the plan's within-chain benefits apply
+    # without coupling siblings.
+    plan_scope = str(getattr(plan_cfg, "mcts_plan_scope", "rollout") or "rollout")
+    tree_plan = plan_enabled and plan_scope == "tree"
+    rollout_plan = plan_enabled and plan_scope == "rollout"
     stall_after_attempts = max(
         1, int(getattr(plan_cfg, "stall_after_attempts", 2) or 2)
     )
@@ -498,6 +513,12 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             question,
             subqs,
             needs_kg=kg_flags,
+            # Plan-conditioned retrieval, matching ``route_after_subq`` in the CoT
+            # graph. Without these two the MCTS arm silently ran unplanned retrieval
+            # even with ``search.plan.enabled=true``, so no plan effect measured on
+            # the CoT path could reproduce here.
+            plan_ledger=view.get("plan_ledger"),
+            serves_intent=pooled.serves_intent,
             memory_context=ctx,
             entity_dict=view.get("entity_dict"),
             kg_graph=kg_graph,
@@ -535,19 +556,29 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         for i, sq in enumerate(subqs):
             ans = answers[i] if i < len(answers) else None
             text = _answer_text(ans)
+            intent_idx = (
+                pooled.serves_intent[i]
+                if i < len(pooled.serves_intent)
+                else None
+            )
             nodes.append(
                 _make_node(
                     MCTSNodeType.SUB_QA,
                     parent_id,
-                    {"sub_question": sq, "sub_answer": text},
+                    # ``serves_intent`` is stored on the node, not just consumed here:
+                    # ``_gen_self_correct`` reads the sub-question back out of this dict
+                    # and re-retrieves for it, and without the attribution
+                    # ``ground_retrieval_query`` cannot find the prerequisite chain — so
+                    # a circumlocuting sub-question was re-retrieved verbatim, which is
+                    # the exact query class grounding exists to repair.
+                    {
+                        "sub_question": sq,
+                        "sub_answer": text,
+                        "serves_intent": intent_idx,
+                    },
                 )
             )
             if text.strip():
-                intent_idx = (
-                    pooled.serves_intent[i]
-                    if i < len(pooled.serves_intent)
-                    else None
-                )
                 # Same gate as CoT: an answer the model itself labels low-confidence
                 # binds nothing, so a guess cannot compete with a grounded answer and
                 # read as genuine ambiguity.
@@ -569,7 +600,11 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         }
 
     async def _explore_for(
-        question: str, target_q: str, ctx: str, view: Dict[str, Any]
+        question: str,
+        target_q: str,
+        ctx: str,
+        view: Dict[str, Any],
+        target_intent: Optional[int] = None,
     ):
         """coe parity: one fresh retrieval pass (gather_evidence) for ``target_q``.
 
@@ -582,6 +617,12 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             question,
             [target_q],
             needs_kg=[True],
+            serves_intent=[target_intent],
+            # Ledger without attribution: ``ground_retrieval_query`` needs an intent
+            # index to find the prerequisite chain, and this path does not know which
+            # intent ``target_q`` serves. Passed anyway so the Stage-A/B pruning focus
+            # applies, which needs only the open-intent set.
+            plan_ledger=view.get("plan_ledger"),
             memory_context=ctx,
             entity_dict=view.get("entity_dict"),
             kg_graph=kg_graph,
@@ -657,6 +698,13 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             # resolvable entity, cutting the public-API burst that caused the
             # ConnectTimeouts. Corpus re-verification (local FAISS) still runs.
             needs_kg=[False] * len(facts_q),
+            # Ledger only, for the same reason as ``_explore_for``: the Stage-A/B
+            # pruning focus needs just the open-intent set, while ``serves_intent`` is
+            # what would rewrite the fact strings being re-verified. Omitting it
+            # entirely does not leave the focus alone — ``gather_evidence`` calls
+            # ``set_plan_focus([], 0)``, which *disables* it, so re-verification paid
+            # the unfocused 64-candidate pruner cost while its siblings paid 16.
+            plan_ledger=view.get("plan_ledger"),
             memory_context=ctx,
             entity_dict=view.get("entity_dict"),
             kg_graph=kg_graph,
@@ -731,8 +779,13 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         if not sub_q or not sub_a:
             return [], {}
         # coe parity (generate_self_correction → _explore): re-retrieve fresh
-        # evidence for the sub-question before refining, not memory alone.
-        correct_ctx, evidence = await _explore_for(question, sub_q, ctx, view)
+        # evidence for the sub-question before refining, not memory alone. The intent
+        # index was recorded on the node by ``_gen_subqa`` precisely so this
+        # re-retrieval can be grounded — reading it back is what stops a circumlocuting
+        # sub-question being re-issued verbatim.
+        correct_ctx, evidence = await _explore_for(
+            question, sub_q, ctx, view, content.get("serves_intent")
+        )
         out, _ = await execute_role_lc(
             registry,
             SELF_CORRECTOR,
@@ -788,6 +841,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         ledger = build_plan_ledger(
             list(getattr(chosen, "intents", None) or []),
             list(getattr(chosen, "premises", None) or []),
+            list(getattr(chosen, "depends_on", None) or []),
         )
         result: Dict[str, Any] = {
             "plan": plan_text,
@@ -1006,12 +1060,17 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
         payload: Dict[str, Any] = {
             "question": state.get("question", ""),
             "max_depth": sim_depth,
+            # ``effective_max_depth`` raises ``max_depth`` to fit a plan's dependency
+            # chain, which is right in standalone CoT and wrong here: ``sim_depth`` is
+            # what sizes the tree, and a rollout quietly running deeper than
+            # ``max_simulation_depth`` charges the difference to every iteration.
+            "max_depth_is_hard": True,
             "depth": 0,
             "text_memory": view.get("text_memory"),
             "graph_memory": view.get("graph_memory"),
             "entity_dict": view.get("entity_dict"),
         }
-        if plan_enabled:
+        if tree_plan:
             payload.update(
                 {
                     "plan": view.get("plan", "") or "",
@@ -1022,6 +1081,13 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                     "plan_frozen": True,
                 }
             )
+        elif rollout_plan:
+            # Seed nothing. ``gen_plan`` returns early only when ``plan`` is already
+            # non-empty, so leaving it unset is what makes the rollout plan for itself —
+            # from *this branch's* memory, which is what keeps sibling rollouts
+            # different. ``plan_frozen`` stays False so the rollout's own ``plan_gate``
+            # governs its own plan; it cannot touch the tree, which holds none.
+            payload["plan_frozen"] = False
         cot_out = await cot_graph.ainvoke(payload)
 
         updates: Dict[str, MCTSTreeNode] = {}
@@ -1081,8 +1147,27 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             "simulation_result": {"rollout_texts": rollout_texts},
             # The rollout finalizing via "answerable from context" is a
             # semantic-sufficiency vote (coe parity: simulate's rollout_signal).
-            "rollout_semantic_signal": bool(cot_out.get("is_answerable")),
+            # A rollout that ended because its plan's terminal intents all resolved is
+            # just as much a sufficiency vote as one that ended on ``is_answerable`` —
+            # but ``route_after_subq`` reaches ``gen_final`` without setting that flag,
+            # so reading it alone silently discarded the plan's own stop condition.
+            "rollout_semantic_signal": bool(cot_out.get("is_answerable"))
+            or plan_target_resolved(cot_out.get("plan_ledger") or []),
         }
+        if rollout_plan:
+            # Carry the rollout's own ledger out for synthesis. Without this, the one
+            # plan mechanism with a *confirmed* effect would not reach MCTS: labelling
+            # bridge referents as "not the answer" drove the rate of answering with a
+            # scaffolding referent from 1.8x the no-plan arm (10.6% vs 5.3%,
+            # p = 0.0054) down to exactly parity (5.6% vs 5.6%, p = 1.0000) in CoT.
+            #
+            # This is a rollout *product*, not tree state: it is written to its own
+            # channel and never to ``plan``/``plan_ledger``, so no sibling inherits it
+            # and the diversity that rollout scope exists to preserve is untouched.
+            out["rollout_plan_ledger"] = [
+                dict(e) for e in (cot_out.get("plan_ledger") or [])
+            ]
+
         # Persist the rollout's consolidated memory (see comment above).
         if cot_out.get("text_memory") is not None:
             out["text_memory"] = list(cot_out.get("text_memory") or [])
@@ -1515,6 +1600,12 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
             visits = node.get("visits", 0)
             scores.append((node.get("value", 0.0) / visits) if visits > 0 else 0.0)
 
+        synthesis_ledger = list(
+            state.get("plan_ledger")
+            or state.get("rollout_plan_ledger")
+            or []
+        )
+
         candidate_scores: Optional[List[float]] = scores
         if not candidates:
             candidates = list(state.get("text_memory") or []) or [
@@ -1530,6 +1621,12 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
                 candidate_answers=candidates,
                 candidate_scores=candidate_scores,
                 context=_join_memory_context(state),
+                # Under tree scope the ledger is the tree's; under rollout scope the
+                # tree holds none, so the winning rollout's ledger is what describes
+                # which referents were bridges. Either way this is the only place the
+                # plan reaches MCTS synthesis.
+                resolved_findings=resolved_findings(synthesis_ledger) or None,
+                scaffolding_findings=scaffolding_findings(synthesis_ledger) or None,
             ),
         )
         final_text = (
@@ -1575,7 +1672,7 @@ def build_mcts_graph(registry: RoleModelRegistry, config: Optional[Any] = None):
 
     # As in CoT, the plan nodes only exist when the feature is on, so the
     # plan-disabled graph is structurally identical to the pre-plan one.
-    if plan_enabled:
+    if tree_plan:
         builder.add_node("gen_plan", gen_plan)
         builder.add_node("plan_gate", plan_gate)
         builder.add_edge(START, "gen_plan")

@@ -1,6 +1,8 @@
 redis/*
 *__pycache__*
 wemg.egg-info/*
+# Stale build artifact from before the coe -> wemg rename; was tracked by mistake.
+coe.egg-info/
 draft.ipynb
 draft.py
 memory_db
@@ -62,4 +64,8 @@ data/
 /OPENCODE.md.bak
 /opencode.json
 # END AI Agent Symlinks
-scripts/
+# NOTE: `scripts/` is deliberately NOT ignored. It was, and that was a delivery bug:
+# README documents ./scripts/searxng_up.sh as a setup step and docs/RESULTS.md cites
+# scripts/reason_report.py + conversion_report.py as the way to regenerate every number,
+# so ignoring it shipped the results with no means of reproducing them. 144K of analysis
+# code. Only its __pycache__ is ignored, via the *__pycache__* rule above.

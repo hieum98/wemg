@@ -1,67 +1,74 @@
-# Evaluation configuration: same environment as config.smoke.yaml (Qwen3-32B on
-# Bedrock, local QLever Wikidata, web search instead of the local corpus, no
-# reranker) but with realistic search budgets rather than the smoke test's tiny ones.
-#
-# The plan arm is selected on the command line, not here, so one config serves all
-# three:
-#   A0  search.plan.enabled=false
-#   A1  search.plan.enabled=true search.plan.replan_max=0   (log-only)
-#   A2  search.plan.enabled=true search.plan.replan_max=2   (armed)
+# Evaluation configuration: locally-served Qwen3 via SGLang, local QLever Wikidata,
+# local FAISS corpus + reranker, and web search — with realistic search budgets rather
+# than the smoke test's tiny ones.
 #
 # Run with:
-#   python -m langgraph_coe.scripts.smoke_test
-# or point the evaluator at it:
-#   COE_CONFIG=langgraph_coe/config.smoke.yaml python -m langgraph_coe.evaluation.evaluate ...
+#   python -m langgraph_coe.evaluation.evaluate --config langgraph_coe/config.eval.yaml \
+#     dataset_name_or_path=./datasets/musique_depth.jsonl level_column=level \
+#     output_path=./results/<name>
 #
-# Prerequisites:
-#   * AWS credentials with Bedrock access + AWS_REGION (or AWS_REGION_NAME) set.
-#     ``boto3`` must be installed — LiteLLM needs it to sign Bedrock requests.
-#   * A reachable Wikidata SPARQL endpoint. ``wikidata.sparql_endpoint`` below
-#     points at the local QEndpoint deployment (docs/deploy_local_wikidata-v2.md);
-#     override with COE_SPARQL_ENDPOINT, or set it to null to fall back to the
-#     public endpoint.
-#   * No Serper key is needed: web_search falls back to DuckDuckGo.
-
+# See docs/RESULTS.md "Reproducing the numbers" for the arms behind the reported results,
+# and why paired arms must run CONCURRENTLY and at most two at a time.
+#
+# Prerequisites — every one of these must be up, or the corresponding surface silently
+# degrades to nothing:
+#   * Three SGLang servers (Qwen3-8B/4B/1.7B). Start with ./setup/sglang_up.sh, verify
+#     with ./setup/sglang_up.sh --check. They MUST be launched with
+#     `--reasoning-parser qwen3`, otherwise the chain-of-thought is left inline in
+#     `content` and every structured-output parse has to survive a reasoning trace
+#     prepended to its JSON.
+#   * A Wikidata SPARQL endpoint. ``wikidata.sparql_endpoint`` points at the local
+#     QLever deployment; start/verify with ./setup/wikidata_up.sh (``status`` also checks
+#     that the index still exists on the host). Override with COE_SPARQL_ENDPOINT, or set
+#     null for public Wikidata.
+#   * The FAISS corpus index at ``retriever.corpus.index_path`` and an embedding server
+#     (see the retriever block for the RAM caveat — this is not a small file).
+#   * A reranker server at ``reranker.url``.
+#   * SearXNG for the web fallback: ./setup/searxng_up.sh
+#
 llm:
   api_key: null
+  # ── tiers ─────────────────────────────────────────────────────────────────────
   tiers:
-    # One model for every role. ``api_base`` MUST be null for Bedrock: LiteLLM
-    # routes by model name there, and a non-null api_base makes it try to reach
-    # that host instead of the provider endpoint.
-    heavy: &bedrock_tier
-      model_name: bedrock/qwen.qwen3-32b-v1:0
-      api_base: null
+    # Roles that reason over retrieved evidence: subquestion_generator,
+    # answer_generator, self_corrector, final_answer_synthesizer, web_researcher.
+    heavy: &qwen8b
+      model_name: openai/Qwen/Qwen3-8B
+      api_base: http://localhost:30000/v1
       api_key: null
       temperature: 0.7
-      # Qwen3-32B on Bedrock has a 32,768-token window covering input + output,
-      # far tighter than the cluster's 100k. ``max_input_tokens`` is what the
-      # input guard trims against, so it must reflect the real window — left at
-      # 100k the guard never fires and the provider rejects the request.
-      #
-      # ``chars_per_token`` matters just as much, and must be set pessimistically:
-      # it is a content-dependent estimate, so the safe value is the *densest*
-      # tokenization the prompt mix produces, not the average. Measured here by
-      # walking it down against real overflows: 3.0 (default) → 60k chars read as
-      # 31k tokens; 2.0 → 48k chars still read as >28.7k tokens (≈1.67 actual for
-      # crawled web text + Wikidata triples). 1.6 with a 20k ceiling gives a
-      # 32k-char budget ≈ 21k real tokens, clear of the 32768-4096 input ceiling.
-      max_tokens: 4096
-      max_input_tokens: 20000
-      chars_per_token: 1.6
+      max_tokens: 16384
+      max_input_tokens: 30000
+      chars_per_token: 2.0
       top_p: 0.95
-      # SGLang-only sampling knobs (top_k / min_p / repetition_penalty) and the
-      # thinking-budget logit processor are left unset: Bedrock ignores or
-      # rejects them, and the custom processor requires an SGLang server.
-      enable_thinking: false
+      enable_thinking: true
+      # Needs an SGLang server started with --enable-custom-logit-processor; left null so
+      # the default launch works. Only bounds reasoning, never the payload.
       thinking_budget: null
+      reasoning_effort: null  # Bedrock-only; inert on SGLang. Do not set here.
       max_retries: 3
       timeout: 300
-    medium: *bedrock_tier
-    # Planning shares the Bedrock tier here; the point of a separate tier is the
-    # hotter sampling, which config.yaml sets. One model for the smoke run.
-    plan: *bedrock_tier
-    light: *bedrock_tier
-    classify: *bedrock_tier
+    # Planning. Same model as heavy; a plan makes no claim about the world, so breadth is
+    # the hedge rather than precision. Sampling is left identical to heavy here (config.yaml
+    # runs it hotter for n=3 plan diversity) so this file changes one thing at a time.
+    plan: *qwen8b
+    consolidate:
+      <<: *qwen8b
+      enable_thinking: false
+    medium:
+      <<: *qwen8b
+      model_name: openai/Qwen/Qwen3-4B
+      api_base: http://localhost:30001/v1
+      temperature: 0.4
+      max_tokens: 4096
+      enable_thinking: false
+    light:
+      <<: *qwen8b
+      model_name: openai/Qwen/Qwen3-1.7B
+      api_base: http://localhost:30002/v1
+      temperature: 0.2
+      max_tokens: 8192
+      enable_thinking: false
 
   role_tiers:
     planner: plan
@@ -70,7 +77,7 @@ llm:
     self_corrector: heavy
     final_answer_synthesizer: heavy
     verifier: medium
-    memory_consolidator: heavy
+    memory_consolidation: consolidate
     extractor: medium
     named_entity_recognition: light
     relation_extraction: light
@@ -81,25 +88,48 @@ llm:
     web_researcher: heavy
     evaluator: medium
 
-# Web search replaces the local Wikipedia corpus as the document surface.
-# No api_key → DuckDuckGo backend (see tools/web.init_web_search).
 web_search:
   enabled: true
-  api_key: null
+  api_key: null  # SERPER_API_KEY from the environment; drives the `builtin` slot
   top_k: 3
   crawl_full_text: true
   max_crawl_requests_per_second: 2.0
   max_queries_per_agent: 2
+  providers:
+    # Head of the chain, and in practice almost the whole of it: MediaWiki nearly
+    # always returns something and the chain stops at the first non-empty provider,
+    # so the providers below mostly do not run. That is deliberate for MuSiQue,
+    # whose gold paragraphs are drawn from Wikipedia — this is the gold source, not
+    # a fallback — and it returns ~4k chars/query against SearXNG's ~70k, which is
+    # what matters when the binding constraint is the ~7.7-item memory budget rather
+    # than corpus coverage. Cost: on compositional queries MediaWiki answers wrongly
+    # and still stops the chain ("who founded the company that made the Model T"
+    # returns A. T. Cross, no Ford), so SearXNG no longer covers that case.
+    - wikipedia
+    # Local container, unmetered. Now reached only when Wikipedia returns nothing.
+    # Start it first anyway: ./setup/searxng_up.sh
+    - searxng
+    # Brave API: 2k queries/month free. Ahead of Serper because this bucket refills
+    # monthly and Serper's does not.
+    - brave
+    # Serper: ~2.5k one-time free credits, never replenished. At the measured ~8
+    # queries/question a 120-question sweep is ~960 calls, so this bucket is worth
+    # ~2.5 sweeps in total — it is the last non-billed resort, not the primary.
+    - builtin
+    # Billed, and this account's free tier is already exhausted (HTTP 432). Kept at
+    # the tail so it is only reachable if everything else is down at once.
+    - tavily
+  searxng_url: http://localhost:8080
+  wikipedia_lang: en
 
-# No local FAISS index / embedding server in this setup. ``corpus_search`` raises
-# when its pipeline is uninitialised, so the fan-out must be gated off rather
-# than left to fail per hop.
 retriever:
-  enabled: false
+  enabled: true
 
-# No reranker server: identity slice instead of an SGLang rerank call.
+# Reranker server, enabled: a real cross-encoder pass instead of the identity slice.
+# ``reranker.url`` must be serving ``model_name``; when it is unreachable the rerank step
+# degrades to lexical overlap, which is silent, so check it before a sweep.
 reranker:
-  enabled: false
+  enabled: true
 
 wikidata:
   # Local QLever endpoint on this box: plain ``/``, NOT the ``/api/endpoint/sparql``
@@ -113,9 +143,12 @@ wikidata:
   max_wikipedia_rps: 2.0
   triple_cache_max_entries: 5000
   max_hops: 2
-  # Stage-A triple pruning falls back to the LLM TRIPLE_PRUNER without a reranker.
-  reranker_url: null
-  reranker_model: null
+  # Stage-A triple pruning: with a reranker available, use it instead of falling back to
+  # the LLM TRIPLE_PRUNER. This is the cheaper path — it replaces an LLM call per hop with
+  # one cross-encoder batch — and must point at the same server as ``reranker.url``.
+  # Set both to null to restore the LLM-pruner fallback.
+  reranker_url: http://n0999:30002/v1
+  reranker_model: Qwen3-Reranker-4B
   pruning_top_k: 64
   pruning_delta: 0.07
 
@@ -148,38 +181,7 @@ search:
     branch_local_memory: true
   plan:
     enabled: true
-    # Back to log-only, now on evidence rather than caution. Arming it (=2) fired on
-    # 20 of 62 questions and the effect was isolated by splitting the run:
-    #
-    #   on the 20 that replanned      armed 10  |  log-only 9  |  no plan 9
-    #   on the 42 that did not        armed 26  |  log-only 21 |  no plan 26
-    #
-    # So the whole 30→36 gain came from the subquestion-breadth fix, not from
-    # replanning: +1 row on the 20 questions that actually replanned. And those
-    # questions cost 2.55 hops / 8.95 subquestions against 1.24 / 3.02 for the rest,
-    # plus up to 2 extra PLANNER calls. Some of that is selection — a question that
-    # trips the contested test is harder — but the direction is unambiguous.
-    #
-    # The trigger itself is sound: it fires on genuinely ambiguous referents. That is
-    # why revising the plan does not help — the ambiguity is in the world, not in the
-    # plan, so no rewrite of what to ask resolves it.
     replan_max: 0
-    # Refuse to replan on the last hop — a plan with no hops left to execute it is
-    # pure cost. 1, not 2: with max_depth=4 a headroom of 1 blocks only hop 3
-    # (13/55 of a1's signals), while 2 would also block hop 2 and discard 51% of
-    # them — including questions that still had two hops left to act on the revision.
     replan_min_depth_headroom: 1
-    # 3, not 2. Of intents that eventually closed, 93-95% closed within 3 attempts
-    # but only 81-89% within 2, so a threshold of 2 marks 11% (a1) to 19% (d1) of
-    # eventual closures as stalled while they were still working. The decisive
-    # interaction is with the per-intent pooling cap: at most 2 subquestions per
-    # intent per hop means a threshold of 2 can fire after a SINGLE hop, which is
-    # one round of ordinary work, not a stall. 3 requires two hops of no progress.
     stall_after_attempts: 3
-    # Measured floor (experiment E5, ``scripts/verifier_noise_floor.py``): rating the
-    # same answer against the same context 5x at temperature 0.7 gives a mean spread
-    # of 1.5 and a **max of 3.0** over 30 calls. So anything at or below 3.0 fires on
-    # sampling noise alone. 4.0 clears the observed floor by a single point — thin,
-    # and the true max over more samples is probably higher, so treat a fire near the
-    # boundary as unproven rather than as evidence.
     memory_disagreement_threshold: 4.0

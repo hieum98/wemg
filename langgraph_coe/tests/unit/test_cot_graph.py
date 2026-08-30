@@ -37,13 +37,19 @@ def _import_module():
     return cot_mod
 
 
-def _config(*, web_enabled: bool = False):
+def _config(*, web_enabled: bool = False, plan_enabled: bool = False):
     from langgraph_coe.config import LangGraphCoeConfig
 
     cfg = LangGraphCoeConfig.from_yaml()
     cfg.reranker.enabled = False
     cfg.reranker.top_k = 3
     cfg.web_search.enabled = web_enabled
+    # Pinned explicitly, not inherited. These tests exercise the plan-free baseline graph
+    # (routing, retrieval fan-out, rerank, extractor, memory update), and the plan adds
+    # gen_plan/plan_gate/replan nodes plus a prompt field. `search.plan.enabled` now
+    # defaults to True, so leaving this to the default would silently change what these
+    # tests exercise; the plan's own behaviour is covered in test_plan_channel.py.
+    cfg.search.plan.enabled = plan_enabled
     return cfg
 
 
@@ -635,6 +641,9 @@ async def test_rerank_node_forwards_configured_reranker(monkeypatch):
     from langgraph_coe.llm import RoleModelRegistry
 
     cfg = LangGraphCoeConfig.from_yaml()
+    # Plan off: this test builds its config inline rather than via _config(), and
+    # search.plan.enabled now defaults to True. See _config() for why.
+    cfg.search.plan.enabled = False
     cfg.reranker.enabled = True
     cfg.reranker.top_k = 2
     registry = RoleModelRegistry(cfg.llm)
@@ -847,6 +856,9 @@ async def test_extractor_splits_oversized_contexts_into_multiple_batches(monkeyp
     from langgraph_coe.config import LangGraphCoeConfig
 
     cfg = LangGraphCoeConfig.from_yaml()
+    # Plan off: this test builds its config inline rather than via _config(), and
+    # search.plan.enabled now defaults to True. See _config() for why.
+    cfg.search.plan.enabled = False
     cfg.reranker.enabled = False
     cfg.reranker.top_k = 5
     cfg.memory.extractor_max_input_chars = 6_000 # forces 1 ctx per batch

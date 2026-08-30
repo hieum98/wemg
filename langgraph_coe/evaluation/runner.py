@@ -117,6 +117,7 @@ def _save_question_artifacts(
         "textual_memory_path": None,
         "graph_memory_path": None,
         "plan_path": None,
+        "retrieval_log_path": None,
     }
 
     raw_state = (getattr(result, "metadata", None) or {}).get("_raw_state") or {}
@@ -150,10 +151,25 @@ def _save_question_artifacts(
             "iteration_history": raw_state.get("iteration_history") or [],
         }
 
-    if not (tree_payload or textual_items or has_graph or plan_payload):
+    # Pre-consolidation evidence. Persisted separately from the consolidated memory so
+    # "the gold was retrieved and then dropped by consolidation" is answerable after a run;
+    # ``extracted_facts`` is cleared every hop, so nothing else preserves it.
+    retrieval_items = [
+        t
+        for t in (raw_state.get("retrieval_log") or [])
+        if isinstance(t, str) and t.strip()
+    ]
+
+    if not (tree_payload or textual_items or has_graph or plan_payload or retrieval_items):
         return out
 
     q_dir.mkdir(parents=True, exist_ok=True)
+
+    if retrieval_items:
+        rl_path = q_dir / "retrieval_log.json"
+        with open(rl_path, "w", encoding="utf-8") as f:
+            json.dump(retrieval_items, f, indent=2, ensure_ascii=False)
+        out["retrieval_log_path"] = str(rl_path)
 
     if plan_payload is not None:
         plan_path = q_dir / "plan.json"
@@ -369,6 +385,7 @@ class DatasetEvaluator:
             compute_aggregate_metrics_both,
             compute_aggregate_metrics_by_level,
             compute_sub_em,
+            compute_sub_em_relaxed,
         )
 
         output_dir = Path(output_path)
@@ -520,6 +537,15 @@ class DatasetEvaluator:
                         predicted_long = result.answer
                         sub_em_short = compute_sub_em(predicted_short, correct)
                         sub_em_long = compute_sub_em(predicted_long, correct)
+                        # Recorded alongside, never in place of, sub-EM. A gold answer that
+                        # arrives wrapped ("at the city of Cairo, Illinois") cannot be
+                        # matched verbatim by a correctly concise answer, and that scored
+                        # 3 questions of this dataset wrong in EVERY run — +1.79 points
+                        # understated, and up to 3 questions kept out of every paired
+                        # comparison's discordant pool. See ``compute_sub_em_relaxed``.
+                        sub_em_short_relaxed = compute_sub_em_relaxed(
+                            predicted_short, correct
+                        )
                         pass_at_k = (
                             result.metadata.get("pass_at_k")
                             if result.metadata
@@ -532,6 +558,7 @@ class DatasetEvaluator:
                             "full_answer": predicted_long,
                             "sub_em_short": sub_em_short,
                             "sub_em_long": sub_em_long,
+                            "sub_em_short_relaxed": sub_em_short_relaxed,
                             "pass_at_k": pass_at_k,
                             "acc_short": None,
                             "acc_long": None,
